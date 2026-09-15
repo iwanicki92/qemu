@@ -2705,6 +2705,19 @@ static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
         }
     }
 
+    /*
+     * Firmware sets the capability's Enable bit once it has programmed the
+     * MMIO base, which locks the block. Nothing here does that, so software
+     * looking for a usable IOMMU sees one a firmware left off unless the
+     * guest is told otherwise.
+     */
+    if (s->firmware_enabled) {
+        pci_set_long(s->pci->dev.config + s->pci->capab_offset +
+                     AMDVI_CAPAB_BAR_LOW,
+                     (AMDVI_BASE_ADDR & MAKE_64BIT_MASK(14, 18)) |
+                     AMDVI_CAPAB_BAR_LOW_ENABLE);
+    }
+
     s->iotlb = g_hash_table_new_full(amdvi_iotlb_hash,
                                      amdvi_iotlb_equal, g_free, g_free);
 
@@ -2757,6 +2770,7 @@ static const Property amdvi_properties[] = {
     DEFINE_PROP_BOOL("xtsup", AMDVIState, xtsup, false),
     DEFINE_PROP_STRING("pci-id", AMDVIState, pci_id),
     DEFINE_PROP_BOOL("dma-remap", AMDVIState, dma_remap, false),
+    DEFINE_PROP_BOOL("firmware-enabled", AMDVIState, firmware_enabled, false),
 };
 
 static const VMStateDescription vmstate_amdvi_sysbus = {

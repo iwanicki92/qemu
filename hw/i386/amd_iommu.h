@@ -36,6 +36,9 @@
 #define AMDVI_CAPAB_SIZE              0x18
 #define AMDVI_CAPAB_REG_SIZE          0x04
 
+/* Base Address Low bit 0, set by firmware once the MMIO base is programmed */
+#define AMDVI_CAPAB_BAR_LOW_ENABLE    (1 << 0)
+
 /* Capability header data */
 #define AMDVI_CAPAB_ID_SEC            0xf
 #define AMDVI_CAPAB_FLAT_EXT          (1 << 28)
@@ -311,6 +314,7 @@ struct AMDVIState {
     X86IOMMUState iommu;        /* IOMMU bus device             */
     AMDVIPCIState *pci;         /* IOMMU PCI device             */
     char *pci_id;               /* ID of AMDVI-PCI device, if user created */
+    bool firmware_enabled;      /* report the capability as enabled by firmware */
 
     uint32_t version;
 

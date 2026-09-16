@@ -2771,6 +2771,7 @@ static const Property amdvi_properties[] = {
     DEFINE_PROP_STRING("pci-id", AMDVIState, pci_id),
     DEFINE_PROP_BOOL("dma-remap", AMDVIState, dma_remap, false),
     DEFINE_PROP_BOOL("firmware-enabled", AMDVIState, firmware_enabled, false),
+    DEFINE_PROP_BOOL("ivrs", AMDVIState, ivrs, true),
 };
 
 static const VMStateDescription vmstate_amdvi_sysbus = {

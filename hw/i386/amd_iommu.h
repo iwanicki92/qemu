@@ -315,6 +315,7 @@ struct AMDVIState {
     AMDVIPCIState *pci;         /* IOMMU PCI device             */
     char *pci_id;               /* ID of AMDVI-PCI device, if user created */
     bool firmware_enabled;      /* report the capability as enabled by firmware */
+    bool ivrs;                  /* describe the IOMMU in an ACPI IVRS table */
 
     uint32_t version;
 

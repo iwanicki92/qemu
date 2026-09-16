@@ -2144,9 +2144,15 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
                    x86ms->oem_table_id);
     }
     if (object_dynamic_cast(OBJECT(iommu), TYPE_AMD_IOMMU_DEVICE)) {
-        acpi_add_table(table_offsets, tables_blob);
-        build_amd_iommu(tables_blob, tables->linker, x86ms->oem_id,
-                        x86ms->oem_table_id);
+        /*
+         * ivrs=off leaves the IOMMU out of ACPI, as firmware that fails to
+         * describe one does, so the guest finds it in PCI space alone.
+         */
+        if (AMD_IOMMU_DEVICE(iommu)->ivrs) {
+            acpi_add_table(table_offsets, tables_blob);
+            build_amd_iommu(tables_blob, tables->linker, x86ms->oem_id,
+                            x86ms->oem_table_id);
+        }
     } else if (object_dynamic_cast(OBJECT(iommu), TYPE_INTEL_IOMMU_DEVICE)) {
         acpi_add_table(table_offsets, tables_blob);
         build_dmar_q35(tables_blob, tables->linker, x86ms->oem_id,

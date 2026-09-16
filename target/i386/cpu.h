@@ -570,6 +570,11 @@ typedef enum X86Seg {
 
 #define MSR_VM_HSAVE_PA                 0xc0010117
 
+#define MSR_AMD64_MMIO_CONF_BASE        0xc0010058
+#define MSR_AMD64_MMIO_CONF_ENABLE      (1ULL << 0)
+#define MSR_AMD64_MMIO_CONF_BUS_RANGE   (0xfULL << 2)
+#define MSR_AMD64_MMIO_CONF_BASE_ADDR   0x000ffffffff00000ULL
+
 #define MSR_IA32_XFD                    0x000001c4
 #define MSR_IA32_XFD_ERR                0x000001c5
 
@@ -2062,6 +2067,7 @@ typedef struct CPUArchState {
     uint64_t star;
 
     uint64_t vm_hsave;
+    uint64_t mmio_conf_base;
 
 #ifdef TARGET_X86_64
     uint64_t lstar;
@@ -2487,6 +2493,9 @@ struct ArchCPU {
      * PMU is not available, but prior to 10.1 it was enabled even if PMU is off.
      */
     bool pdcm_on_even_without_pmu;
+
+    /* Reset value of MSR_AMD64_MMIO_CONF_BASE, since no firmware sets it */
+    uint64_t mmio_conf_base;
 
     /* Number of physical address bits supported */
     uint32_t phys_bits;

@@ -209,6 +209,12 @@ void helper_wrmsr(CPUX86State *env)
         }
         env->vm_hsave = val;
         break;
+    case MSR_AMD64_MMIO_CONF_BASE:
+        /* Enable, bus range and base address. Reserved bits read as zero. */
+        env->mmio_conf_base = val & (MSR_AMD64_MMIO_CONF_ENABLE |
+                                     MSR_AMD64_MMIO_CONF_BUS_RANGE |
+                                     MSR_AMD64_MMIO_CONF_BASE_ADDR);
+        break;
 #ifdef TARGET_X86_64
     case MSR_LSTAR:
         env->lstar = val;
@@ -361,6 +367,9 @@ void helper_rdmsr(CPUX86State *env)
         break;
     case MSR_VM_HSAVE_PA:
         val = env->vm_hsave;
+        break;
+    case MSR_AMD64_MMIO_CONF_BASE:
+        val = env->mmio_conf_base;
         break;
     case MSR_IA32_PERF_STATUS:
         /* tsc_increment_by_tick */

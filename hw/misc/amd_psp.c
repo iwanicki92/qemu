@@ -90,6 +90,12 @@ static const Property amd_psp_properties[] = {
                        AMD_PSP_DEFAULT_ID),
     DEFINE_PROP_BOOL("drtm-ready", AmdPspState, drtm_ready, true),
     DEFINE_PROP_BOOL("aspt", AmdPspState, aspt, true),
+    /*
+     * The DRTM ACPI device is firmware's on hardware, behind a setup option
+     * of its own, and rides on this device here because it is the AMD one a
+     * guest asking for any of this already has.
+     */
+    DEFINE_PROP_BOOL("drtm-device", AmdPspState, drtm_device, false),
 };
 
 static void amd_psp_class_init(ObjectClass *klass, const void *data)

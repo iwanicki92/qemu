@@ -2052,6 +2052,36 @@ build_amd_psp(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     acpi_table_end(linker, &table);
 }
 
+/*
+ * The DRTM ACPI device, which Turin firmware publishes in an SSDT of its own
+ * once its "DRTM Virtual Device Support" option is enabled: \_SB.DRTM with
+ * _HID "DRTM0002" and an _STA of 0x0f. What consumes it is not known, so
+ * nothing here implements what it describes.
+ */
+static void
+build_amd_drtm(GArray *table_data, BIOSLinker *linker, const char *oem_id,
+               const char *oem_table_id)
+{
+    AcpiTable table = { .sig = "SSDT", .rev = 1, .oem_id = oem_id,
+                        .oem_table_id = oem_table_id };
+    Aml *ssdt, *scope, *dev;
+
+    acpi_table_begin(&table, table_data);
+    ssdt = init_aml_allocator();
+
+    scope = aml_scope("\\_SB");
+    dev = aml_device("DRTM");
+    aml_append(dev, aml_name_decl("_HID", aml_string("DRTM0002")));
+    aml_append(dev, aml_name_decl("_UID", aml_int(0)));
+    aml_append(dev, aml_name_decl("_STA", aml_int(0x0f)));
+    aml_append(scope, dev);
+    aml_append(ssdt, scope);
+
+    g_array_append_vals(table_data, ssdt->buf->data, ssdt->buf->len);
+    acpi_table_end(linker, &table);
+    free_aml_allocator();
+}
+
 typedef
 struct AcpiBuildState {
     /* Copy of table in RAM (for patching). */
@@ -2253,6 +2283,11 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
         acpi_add_table(table_offsets, tables_blob);
         build_amd_psp(tables_blob, tables->linker, x86ms->oem_id,
                       x86ms->oem_table_id);
+    }
+    if (psp && AMD_PSP(psp)->drtm_device) {
+        acpi_add_table(table_offsets, tables_blob);
+        build_amd_drtm(tables_blob, tables->linker, x86ms->oem_id,
+                       x86ms->oem_table_id);
     }
     if (machine->nvdimms_state->is_enabled) {
         nvdimm_build_acpi(table_offsets, tables_blob, tables->linker,

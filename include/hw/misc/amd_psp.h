@@ -59,6 +59,7 @@ struct AmdPspState {
     uint16_t device_id;
     bool drtm_ready;
     bool aspt;
+    bool drtm_device;
 
     MemoryRegion mmio;
     MemoryRegion window;

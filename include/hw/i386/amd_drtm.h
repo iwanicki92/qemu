@@ -10,12 +10,26 @@
 #define HW_I386_AMD_DRTM_H
 
 #include "hw/core/sysbus.h"
+#include "qapi/qapi-types-misc-i386.h"
+#include "qemu/queue.h"
 #include "qom/object.h"
 
 #define TYPE_AMD_DRTM_PLATFORM "amd-drtm-platform"
 OBJECT_DECLARE_SIMPLE_TYPE(AmdDrtmPlatform, AMD_DRTM_PLATFORM)
 
 typedef struct TPMIf TPMIf;
+
+/* The block SKINIT places over the whole SLB, and its size. */
+#define AMD_DRTM_SL_DEV_BLOCK "sl_dev"
+#define AMD_DRTM_SLB_SIZE 0x10000
+
+/* One named range that device DMA is kept out of. */
+typedef struct AmdDrtmBlock {
+    char *name;
+    hwaddr base;
+    uint64_t len;
+    QLIST_ENTRY(AmdDrtmBlock) next;
+} AmdDrtmBlock;
 
 /*
  * The one record of a launch, shared by the CPU, the APIC path, the
@@ -28,6 +42,8 @@ struct AmdDrtmPlatform {
     hwaddr slb_base;
     uint16_t slb_length;
     bool sl_dev;
+    AmdDrtmHashResult hash;
+    QLIST_HEAD(, AmdDrtmBlock) blocks;
 
     TPMIf *tpm;
     DeviceState *iommu;

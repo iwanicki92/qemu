@@ -108,6 +108,7 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_SDHCI_PCI') ? ['fuzz-sdcard-test'] : []) +            \
   (config_all_devices.has_key('CONFIG_ESP_PCI') ? ['am53c974-test'] : []) +                 \
   (config_all_devices.has_key('CONFIG_AMD_IOMMU') ? ['amd-iommu-test'] : []) +             \
+  (config_all_devices.has_key('CONFIG_AMD_DRTM') ? ['amd-drtm-test'] : []) +               \
   (config_all_devices.has_key('CONFIG_VTD') ? ['intel-iommu-test'] : []) +                 \
   (config_all_devices.has_key('CONFIG_VTD') and
    config_all_devices.has_key('CONFIG_IOMMU_TESTDEV') ? ['iommu-intel-test', 'iommu-intel-inv-test', 'iommu-intel-pmr-test'] : []) + \

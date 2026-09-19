@@ -178,3 +178,10 @@ txt_smi_held(int cpu) "TXT: SMI held on CPU %d (inhibition engaged)"
 txt_smi_released(int pending) "TXT: SMI inhibition released, %d held SMI(s) redelivered"
 txt_dmar_found(uint64_t addr, uint32_t len) "sinit_mle_data: DMAR at 0x%"PRIx64", %"PRIu32" bytes"
 txt_dmar_rejected(uint64_t addr, uint32_t len) "sinit_mle_data: DMAR at 0x%"PRIx64" rejected (bad length/checksum), %"PRIu32" bytes"
+
+# amd_drtm.c
+amd_drtm_launch(uint64_t base, uint16_t length) "SLB base 0x%" PRIx64 " length %u"
+amd_drtm_hash(uint64_t base, uint16_t length, const char *result) "SLB base 0x%" PRIx64 " length %u: %s"
+amd_drtm_sl_dev_release(bool launched, bool sl_dev) "launched %d sl_dev %d"
+amd_drtm_block_dma(const char *name, uint64_t base, uint64_t len) "%s base 0x%" PRIx64 " len 0x%" PRIx64
+amd_drtm_unblock_dma(const char *name, bool found) "%s found %d"

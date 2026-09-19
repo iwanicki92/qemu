@@ -472,6 +472,43 @@
   'data': { 'port': 'uint32' } }
 
 ##
+# @AmdDrtmHashResult:
+#
+# What became of the measurement SKINIT sends the TPM at locality 4.
+#
+# @none: no launch since reset
+#
+# @ok: the TPM reset PCRs 17 to 22 and extended PCR 17 with the
+#     block's digest
+#
+# @unsupported: there is no TPM, or it has no locality 4 path, so
+#     PCR 17 was left unmeasured
+#
+# @failed: the block could not be read or the TPM refused the hash
+#
+# Since: 11.2
+##
+{ 'enum': 'AmdDrtmHashResult',
+  'data': [ 'none', 'ok', 'unsupported', 'failed' ] }
+
+##
+# @AmdDrtmDmaBlock:
+#
+# A range of guest memory that device DMA is kept out of.
+#
+# @name: what placed the block: sl_dev for the SLB SKINIT covers,
+#     later the IOMMU exclusion range and each PSP TMR
+#
+# @base: the physical address the block starts at
+#
+# @len: the length of the block in bytes
+#
+# Since: 11.2
+##
+{ 'struct': 'AmdDrtmDmaBlock',
+  'data': { 'name': 'str', 'base': 'uint64', 'len': 'uint64' } }
+
+##
 # @AmdDrtmInfo:
 #
 # The state of the AMD dynamic launch platform.
@@ -484,13 +521,19 @@
 #
 # @sl-dev: whether SL_DEV protection of the block is still armed
 #
+# @hash: what became of the locality 4 measurement of the block
+#
+# @dma-blocks: the ranges currently kept from device DMA
+#
 # Since: 11.2
 ##
 { 'struct': 'AmdDrtmInfo',
   'data': { 'launched': 'bool',
             'slb-base': 'uint64',
             'slb-length': 'uint16',
-            'sl-dev': 'bool' } }
+            'sl-dev': 'bool',
+            'hash': 'AmdDrtmHashResult',
+            'dma-blocks': ['AmdDrtmDmaBlock'] } }
 
 ##
 # @query-amd-drtm:
@@ -506,7 +549,8 @@
 #
 #     -> { "execute": "query-amd-drtm" }
 #     <- { "return": { "launched": false, "slb-base": 0,
-#                      "slb-length": 0, "sl-dev": false } }
+#                      "slb-length": 0, "sl-dev": false,
+#                      "hash": "none", "dma-blocks": [] } }
 ##
 { 'command': 'query-amd-drtm', 'returns': 'AmdDrtmInfo' }
 

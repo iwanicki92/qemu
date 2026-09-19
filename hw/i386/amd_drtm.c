@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "hw/i386/amd_drtm.h"
 #include "qapi/error.h"
+#include "qapi/qapi-commands-misc-i386.h"
 #include "qemu/module.h"
 
 AmdDrtmPlatform *amd_drtm_platform_find(void)
@@ -46,6 +47,34 @@ void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
 
 void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
 {
+}
+
+AmdDrtmInfo *qmp_query_amd_drtm(Error **errp)
+{
+    AmdDrtmPlatform *p = amd_drtm_platform_find();
+    AmdDrtmInfo *info;
+
+    if (!p) {
+        error_setg(errp, "no %s device", TYPE_AMD_DRTM_PLATFORM);
+        return NULL;
+    }
+    info = g_new0(AmdDrtmInfo, 1);
+    info->launched = p->launched;
+    info->slb_base = p->slb_base;
+    info->slb_length = p->slb_length;
+    info->sl_dev = p->sl_dev;
+    return info;
+}
+
+void qmp_x_amd_drtm_launch(uint64_t base, uint16_t length, Error **errp)
+{
+    AmdDrtmPlatform *p = amd_drtm_platform_find();
+
+    if (!p) {
+        error_setg(errp, "no %s device", TYPE_AMD_DRTM_PLATFORM);
+        return;
+    }
+    amd_drtm_launch(p, base, length);
 }
 
 static void amd_drtm_platform_realize(DeviceState *dev, Error **errp)

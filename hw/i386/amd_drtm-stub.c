@@ -8,6 +8,8 @@
 
 #include "qemu/osdep.h"
 #include "hw/i386/amd_drtm.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-misc-i386.h"
 
 AmdDrtmPlatform *amd_drtm_platform_find(void)
 {
@@ -34,4 +36,15 @@ void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
 
 void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
 {
+}
+
+AmdDrtmInfo *qmp_query_amd_drtm(Error **errp)
+{
+    error_setg(errp, "%s is not built in", TYPE_AMD_DRTM_PLATFORM);
+    return NULL;
+}
+
+void qmp_x_amd_drtm_launch(uint64_t base, uint16_t length, Error **errp)
+{
+    error_setg(errp, "%s is not built in", TYPE_AMD_DRTM_PLATFORM);
 }

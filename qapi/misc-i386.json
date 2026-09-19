@@ -470,3 +470,66 @@
 ##
 { 'command': 'xen-event-inject',
   'data': { 'port': 'uint32' } }
+
+##
+# @AmdDrtmInfo:
+#
+# The state of the AMD dynamic launch platform.
+#
+# @launched: whether SKINIT has run since reset
+#
+# @slb-base: the physical address of the Secure Loader Block
+#
+# @slb-length: the length SKINIT read from the block's header
+#
+# @sl-dev: whether SL_DEV protection of the block is still armed
+#
+# Since: 11.2
+##
+{ 'struct': 'AmdDrtmInfo',
+  'data': { 'launched': 'bool',
+            'slb-base': 'uint64',
+            'slb-length': 'uint16',
+            'sl-dev': 'bool' } }
+
+##
+# @query-amd-drtm:
+#
+# Return the state of the AMD dynamic launch platform.
+#
+# Errors:
+#     - If the machine has no amd-drtm-platform device
+#
+# Since: 11.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "query-amd-drtm" }
+#     <- { "return": { "launched": false, "slb-base": 0,
+#                      "slb-length": 0, "sl-dev": false } }
+##
+{ 'command': 'query-amd-drtm', 'returns': 'AmdDrtmInfo' }
+
+##
+# @x-amd-drtm-launch:
+#
+# Record a launch as SKINIT would, without the CPU executing it:
+# the block is measured into the TPM and SL_DEV armed, but no core
+# is reset.  For tests of what follows a launch.
+#
+# @base: the physical address of the Secure Loader Block
+#
+# @length: the number of bytes to measure
+#
+# Features:
+#
+# @unstable: This command is experimental.
+#
+# Errors:
+#     - If the machine has no amd-drtm-platform device
+#
+# Since: 11.2
+##
+{ 'command': 'x-amd-drtm-launch',
+  'data': { 'base': 'uint64', 'length': 'uint16' },
+  'features': [ 'unstable' ] }

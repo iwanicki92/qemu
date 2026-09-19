@@ -1787,14 +1787,53 @@ static void check_tpm2_event_log(void)
 #ifdef TEST_TXT_SMP
 /* Volatile: AP writes this word concurrently with the BSP's spin wait. */
 static volatile uint32_t ap_joined;
+/* Volatile: the AP stores the EDX it joined with, read by the BSP. */
+static volatile uint32_t ap_edx;
+
+/* What the AP puts in EDX before it halts, and keeps through its sleep */
+#define AP_EDX_MARK 0xa55aa55aU
+#define LAPIC_ICR_LOW  0xfee00300U
+#define LAPIC_ICR_HIGH 0xfee00310U
 
 /* The AP has no stack on entry. Use no C prologue and a private stack. */
 static void __attribute__((naked, noreturn, used)) ap_landing(void)
 {
     asm volatile("movl $0xe5f000, %%esp\n"
+                 "movl %%edx, ap_edx\n"
                  "movl $1, ap_joined\n"
                  "1: hlt\n"
                  "jmp 1b\n" : : : "memory");
+}
+
+static void lapic_ipi(uint32_t icr_low)
+{
+    unsigned i;
+
+    /* Volatile: the local APIC interrupt command is guest MMIO. */
+    *(volatile uint32_t *)LAPIC_ICR_HIGH = 1U << 24; /* APIC ID 1 */
+    *(volatile uint32_t *)LAPIC_ICR_LOW = icr_low;
+    for (i = 0; i < 100000; i++) {
+        asm volatile("pause" : : : "memory");
+    }
+}
+
+/* Start the AP in real mode at 0x8000, where it marks EDX and halts */
+static void start_marked_ap(void)
+{
+    static const uint8_t code[] = {
+        0x66, 0xba, 0x5a, 0xa5, 0x5a, 0xa5, /* mov $AP_EDX_MARK, %edx */
+        0xf4,                               /* hlt */
+        0xeb, 0xfd,                         /* jmp back to hlt */
+    };
+    /* Volatile: SIPI fetches these instruction bytes from guest RAM. */
+    volatile uint8_t *dst = (volatile uint8_t *)0x8000;
+    unsigned i;
+
+    for (i = 0; i < sizeof(code); i++) {
+        dst[i] = code[i];
+    }
+    lapic_ipi(0x4500); /* INIT, level assert */
+    lapic_ipi(0x4608); /* SIPI, vector 8 -> physical 0x8000 */
 }
 #endif
 
@@ -1964,6 +2003,8 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             fail_msg("SEXIT abandoned a sleeping AP", 16384);
         }
         join[0] = ACM_GDT_LIMIT;
+        /* SENTER sleep ignores INIT: the AP must join with its own EDX */
+        lapic_ipi(0x4500);
 #ifdef TEST_TXT_MONITOR_WAKE
         {
             /* Volatile: a guest MMIO register, not ordinary RAM. */
@@ -2013,6 +2054,13 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             ml_printf("PASS: RLP joined MLE through TXT.MLE_JOIN\n");
         }
 #endif
+        if (ap_joined && ap_edx != AP_EDX_MARK) {
+            ml_printf("smx: AP joined with EDX=0x%x\n", ap_edx);
+            fail_msg("an INIT reset the RLP in SENTER sleep", 16384);
+        } else if (ap_joined) {
+            ml_printf("PASS: an INIT does not reset the RLP in SENTER "
+                      "sleep\n");
+        }
     }
 #else
     asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
@@ -2183,6 +2231,9 @@ int main(void)
     /* Enable SSE before any txt_read64()/txt_write64() (see above). */
     write_cr4(read_cr4() | CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK);
     ml_printf("smx: SSE enabled, cr4=0x%x\n", read_cr4());
+#ifdef TEST_TXT_SMP
+    start_marked_ap();
+#endif
 
     /* 1. With CR4.SMXE clear, GETSEC raises #UD. */
     cr4 = read_cr4();

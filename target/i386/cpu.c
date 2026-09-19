@@ -10653,7 +10653,13 @@ int x86_cpu_pending_interrupt(const CPUState *cs, int interrupt_request)
 
 static bool x86_cpu_has_work(CPUState *cs)
 {
-    return x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
+    /*
+     * The CPU loop takes INIT itself, so a halted CPU has to wake for it,
+     * unless it sleeps in TXT's SENTER sleep, which INIT does not end
+     */
+    return (cpu_test_interrupt(cs, CPU_INTERRUPT_INIT) &&
+            !cpu_env(cs)->txt_ap_parked) ||
+           x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
 }
 #endif /* !CONFIG_USER_ONLY */
 

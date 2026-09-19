@@ -19,12 +19,16 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "tcg/helper-tcg.h"
+#include "hw/i386/amd_drtm.h"
+#include "hw/i386/apic_internal.h"
+#include "trace.h"
 
 /* Secure Virtual Machine helpers */
 
@@ -594,6 +598,10 @@ void helper_stgi(CPUX86State *env)
 {
     cpu_svm_check_intercept_param(env, SVM_EXIT_STGI, 0, GETPC());
 
+    if (env->vm_cr & MSR_VM_CR_R_INIT) {
+        qemu_log_mask(LOG_GUEST_ERROR, "STGI with VM_CR.R_INIT still set:"
+                      " an INIT now arrives as #SX (APM 15.30.1)\n");
+    }
     if (virtual_gif_enabled(env)) {
         env->int_ctl |= V_GIF_MASK;
         env->hflags2 |= HF2_VGIF_MASK;
@@ -612,6 +620,84 @@ void helper_clgi(CPUX86State *env)
     } else {
         env->hflags2 &= ~HF2_GIF_MASK;
     }
+}
+
+void helper_skinit(CPUX86State *env)
+{
+    CPUState *cs = env_cpu(env);
+    X86CPU *cpu = env_archcpu(env);
+    AmdDrtmPlatform *p = amd_drtm_platform_find();
+    CPUX86State *save;
+    CPUState *other;
+    int interrupt_request;
+    hwaddr base;
+    uint16_t entry, length;
+
+    /* Without a platform to launch on the instruction stays unimplemented */
+    if (!p) {
+        raise_exception_ra(env, EXCP06_ILLOP, GETPC());
+    }
+
+    base = (uint32_t)env->regs[R_EAX] & 0xffff0000;
+    entry = x86_lduw_phys(cs, base);
+    length = x86_lduw_phys(cs, base + 2);
+
+    /* What hardware assumes rather than checks, APM 15.27.2 and 15.27.8 */
+    if (length < 4 || entry >= length) {
+        qemu_log_mask(LOG_GUEST_ERROR, "SKINIT: SLB at 0x%" HWADDR_PRIx
+                      " has entry offset 0x%x outside its measured length"
+                      " 0x%x (APM 15.27.2)\n", base, entry, length);
+    }
+    CPU_FOREACH(other) {
+        APICCommonState *apic = X86_CPU(other)->apic_state;
+
+        if (other != cs && !(apic && apic->wait_for_sipi)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "SKINIT: CPU %d is not parked"
+                          " in wait-for-SIPI (APM 15.27.8)\n",
+                          other->cpu_index);
+        }
+    }
+
+    trace_x86_skinit(cs->cpu_index, base, entry, length);
+
+    /*
+     * Reset the core as INIT does. The APIC is not SL entry state, and
+     * interrupts pending now stay pending until STGI (APM 15.27.6).
+     */
+    bql_lock();
+    save = g_new(CPUX86State, 1);
+    *save = *env;
+    interrupt_request = cs->interrupt_request;
+    cpu_reset(cs);
+    cs->interrupt_request = interrupt_request;
+    cs->halted = 0;
+    memcpy(&env->start_init_save, &save->start_init_save,
+           offsetof(CPUX86State, end_init_save) -
+           offsetof(CPUX86State, start_init_save));
+    g_free(save);
+
+    /* Flat 32-bit protected mode, DS through GS as the reset left them */
+    cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) & ~CR0_PG_MASK);
+    cpu_x86_load_seg_cache(env, R_CS, 0x08, 0, 0xffffffff,
+                           DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
+                           DESC_S_MASK | DESC_CS_MASK | DESC_R_MASK |
+                           DESC_A_MASK);
+    cpu_x86_load_seg_cache(env, R_SS, 0x10, 0, 0xffffffff,
+                           DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
+                           DESC_S_MASK | DESC_W_MASK | DESC_A_MASK);
+    /* The reset zeroed the other GPRs and put family/model/stepping in EDX */
+    env->regs[R_EAX] = base;
+    env->regs[R_ESP] = base + 0x10000;
+    cpu_load_efer(env, 0);
+    env->vm_cr |= MSR_VM_CR_DPD | MSR_VM_CR_R_INIT | MSR_VM_CR_DIS_A20M;
+    x86_cpu_apply_a20(cpu);
+    env->hflags2 &= ~HF2_GIF_MASK;
+
+    /* Measured after the reset, so the image hashed is the one entered */
+    amd_drtm_launch(p, base, length);
+    bql_unlock();
+
+    env->eip = base + entry;
 }
 
 bool cpu_svm_has_intercept(CPUX86State *env, uint32_t type)

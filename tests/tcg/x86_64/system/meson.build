@@ -52,11 +52,13 @@ tests += {
   }
 }
 
-# AMD SVM state, which the default model lacks
 tests += {
-  'vm-cr.c': {
+  # A launchable AMD machine: the skinit bit, the launch record, an AP to
+  # park
+  'skinit.c': {
     'cflags': cflags,
-    'qemu_args': ['-cpu', 'max'] + qemu_def_args,
+    'qemu_args': ['-machine', 'q35', '-cpu', 'max,+skinit', '-smp', '2',
+                  '-device', 'amd-drtm-platform'] + qemu_def_args,
   },
 }
 

@@ -34,6 +34,11 @@
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-loop.h"
 #include "tcg/insn-start-words.h"
+#ifndef CONFIG_USER_ONLY
+#include "hw/i386/amd_drtm.h"
+#include "hw/i386/apic_internal.h"
+#include "trace.h"
+#endif
 #endif
 
 void cpu_sync_avx_hflag(CPUX86State *env)
@@ -664,8 +669,17 @@ void do_cpu_init(X86CPU *cpu)
 void do_cpu_sipi(X86CPU *cpu)
 {
     CPUX86State *env = &cpu->env;
+    AmdDrtmPlatform *p = amd_drtm_platform_find();
+
     if (env->hflags & HF_SMM_MASK) {
         return;
+    }
+    /* APM 15.27.8: after SKINIT an AP starts the way the BSP entered the SL */
+    if (p && amd_drtm_launched(p) && cpu->apic_state->wait_for_sipi) {
+        env->vm_cr |= MSR_VM_CR_DPD | MSR_VM_CR_R_INIT | MSR_VM_CR_DIS_A20M;
+        x86_cpu_apply_a20(cpu);
+        env->hflags2 &= ~HF2_GIF_MASK;
+        trace_x86_sipi_after_launch(CPU(cpu)->cpu_index);
     }
     apic_sipi(cpu->apic_state);
 }

@@ -89,5 +89,6 @@ void tpm_tis_request_completed(TPMState *s, int ret);
 uint32_t tpm_tis_read_data(TPMState *s, hwaddr addr, unsigned size);
 void tpm_tis_write_data(TPMState *s, hwaddr addr, uint64_t val, uint32_t size);
 uint16_t tpm_tis_get_checksum(TPMState *s);
+int tpm_tis_hash_image(TPMState *s, const uint8_t *data, size_t len);
 
 #endif /* TPM_TPM_TIS_H */

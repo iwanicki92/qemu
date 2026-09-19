@@ -299,6 +299,14 @@ static enum TPMVersion tpm_tis_i2c_get_tpm_version(TPMIf *ti)
     return tpm_tis_get_tpm_version(s);
 }
 
+static int tpm_tis_i2c_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
+{
+    TPMStateI2C *i2cst = TPM_TIS_I2C(ti);
+    TPMState *s = &i2cst->state;
+
+    return tpm_tis_hash_image(s, data, len);
+}
+
 static int tpm_tis_i2c_event(I2CSlave *i2c, enum i2c_event event)
 {
     TPMStateI2C *i2cst = TPM_TIS_I2C(i2c);
@@ -545,6 +553,7 @@ static void tpm_tis_i2c_class_init(ObjectClass *klass, const void *data)
     tc->model = TPM_MODEL_TPM_TIS;
     tc->request_completed = tpm_tis_i2c_request_completed;
     tc->get_version = tpm_tis_i2c_get_tpm_version;
+    tc->hash_image = tpm_tis_i2c_hash_image;
 }
 
 static const TypeInfo tpm_tis_i2c_info = {

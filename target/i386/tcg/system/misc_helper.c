@@ -28,6 +28,7 @@
 #include "exec/cputlb.h"
 #include "tcg/helper-tcg.h"
 #include "hw/i386/apic.h"
+#include "trace.h"
 
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
 {
@@ -186,6 +187,10 @@ void helper_wrmsr(CPUX86State *env)
             if (env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_FFXSR) {
                 update_mask |= MSR_EFER_FFXSR;
             }
+            /* VM_CR.SVMDIS makes SVME must-be-zero */
+            if ((val & MSR_EFER_SVME) && (env->vm_cr & MSR_VM_CR_SVMDIS)) {
+                goto error;
+            }
             cpu_load_efer(env, (env->efer & ~update_mask) |
                           (val & update_mask));
         }
@@ -215,6 +220,28 @@ void helper_wrmsr(CPUX86State *env)
                                      MSR_AMD64_MMIO_CONF_BUS_RANGE |
                                      MSR_AMD64_MMIO_CONF_BASE_ADDR);
         break;
+    case MSR_VM_CR: {
+        const uint64_t locked = MSR_VM_CR_LOCK | MSR_VM_CR_SVMDIS;
+        uint64_t old = env->vm_cr;
+
+        if (val & ~(MSR_VM_CR_DPD | MSR_VM_CR_R_INIT | MSR_VM_CR_DIS_A20M |
+                    locked)) {
+            goto error;
+        }
+        /* Setting SVMDIS under an enabled SVM faults even when LOCK holds */
+        if ((val & MSR_VM_CR_SVMDIS) && (env->efer & MSR_EFER_SVME)) {
+            goto error;
+        }
+        if (old & MSR_VM_CR_LOCK) {
+            val = (val & ~locked) | (old & locked);
+        }
+        env->vm_cr = val;
+        trace_x86_vm_cr_write(cs->cpu_index, old, val);
+        bql_lock();
+        x86_cpu_apply_a20(env_archcpu(env));
+        bql_unlock();
+        break;
+    }
 #ifdef TARGET_X86_64
     case MSR_LSTAR:
         env->lstar = val;
@@ -370,6 +397,9 @@ void helper_rdmsr(CPUX86State *env)
         break;
     case MSR_AMD64_MMIO_CONF_BASE:
         val = env->mmio_conf_base;
+        break;
+    case MSR_VM_CR:
+        val = env->vm_cr;
         break;
     case MSR_IA32_PERF_STATUS:
         /* tsc_increment_by_tick */

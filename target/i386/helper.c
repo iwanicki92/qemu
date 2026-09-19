@@ -114,9 +114,16 @@ int cpu_x86_support_mca_broadcast(CPUX86State *env)
 #ifndef CONFIG_USER_ONLY
 void x86_cpu_set_a20(X86CPU *cpu, int a20_state)
 {
-    CPUX86State *env = &cpu->env;
+    cpu->env.a20_gate = a20_state != 0;
+    x86_cpu_apply_a20(cpu);
+}
 
-    a20_state = (a20_state != 0);
+/* VM_CR.DIS_A20M holds the line high whatever the gate says */
+void x86_cpu_apply_a20(X86CPU *cpu)
+{
+    CPUX86State *env = &cpu->env;
+    int a20_state = env->a20_gate || (env->vm_cr & MSR_VM_CR_DIS_A20M);
+
     if (a20_state != ((env->a20_mask >> 20) & 1)) {
         CPUState *cs = CPU(cpu);
 
@@ -625,6 +632,11 @@ void do_cpu_init(X86CPU *cpu)
            offsetof(CPUX86State, end_init_save) -
            offsetof(CPUX86State, start_init_save));
     g_free(save);
+
+    /* APM 15.30.1: INIT clears SVMDIS unless LOCK holds it */
+    if (!(env->vm_cr & MSR_VM_CR_LOCK)) {
+        env->vm_cr &= ~MSR_VM_CR_SVMDIS;
+    }
 
     if (kvm_enabled()) {
         kvm_arch_do_init_vcpu(cpu);

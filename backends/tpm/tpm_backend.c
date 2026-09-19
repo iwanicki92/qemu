@@ -21,6 +21,7 @@
 #include "qemu/module.h"
 #include "block/thread-pool.h"
 #include "qemu/error-report.h"
+#include "trace.h"
 
 static void tpm_backend_request_completed(void *opaque, int ret)
 {
@@ -172,6 +173,44 @@ TPMInfo *tpm_backend_query_tpm(TPMBackend *s)
     info->options = k->get_tpm_options(s);
 
     return info;
+}
+
+int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+    size_t off = 0;
+    int ret;
+
+    if (!k->hash_start || !k->hash_data || !k->hash_end) {
+        return -ENOTSUP;
+    }
+    if (s->had_startup_error) {
+        return -EIO;
+    }
+    if (s->cmd) {
+        return -EBUSY;
+    }
+
+    ret = k->hash_start(s);
+    trace_tpm_backend_hash_start(ret);
+    if (ret < 0) {
+        return ret;
+    }
+
+    while (off < len) {
+        size_t n = MIN(len - off, TPM_BACKEND_HASH_CHUNK);
+
+        ret = k->hash_data(s, data + off, n);
+        trace_tpm_backend_hash_data(n, ret);
+        if (ret < 0) {
+            return ret;
+        }
+        off += n;
+    }
+
+    ret = k->hash_end(s);
+    trace_tpm_backend_hash_end(ret);
+    return ret;
 }
 
 static void tpm_backend_instance_finalize(Object *obj)

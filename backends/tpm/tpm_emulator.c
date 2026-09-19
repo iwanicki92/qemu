@@ -551,6 +551,106 @@ static int tpm_emulator_reset_tpm_established_flag(TPMBackend *tb,
     return 0;
 }
 
+static int tpm_emulator_hash_start(TPMBackend *tb)
+{
+    TPMEmulator *tpm_emu = TPM_EMULATOR(tb);
+    ptm_res res;
+
+    if (!TPM_EMULATOR_IMPLEMENTS_ALL_CAPS(tpm_emu, PTM_CAP_HASHING)) {
+        trace_tpm_emulator_hash_cmd_not_supt();
+        return -ENOTSUP;
+    }
+
+    trace_tpm_emulator_hash_start();
+
+    if (tpm_emulator_ctrlcmd(tpm_emu, CMD_HASH_START, &res, 0,
+                             sizeof(ptm_res), sizeof(res)) < 0) {
+        error_report("tpm-emulator: Could not send CMD_HASH_START");
+        return -EIO;
+    }
+
+    res = be32_to_cpu(res);
+    if (res) {
+        error_report("tpm-emulator: TPM result for CMD_HASH_START: 0x%x %s",
+                     res, tpm_emulator_strerror(res));
+        return -EIO;
+    }
+
+    /* the sequence sets the TPM Established flag, so the cache is stale */
+    tpm_emu->established_flag_cached = 0;
+
+    return 0;
+}
+
+static int tpm_emulator_hash_data(TPMBackend *tb, const uint8_t *data,
+                                  size_t len)
+{
+    TPMEmulator *tpm_emu = TPM_EMULATOR(tb);
+    g_autofree ptm_hdata *hdata = NULL;
+    ptm_res res;
+
+    if (!TPM_EMULATOR_IMPLEMENTS_ALL_CAPS(tpm_emu, PTM_CAP_HASHING)) {
+        trace_tpm_emulator_hash_cmd_not_supt();
+        return -ENOTSUP;
+    }
+
+    if (len > sizeof(hdata->u.req.data)) {
+        return -EINVAL;
+    }
+
+    trace_tpm_emulator_hash_data(len);
+
+    hdata = g_new(ptm_hdata, 1);
+    hdata->u.req.length = cpu_to_be32(len);
+    memcpy(hdata->u.req.data, data, len);
+
+    /* the request is the length field and the data, not the whole union */
+    if (tpm_emulator_ctrlcmd(tpm_emu, CMD_HASH_DATA, hdata,
+                             offsetof(ptm_hdata, u.req.data) + len,
+                             sizeof(hdata->u.resp.tpm_result),
+                             sizeof(hdata->u.resp)) < 0) {
+        error_report("tpm-emulator: Could not send CMD_HASH_DATA");
+        return -EIO;
+    }
+
+    res = be32_to_cpu(hdata->u.resp.tpm_result);
+    if (res) {
+        error_report("tpm-emulator: TPM result for CMD_HASH_DATA: 0x%x %s",
+                     res, tpm_emulator_strerror(res));
+        return -EIO;
+    }
+
+    return 0;
+}
+
+static int tpm_emulator_hash_end(TPMBackend *tb)
+{
+    TPMEmulator *tpm_emu = TPM_EMULATOR(tb);
+    ptm_res res;
+
+    if (!TPM_EMULATOR_IMPLEMENTS_ALL_CAPS(tpm_emu, PTM_CAP_HASHING)) {
+        trace_tpm_emulator_hash_cmd_not_supt();
+        return -ENOTSUP;
+    }
+
+    trace_tpm_emulator_hash_end();
+
+    if (tpm_emulator_ctrlcmd(tpm_emu, CMD_HASH_END, &res, 0,
+                             sizeof(ptm_res), sizeof(res)) < 0) {
+        error_report("tpm-emulator: Could not send CMD_HASH_END");
+        return -EIO;
+    }
+
+    res = be32_to_cpu(res);
+    if (res) {
+        error_report("tpm-emulator: TPM result for CMD_HASH_END: 0x%x %s",
+                     res, tpm_emulator_strerror(res));
+        return -EIO;
+    }
+
+    return 0;
+}
+
 static void tpm_emulator_cancel_cmd(TPMBackend *tb)
 {
     TPMEmulator *tpm_emu = TPM_EMULATOR(tb);
@@ -1098,6 +1198,9 @@ static void tpm_emulator_class_init(ObjectClass *klass, const void *data)
     tbc->cancel_cmd = tpm_emulator_cancel_cmd;
     tbc->get_tpm_established_flag = tpm_emulator_get_tpm_established_flag;
     tbc->reset_tpm_established_flag = tpm_emulator_reset_tpm_established_flag;
+    tbc->hash_start = tpm_emulator_hash_start;
+    tbc->hash_data = tpm_emulator_hash_data;
+    tbc->hash_end = tpm_emulator_hash_end;
     tbc->get_tpm_version = tpm_emulator_get_tpm_version;
     tbc->get_buffer_size = tpm_emulator_get_buffer_size;
     tbc->get_tpm_options = tpm_emulator_get_tpm_options;

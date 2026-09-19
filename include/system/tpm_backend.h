@@ -80,7 +80,18 @@ struct TPMBackendClass {
     TpmTypeOptions *(*get_tpm_options)(TPMBackend *t);
 
     void (*handle_request)(TPMBackend *s, TPMBackendCmd *cmd, Error **errp);
+
+    /*
+     * optional: the locality 4 hash sequence a processor drives at a
+     * dynamic launch, chunks of at most TPM_BACKEND_HASH_CHUNK bytes
+     */
+    int (*hash_start)(TPMBackend *t);
+    int (*hash_data)(TPMBackend *t, const uint8_t *data, size_t len);
+    int (*hash_end)(TPMBackend *t);
 };
+
+/* what one hash_data call carries, the size of ptm_hdata's data field */
+#define TPM_BACKEND_HASH_CHUNK 4096
 
 /**
  * tpm_backend_get_type:
@@ -208,6 +219,21 @@ void tpm_backend_finish_sync(TPMBackend *s);
  * Returns newly allocated TPMInfo
  */
 TPMInfo *tpm_backend_query_tpm(TPMBackend *s);
+
+/**
+ * tpm_backend_hash_image:
+ * @s: the backend
+ * @data: the image to measure
+ * @len: its length in bytes
+ *
+ * Run the locality 4 hash sequence over @data: PCRs 17 to 22 reset,
+ * PCR 17 extended with the image digest in every active bank. No guest
+ * command may be in flight.
+ *
+ * Returns 0 on success, -ENOTSUP if the backend has no locality 4 path,
+ * -EBUSY with a command in flight, or another negative errno.
+ */
+int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len);
 
 TPMBackend *qemu_find_tpm_be(const char *id);
 

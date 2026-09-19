@@ -10645,7 +10645,9 @@ int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request)
 
 static bool x86_cpu_has_work(CPUState *cs)
 {
-    return x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
+    /* The CPU loop takes INIT itself, so a halted CPU has to wake for it */
+    return cpu_test_interrupt(cs, CPU_INTERRUPT_INIT) ||
+           x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
 }
 #endif /* !CONFIG_USER_ONLY */
 

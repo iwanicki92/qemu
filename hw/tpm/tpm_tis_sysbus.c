@@ -83,6 +83,14 @@ static enum TPMVersion tpm_tis_sysbus_get_tpm_version(TPMIf *ti)
     return tpm_tis_get_tpm_version(s);
 }
 
+static int tpm_tis_sysbus_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
+{
+    TPMStateSysBus *sbdev = TPM_TIS_SYSBUS(ti);
+    TPMState *s = &sbdev->state;
+
+    return tpm_tis_hash_image(s, data, len);
+}
+
 static void tpm_tis_sysbus_reset(DeviceState *dev)
 {
     TPMStateSysBus *sbdev = TPM_TIS_SYSBUS(dev);
@@ -149,6 +157,7 @@ static void tpm_tis_sysbus_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, tpm_tis_sysbus_reset);
     tc->request_completed = tpm_tis_sysbus_request_completed;
     tc->get_version = tpm_tis_sysbus_get_tpm_version;
+    tc->hash_image = tpm_tis_sysbus_hash_image;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 

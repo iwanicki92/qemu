@@ -83,6 +83,14 @@ static enum TPMVersion tpm_tis_isa_get_tpm_version(TPMIf *ti)
     return tpm_tis_get_tpm_version(s);
 }
 
+static int tpm_tis_isa_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
+{
+    TPMStateISA *isadev = TPM_TIS_ISA(ti);
+    TPMState *s = &isadev->state;
+
+    return tpm_tis_hash_image(s, data, len);
+}
+
 static void tpm_tis_isa_reset(DeviceState *dev)
 {
     TPMStateISA *isadev = TPM_TIS_ISA(dev);
@@ -177,6 +185,7 @@ static void tpm_tis_isa_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, tpm_tis_isa_reset);
     tc->request_completed = tpm_tis_isa_request_completed;
     tc->get_version = tpm_tis_isa_get_tpm_version;
+    tc->hash_image = tpm_tis_isa_hash_image;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     adevc->build_dev_aml = build_tpm_tis_isa_aml;
 }

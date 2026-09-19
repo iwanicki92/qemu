@@ -810,6 +810,20 @@ enum TPMVersion tpm_tis_get_tpm_version(TPMState *s)
 }
 
 /*
+ * The locality 4 hash a processor sends at a dynamic launch. It reaches the
+ * backend directly: the interface registers only observe its outcome, so
+ * the active locality, the status bits and the FIFO stay as they are.
+ */
+int tpm_tis_hash_image(TPMState *s, const uint8_t *data, size_t len)
+{
+    int ret = tpm_backend_hash_image(s->be_driver, data, len);
+
+    trace_tpm_tis_hash_image(len, ret);
+
+    return ret;
+}
+
+/*
  * This function is called when the machine starts, resets or due to
  * S3 resume.
  */

@@ -163,6 +163,11 @@ config AMD_IOMMU
     bool
     select X86_IOMMU
 
+config AMD_DRTM
+    bool
+    default y
+    depends on I386 && TPM
+
 config VMPORT
     bool
 

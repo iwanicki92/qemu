@@ -568,6 +568,12 @@ typedef enum X86Seg {
 
 #define MSR_K7_HWCR                     0xc0010015
 
+#define MSR_VM_CR                       0xc0010114
+#define MSR_VM_CR_DPD                   (1ULL << 0)
+#define MSR_VM_CR_R_INIT                (1ULL << 1)
+#define MSR_VM_CR_DIS_A20M              (1ULL << 2)
+#define MSR_VM_CR_LOCK                  (1ULL << 3)
+#define MSR_VM_CR_SVMDIS                (1ULL << 4)
 #define MSR_VM_HSAVE_PA                 0xc0010117
 
 #define MSR_AMD64_MMIO_CONF_BASE        0xc0010058

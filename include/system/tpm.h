@@ -43,6 +43,8 @@ struct TPMIfClass {
     void (*request_completed)(TPMIf *obj, int ret);
     enum TPMVersion (*get_version)(TPMIf *obj);
     bool ppi_enabled;
+    /* optional: the locality 4 hash the processor sends at SKINIT */
+    int (*hash_image)(TPMIf *obj, const uint8_t *data, size_t len);
 };
 
 #define TYPE_TPM_TIS_ISA            "tpm-tis"
@@ -85,6 +87,25 @@ static inline bool tpm_ppi_enabled(TPMIf *ti)
         return false;
     }
     return TPM_IF_GET_CLASS(ti)->ppi_enabled;
+}
+
+/*
+ * Measure an image as the processor does at SKINIT: PCRs 17 to 22 reset,
+ * PCR 17 extended with its digest. Returns 0, -ENOTSUP when the frontend or
+ * its backend has no locality 4 path, or another negative errno.
+ */
+static inline int tpm_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
+{
+    TPMIfClass *tic;
+
+    if (!ti) {
+        return -ENOTSUP;
+    }
+    tic = TPM_IF_GET_CLASS(ti);
+    if (!tic->hash_image) {
+        return -ENOTSUP;
+    }
+    return tic->hash_image(ti, data, len);
 }
 
 #else /* CONFIG_TPM */

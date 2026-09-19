@@ -66,6 +66,7 @@
 #include "hw/mem/nvdimm.h"
 #include "hw/uefi/var-service-api.h"
 #include "hw/i386/acpi-build.h"
+#include "hw/i386/amd_drtm.h"
 #include "target/i386/cpu.h"
 
 #ifdef CONFIG_TPM
@@ -493,6 +494,7 @@ static void pc_q35_machine_options(MachineClass *m)
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_RAMFB_DEVICE);
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_VMBUS_BRIDGE);
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_UEFI_VARS_X64);
+    machine_class_allow_dynamic_sysbus_dev(m, TYPE_AMD_DRTM_PLATFORM);
     object_class_property_add_bool(oc, "wdat",
         pc_q35_machine_get_wdat, pc_q35_machine_set_wdat);
     object_class_property_set_description(oc, "wdat",

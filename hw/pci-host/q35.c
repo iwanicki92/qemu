@@ -67,6 +67,7 @@ static void q35_host_realize(DeviceState *dev, Error **errp)
                                 s->mch.address_space_io,
                                 0, TYPE_PCIE_BUS);
 
+    qdev_prop_set_bit(DEVICE(&s->mch), "multifunction", s->mch_multifunction);
     qdev_realize(DEVICE(&s->mch), BUS(pci->bus), &error_fatal);
 }
 
@@ -193,6 +194,12 @@ static const Property q35_host_props[] = {
     DEFINE_PROP_BOOL(PCI_HOST_PROP_SMM_RANGES, Q35PCIHost,
                      mch.has_smm_ranges, true),
     DEFINE_PROP_BOOL("x-pci-hole64-fix", Q35PCIHost, pci_hole64_fix, true),
+    /*
+     * Lets other functions sit beside the MCH at 00:00, which AMD firmware
+     * does with the IOMMU at 00:00.2 and software written for it expects.
+     */
+    DEFINE_PROP_BOOL("mch-multifunction", Q35PCIHost, mch_multifunction,
+                     false),
 };
 
 static void q35_host_class_init(ObjectClass *klass, const void *data)

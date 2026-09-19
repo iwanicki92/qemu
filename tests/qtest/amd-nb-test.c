@@ -1,5 +1,5 @@
 /*
- * QTest testcase for the AMD northbridge stub
+ * QTest testcase for the AMD northbridge stub and the MCH's function bit
  *
  * Copyright (c) 2026 iwanicki92 <iwanicki92@gmail.com>
  *
@@ -102,9 +102,59 @@ static void test_memprot(void)
     qtest_quit(qts);
 }
 
+static void test_mch_multifunction(void)
+{
+    QTestState *qts;
+    QPCIBus *bus;
+    QPCIDevice *mch;
+    QPCIDevice *dev;
+
+    if (!qtest_has_device("AMDVI-PCI")) {
+        g_test_skip("AMDVI-PCI not available");
+        return;
+    }
+
+    /* Off by default, so 00:00 stays single function. */
+    qts = qtest_init("-M q35");
+    bus = qpci_new_pc(qts, NULL);
+    mch = qpci_device_find(bus, PCI_DEVFN(0, 0));
+    g_assert_nonnull(mch);
+    g_assert_cmphex(qpci_config_readb(mch, PCI_HEADER_TYPE) &
+                    PCI_HEADER_TYPE_MULTI_FUNCTION, ==, 0);
+    g_free(mch);
+    qpci_free_pc(bus);
+    qtest_quit(qts);
+
+    /* A function above 0 is refused, as before. */
+    qts = qtest_init_ext(NULL, "-M q35 -device AMDVI-PCI,addr=0.2", NULL,
+                         false);
+    qtest_set_expected_status(qts, 1);
+    qtest_wait_qemu(qts);
+    qtest_quit(qts);
+
+    /* On, the header says so and 00:00.2 answers. */
+    qts = qtest_init("-M q35 -global q35-pcihost.mch-multifunction=on"
+                     " -device AMDVI-PCI,addr=0.2");
+    bus = qpci_new_pc(qts, NULL);
+    mch = qpci_device_find(bus, PCI_DEVFN(0, 0));
+    g_assert_nonnull(mch);
+    g_assert_cmphex(qpci_config_readb(mch, PCI_HEADER_TYPE) &
+                    PCI_HEADER_TYPE_MULTI_FUNCTION, ==,
+                    PCI_HEADER_TYPE_MULTI_FUNCTION);
+    dev = qpci_device_find(bus, PCI_DEVFN(0, 2));
+    g_assert_nonnull(dev);
+    g_assert_cmphex(qpci_config_readw(dev, PCI_VENDOR_ID), ==,
+                    PCI_VENDOR_ID_AMD);
+    g_free(dev);
+    g_free(mch);
+    qpci_free_pc(bus);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/q35/amd-nb/memprot", test_memprot);
+    qtest_add_func("/q35/mch-multifunction", test_mch_multifunction);
     return g_test_run();
 }

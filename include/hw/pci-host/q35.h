@@ -64,6 +64,7 @@ struct Q35PCIHost {
     /*< public >*/
 
     bool pci_hole64_fix;
+    bool mch_multifunction;
     MCHPCIState mch;
 };
 

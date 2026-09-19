@@ -52,6 +52,14 @@ tests += {
   }
 }
 
+# AMD SVM state, which the default model lacks
+tests += {
+  'vm-cr.c': {
+    'cflags': cflags,
+    'qemu_args': ['-cpu', 'max'] + qemu_def_args,
+  },
+}
+
 if 'qemu-system-x86_64' in emulators
   tcg_tests += {
     'x86_64-softmmu': {

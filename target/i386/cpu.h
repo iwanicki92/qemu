@@ -2090,6 +2090,9 @@ typedef struct CPUArchState {
 
     uint64_t vm_hsave;
     uint64_t mmio_conf_base;
+    uint64_t vm_cr;
+    /* The A20 gate as the chipset set it, reapplied when DIS_A20M clears */
+    bool a20_gate;
 
 #ifdef TARGET_X86_64
     uint64_t lstar;
@@ -2814,6 +2817,7 @@ static inline bool x86_has_cpuid_0x1f(X86CPU *cpu)
 
 /* helper.c */
 void x86_cpu_set_a20(X86CPU *cpu, int a20_state);
+void x86_cpu_apply_a20(X86CPU *cpu);
 void cpu_sync_avx_hflag(CPUX86State *env);
 
 typedef enum X86ASIdx {

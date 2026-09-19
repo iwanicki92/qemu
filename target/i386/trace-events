@@ -24,3 +24,6 @@ getsec_senter(void) "GETSEC[SENTER]: staged measured launch"
 getsec_senter_no_chipset(void) "GETSEC[SENTER]: no TXT chipset device, #GP(0)"
 getsec_ap_parked(int cpu_index) "GETSEC[SENTER]: RLP %d asleep"
 getsec_ap_joined(int cpu_index, uint32_t entry) "GETSEC[WAKEUP]: RLP %d joined at 0x%"PRIx32
+
+# tcg/system/misc_helper.c
+x86_vm_cr_write(int cpu_index, uint64_t old, uint64_t val) "cpu %d 0x%" PRIx64 " -> 0x%" PRIx64

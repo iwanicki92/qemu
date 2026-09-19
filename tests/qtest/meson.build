@@ -97,6 +97,8 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_Q35') and                                        \
    config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['txt-test'] : []) +               \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['tpm-tis-swtpm-test'] : []) +        \
+  (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') and                                     \
+   config_all_devices.has_key('CONFIG_AMD_DRTM') ? ['tpm-drtm-swtpm-test'] : []) +          \
   (config_all_devices.has_key('CONFIG_RTL8139_PCI') ? ['rtl8139-test'] : []) +              \
   (config_all_devices.has_key('CONFIG_E1000E_PCI_EXPRESS') ? ['fuzz-e1000e-test'] : []) +   \
   (config_all_devices.has_key('CONFIG_MEGASAS_SCSI_PCI') ? ['fuzz-megasas-test'] : []) +    \
@@ -431,6 +433,7 @@ qtests = {
   'qos-test': [chardev, io, qos_test_ss.apply({}).sources()],
   'tpm-crb-swtpm-test': [io, tpmemu_files],
   'tpm-crb-test': [io, tpmemu_files],
+  'tpm-drtm-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'tpm-tis-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'tpm-tis-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'txt-test': [io, tpmemu_files],

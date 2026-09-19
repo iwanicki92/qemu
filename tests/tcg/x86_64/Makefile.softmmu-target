@@ -34,8 +34,10 @@ memory: CFLAGS+=-DCHECK_UNALIGNED=1
 # Running
 QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4 -kernel
 
-# AMD SVM state, which the default model lacks. Prepended, -kernel is last.
-run-vm-cr: QEMU_OPTS := -cpu max $(QEMU_OPTS)
+# A launchable AMD machine: the skinit bit, the launch record, an AP to
+# park. Prepended, since -kernel is last.
+run-skinit: QEMU_OPTS := -machine q35 -cpu max,+skinit -smp 2 \
+	-device amd-drtm-platform $(QEMU_OPTS)
 
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\

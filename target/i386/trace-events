@@ -16,5 +16,11 @@ kvm_sev_snp_launch_update(uint64_t src, uint64_t gpa, uint64_t len, const char *
 kvm_sev_snp_launch_finish(char *id_block, char *id_auth, char *host_data) "id_block %s id_auth %s host_data %s"
 sev_handle_reset(void) ""
 
+# helper.c
+x86_sipi_after_launch(int cpu_index) "cpu %d starts with GIF clear and VM_CR DPD, R_INIT and DIS_A20M set"
+
 # tcg/system/misc_helper.c
 x86_vm_cr_write(int cpu_index, uint64_t old, uint64_t val) "cpu %d 0x%" PRIx64 " -> 0x%" PRIx64
+
+# tcg/system/svm_helper.c
+x86_skinit(int cpu_index, uint64_t base, uint32_t entry, uint32_t length) "cpu %d slb 0x%" PRIx64 " entry 0x%x length 0x%x"

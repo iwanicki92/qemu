@@ -798,6 +798,96 @@ static void test_launch_signature(const void *data)
     tpm_stop(s, swtpm_pid, addr);
 }
 
+/*
+ * After a launch: EXTEND_OSSL_DIGEST hashes a range inside a TMR into
+ * PCR 17 and PCR 18, then the SKL marker after it, and refuses an empty,
+ * wrapping or uncovered range. TPM_LOCALITY_ACCESS locks locality 2 and
+ * opens 4. Both are unsupported before the launch.
+ */
+#define DLME_BASE   0x300000
+#define DLME_LEN    0x1234
+
+static uint32_t extend_ossl_digest(QTestState *s, uint64_t base,
+                                   uint32_t size)
+{
+    qtest_writel(s, MBOX_ARG0, size);
+    qtest_writel(s, MBOX_ARG1, base);
+    qtest_writel(s, MBOX_ARG2, base >> 32);
+    return mbox_command(s, AMD_PSP_DRTM_CMD(
+                               AMD_PSP_DRTM_CMD_EXTEND_OSSL_DIGEST, 0));
+}
+
+static void test_after_launch(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t launch = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH, 0);
+    const uint32_t access = AMD_PSP_DRTM_CMD(
+                                AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS, 0);
+    uint8_t slb[AMD_PSP_SLB_SIZE], dlme[DLME_LEN];
+    uint8_t pcr17[SHA256_LEN], pcr18[SHA256_LEN];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    unsigned i;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, PSP ",verify=off", &swtpm_pid, &addr);
+    build_slb(slb);
+    qtest_memwrite(s, SLB_BASE, slb, sizeof(slb));
+    for (i = 0; i < DLME_LEN; i++) {
+        dlme[i] = i * 5 + 1;
+    }
+    qtest_memwrite(s, DLME_BASE, dlme, sizeof(dlme));
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+
+    /* Not before the launch */
+    g_assert_cmphex(extend_ossl_digest(s, DLME_BASE, DLME_LEN), ==,
+                    AMD_PSP_DRTM_NOT_SUPPORTED);
+    g_assert_cmphex(mbox_command(s, access), ==, AMD_PSP_DRTM_NOT_SUPPORTED);
+
+    skinit(s, SLB_MEASURED);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_NO_ERROR);
+    pcr_read(s, 17, pcr17);
+    pcr_read(s, 18, pcr18);
+
+    /* Empty, wrapping, and past the TMR's 4 MiB: nothing extended */
+    g_assert_cmphex(extend_ossl_digest(s, DLME_BASE, 0), ==,
+                    AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
+    g_assert_cmphex(extend_ossl_digest(s, 0xfffffffffffff000ull, 0x2000), ==,
+                    AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
+    g_assert_cmphex(extend_ossl_digest(s, 0x3ff000, 0x2000), ==,
+                    AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
+    g_assert_cmphex(extend_ossl_digest(s, 0x400000, 0x1000), ==,
+                    AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
+    assert_pcr(s, 17, pcr17);
+    assert_pcr(s, 18, pcr18);
+
+    /* The range's digest, then the marker, into both PCRs */
+    g_assert_cmphex(extend_ossl_digest(s, DLME_BASE, DLME_LEN), ==,
+                    AMD_PSP_DRTM_NO_ERROR);
+    extend(pcr17, dlme, DLME_LEN);
+    extend(pcr17, "SKL", 3);
+    extend(pcr18, dlme, DLME_LEN);
+    extend(pcr18, "SKL", 3);
+    assert_pcr(s, 17, pcr17);
+    assert_pcr(s, 18, pcr18);
+
+    /* Locality 2 handed back to the PSP, 4 opened, 1 still open */
+    g_assert_cmphex(tis_access(s, 2), !=, 0xffffffff);
+    g_assert_cmphex(tis_access(s, 4), ==, 0xffffffff);
+    g_assert_cmphex(mbox_command(s, access), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(tis_access(s, 1), !=, 0xffffffff);
+    g_assert_cmphex(tis_access(s, 2), ==, 0xffffffff);
+    g_assert_cmphex(tis_access(s, 4), !=, 0xffffffff);
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
 /* locality-locks=off leaves the TIS as it is without a PSP */
 static void test_locks_off(const void *data)
 {
@@ -848,6 +938,8 @@ int main(int argc, char **argv)
                         test_launch_fails);
     qtest_add_data_func("/amd-psp/drtm/launch-signature", tpm_path,
                         test_launch_signature);
+    qtest_add_data_func("/amd-psp/drtm/after-launch", tpm_path,
+                        test_after_launch);
     qtest_add_data_func("/amd-psp/drtm/locks-off", tpm_path, test_locks_off);
 
     ret = g_test_run();

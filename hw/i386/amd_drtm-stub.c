@@ -42,7 +42,7 @@ void amd_drtm_sl_dev_release(AmdDrtmPlatform *p)
 }
 
 void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
-                        const char *name)
+                        const char *name, bool fetch)
 {
 }
 

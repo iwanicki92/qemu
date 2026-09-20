@@ -183,7 +183,7 @@ txt_dmar_rejected(uint64_t addr, uint32_t len) "sinit_mle_data: DMAR at 0x%"PRIx
 amd_drtm_launch(uint64_t base, uint16_t length) "SLB base 0x%" PRIx64 " length 0x%x"
 amd_drtm_hash(uint64_t base, uint16_t length, const char *result) "SLB base 0x%" PRIx64 " length 0x%x: %s"
 amd_drtm_sl_dev_release(bool launched, bool sl_dev) "launched %d sl_dev %d"
-amd_drtm_block_dma(const char *name, uint64_t base, uint64_t len, bool enforced) "%s base 0x%" PRIx64 " len 0x%" PRIx64 " enforced %d"
+amd_drtm_block_dma(const char *name, uint64_t base, uint64_t len, bool fetch, bool enforced) "%s base 0x%" PRIx64 " len 0x%" PRIx64 " fetch %d enforced %d"
 amd_drtm_dma_blocked(const char *name, uint64_t addr, unsigned size, bool is_write) "%s addr 0x%" PRIx64 " size %u write %d"
 amd_drtm_unblock_dma(const char *name, bool found) "%s found %d"
 amd_drtm_guest_error(const char *rule, bool strict) "%s (strict %d)"

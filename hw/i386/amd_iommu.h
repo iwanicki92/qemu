@@ -371,7 +371,10 @@ struct AMDVIState {
     MemoryRegion mr_sys;
     MemoryRegion mr_nodma;
     MemoryRegion mr_ir;
-    AddressSpace as_sys;               /* the IOMMU's own view of mr_sys */
+    AddressSpace as_sys;               /* device DMA once translated */
+    MemoryRegion mr_fetch;             /* the IOMMU's own accesses */
+    MemoryRegion mr_fetch_mem;
+    AddressSpace as_fetch;
     uint8_t mmior[AMDVI_MMIO_SIZE];    /* read/write MMIO              */
     uint8_t w1cmask[AMDVI_MMIO_SIZE];  /* read/write 1 clear mask      */
     uint8_t romask[AMDVI_MMIO_SIZE];   /* MMIO read/only mask          */
@@ -400,9 +403,12 @@ uint64_t amdvi_extended_feature_register(AMDVIState *s);
 
 /*
  * Keep DMA out of a range: @mr joins the physical view every device's
- * address space and the IOMMU's own fetches go through, above memory.
+ * address space goes through, above memory. @fetch_mr, when given, joins
+ * the view the IOMMU's own table, command and log accesses go through.
  */
-void amdvi_add_dma_block(AMDVIState *s, MemoryRegion *mr, hwaddr base);
-void amdvi_del_dma_block(AMDVIState *s, MemoryRegion *mr);
+void amdvi_add_dma_block(AMDVIState *s, MemoryRegion *mr,
+                         MemoryRegion *fetch_mr, hwaddr base);
+void amdvi_del_dma_block(AMDVIState *s, MemoryRegion *mr,
+                         MemoryRegion *fetch_mr);
 
 #endif

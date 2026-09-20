@@ -118,7 +118,8 @@ void amd_drtm_launch(AmdDrtmPlatform *p, hwaddr base, uint16_t length)
     p->slb_base = base;
     p->slb_length = length;
     p->sl_dev = true;
-    amd_drtm_block_dma(p, base, AMD_DRTM_SLB_SIZE, AMD_DRTM_SL_DEV_BLOCK);
+    amd_drtm_block_dma(p, base, AMD_DRTM_SLB_SIZE, AMD_DRTM_SL_DEV_BLOCK,
+                       true);
     amd_drtm_hash(p);
 }
 
@@ -204,7 +205,7 @@ static void amd_drtm_free_block(struct rcu_head *rcu)
 }
 
 void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
-                        const char *name)
+                        const char *name, bool fetch)
 {
     AMDVIState *iommu = amd_drtm_iommu(p);
     AmdDrtmBlock *b;
@@ -216,14 +217,21 @@ void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
     b->name = g_strdup(name);
     b->base = base;
     b->len = len;
+    b->fetch = fetch;
     memory_region_init_io(&b->mr, OBJECT(p), &amd_drtm_block_ops, b, name,
                           len);
+    if (fetch) {
+        g_autofree char *fetch_name = g_strdup_printf("%s-fetch", name);
+
+        memory_region_init_alias(&b->fetch_mr, OBJECT(p), fetch_name, &b->mr,
+                                 0, len);
+    }
     if (iommu) {
-        amdvi_add_dma_block(iommu, &b->mr, base);
+        amdvi_add_dma_block(iommu, &b->mr, fetch ? &b->fetch_mr : NULL, base);
         b->enforced = true;
     }
     QLIST_INSERT_HEAD(&p->blocks, b, next);
-    trace_amd_drtm_block_dma(name, base, len, b->enforced);
+    trace_amd_drtm_block_dma(name, base, len, fetch, b->enforced);
 }
 
 void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
@@ -235,7 +243,11 @@ void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
         return;
     }
     if (b->enforced) {
-        amdvi_del_dma_block(amd_drtm_iommu(p), &b->mr);
+        amdvi_del_dma_block(amd_drtm_iommu(p), &b->mr,
+                            b->fetch ? &b->fetch_mr : NULL);
+    }
+    if (b->fetch) {
+        object_unparent(OBJECT(&b->fetch_mr));
     }
     object_unparent(OBJECT(&b->mr));
     QLIST_REMOVE(b, next);

@@ -65,6 +65,8 @@ struct Q35PCIHost {
 
     bool pci_hole64_fix;
     bool mch_multifunction;
+    /* Registered by the machine, since the MSR lives in target code */
+    Notifier mmio_conf_notifier;
     MCHPCIState mch;
 };
 

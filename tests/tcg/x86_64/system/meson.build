@@ -60,6 +60,11 @@ tests += {
     'qemu_args': ['-machine', 'q35', '-cpu', 'max,+skinit', '-smp', '2',
                   '-device', 'amd-drtm-platform'] + qemu_def_args,
   },
+  # The MSR maps MMCONFIG on the q35 host only
+  'mmio-conf.c': {
+    'cflags': cflags,
+    'qemu_args': ['-machine', 'q35'] + qemu_def_args,
+  },
 }
 
 if 'qemu-system-x86_64' in emulators

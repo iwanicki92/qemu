@@ -214,12 +214,28 @@ void helper_wrmsr(CPUX86State *env)
         }
         env->vm_hsave = val;
         break;
-    case MSR_AMD64_MMIO_CONF_BASE:
+    case MSR_AMD64_MMIO_CONF_BASE: {
+        bool locked;
+
+        /* Bus ranges beyond 256 buses are reserved */
+        if (((val & MSR_AMD64_MMIO_CONF_BUS_RANGE) >> 2) > 8) {
+            goto error;
+        }
         /* Enable, bus range and base address. Reserved bits read as zero. */
         env->mmio_conf_base = val & (MSR_AMD64_MMIO_CONF_ENABLE |
                                      MSR_AMD64_MMIO_CONF_BUS_RANGE |
                                      MSR_AMD64_MMIO_CONF_BASE_ADDR);
+        /* The machine remaps MMCONFIG from it, which needs the lock */
+        locked = bql_locked();
+        if (!locked) {
+            bql_lock();
+        }
+        x86_cpu_mmio_conf_base_notify(env_archcpu(env));
+        if (!locked) {
+            bql_unlock();
+        }
         break;
+    }
     case MSR_VM_CR: {
         const uint64_t locked = MSR_VM_CR_LOCK | MSR_VM_CR_SVMDIS;
         uint64_t old = env->vm_cr;

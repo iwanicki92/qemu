@@ -66,6 +66,25 @@
 #define OSSL_MARKER_LEN             5
 #define OSSL_CHUNK                  0x10000
 
+/*
+ * The event log's header, as the board's log has it: an EV_NO_ACTION
+ * event in PCR 0 with a zero SHA-1 digest carrying the Spec ID Event03
+ * structure, TCG2 version 2.0, one algorithm, SHA-256.
+ */
+static const uint8_t tcg_log_header[] = {
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x21, 0x00, 0x00, 0x00,
+    'S', 'p', 'e', 'c', ' ', 'I', 'D', ' ', 'E', 'v', 'e', 'n', 't', '0',
+    '3', 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00,
+    0x0b, 0x00, 0x20, 0x00, 0x00,
+};
+
+/* A TCG_PCR_EVENT2 with one SHA-256 digest, before its event data */
+#define TCG_EVENT2_OVERHEAD         (12 + 2 + SHA256_LEN + 4)
+
 /* The stepping is masked when the SOC flag list is compared */
 #define CPUID_STEPPING_MASK         0xf
 
@@ -179,14 +198,85 @@ static int amd_psp_pcr_extend(AmdPspState *s, unsigned pcr,
     return amd_psp_tpm_run(s, cmd, sizeof(cmd), rsp, sizeof(rsp));
 }
 
-/* Extend @pcr with the SHA-256 of @data */
-static int amd_psp_extend(AmdPspState *s, unsigned pcr, const void *data,
-                          size_t len)
+static void amd_psp_log_write(AmdPspState *s, uint32_t off, const void *buf,
+                              size_t len)
+{
+    memcpy((uint8_t *)memory_region_get_ram_ptr(&s->tcg_log) + off, buf, len);
+    memory_region_set_dirty(&s->tcg_log, off, len);
+}
+
+static void amd_psp_log_clear(AmdPspState *s)
+{
+    if (s->tcg_log_len) {
+        memset(memory_region_get_ram_ptr(&s->tcg_log), 0, s->tcg_log_len);
+        memory_region_set_dirty(&s->tcg_log, 0, s->tcg_log_len);
+    }
+    s->tcg_log_len = 0;
+    s->tcg_log_full = false;
+}
+
+/* One event appended to the log, the header first when the log is empty */
+static void amd_psp_log_event(AmdPspState *s, unsigned pcr, uint16_t type,
+                              const uint8_t *digest, const void *data,
+                              uint32_t len)
+{
+    uint8_t ev[TCG_EVENT2_OVERHEAD];
+    uint32_t need = TCG_EVENT2_OVERHEAD + len;
+
+    if (s->tcg_log_full) {
+        return;
+    }
+    if (!s->tcg_log_len) {
+        amd_psp_log_write(s, 0, tcg_log_header, sizeof(tcg_log_header));
+        s->tcg_log_len = sizeof(tcg_log_header);
+    }
+    if (s->tcg_log_len + need > AMD_PSP_TCG_LOG_SIZE) {
+        s->tcg_log_full = true;
+        amd_drtm_guest_error(s->platform, "amd-psp: the event log is full, "
+                             "GET_TCG_LOGS will fail from now on");
+        return;
+    }
+    stl_le_p(ev, pcr);
+    stl_le_p(ev + 4, type);
+    stl_le_p(ev + 8, 1);
+    stw_le_p(ev + 12, TPM2_ALG_SHA256);
+    memcpy(ev + 14, digest, SHA256_LEN);
+    stl_le_p(ev + 14 + SHA256_LEN, len);
+    amd_psp_log_write(s, s->tcg_log_len, ev, sizeof(ev));
+    if (len) {
+        amd_psp_log_write(s, s->tcg_log_len + sizeof(ev), data, len);
+    }
+    s->tcg_log_len += need;
+    trace_amd_psp_drtm_log_event(pcr, type, len);
+}
+
+/* Extend @pcr with @digest and log it as @type, with @data as event data */
+static int amd_psp_extend_digest(AmdPspState *s, unsigned pcr, uint16_t type,
+                                 const uint8_t *digest, const void *data,
+                                 uint32_t len)
+{
+    int ret = amd_psp_pcr_extend(s, pcr, digest);
+
+    if (ret < 0) {
+        return ret;
+    }
+    amd_psp_log_event(s, pcr, type, digest, data, len);
+    return 0;
+}
+
+/*
+ * Extend @pcr with the SHA-256 of @data and log it as @type. The board's
+ * log carries the data itself for the short values and nothing for the
+ * hashed blobs.
+ */
+static int amd_psp_extend(AmdPspState *s, unsigned pcr, uint16_t type,
+                          const void *data, size_t len, bool log_data)
 {
     uint8_t digest[SHA256_LEN];
 
     amd_psp_sha256(data, len, digest);
-    return amd_psp_pcr_extend(s, pcr, digest);
+    return amd_psp_extend_digest(s, pcr, type, digest, log_data ? data : NULL,
+                                 log_data ? len : 0);
 }
 
 static void amd_psp_apply_locks(AmdPspState *s)
@@ -244,6 +334,7 @@ amd_psp_launch_failed(AmdPspState *s, const char *fmt, ...)
         amd_psp_pcr_extend(s, pcr, ones);
     }
     s->launch = AMD_PSP_LAUNCH_FAILED;
+    amd_psp_log_clear(s);
     amd_psp_unlock(s, BIT(4));
     return AMD_PSP_DRTM_LAUNCH_ERROR;
 }
@@ -548,25 +639,30 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
         return amd_psp_launch_failed(s, "PCR 17 does not hold the measurement "
                                      "of the SLB's first 0x%x bytes", length);
     }
+    /* SKINIT's own extend heads the log, though the service did not make it */
+    amd_psp_log_event(s, 17, AMD_PSP_EV_SL_IMAGE, expected + SHA256_LEN, NULL,
+                      0);
 
     words[0] = cpu_to_le32(s->splt_version);
-    if (amd_psp_extend(s, 17, words, 4) < 0) {
+    if (amd_psp_extend(s, 17, AMD_PSP_EV_SPLT_VERSION, words, 4, true) < 0) {
         return amd_psp_launch_failed(s, "PCR 17 extend with the SPLT version "
                                      "failed");
     }
     /* TSME off, anti-rollback set: the board's fuse words, in this order */
     words[0] = 0;
     words[1] = cpu_to_le32(1);
-    if (amd_psp_extend(s, 17, words, 8) < 0) {
+    if (amd_psp_extend(s, 17, AMD_PSP_EV_FUSE_STATE, words, 8, true) < 0) {
         return amd_psp_launch_failed(s, "PCR 17 extend with the fuse state "
                                      "failed");
     }
-    if (amd_psp_extend(s, 18, token, TOKEN_LEN) < 0) {
+    if (amd_psp_extend(s, 18, AMD_PSP_EV_KEY_TOKEN, token, TOKEN_LEN,
+                       false) < 0) {
         return amd_psp_launch_failed(s, "PCR 18 extend with the key token "
                                      "failed");
     }
     words[0] = cpu_to_le32(sec_patch_level);
-    if (amd_psp_extend(s, 18, words, 4) < 0) {
+    if (amd_psp_extend(s, 18, AMD_PSP_EV_SEC_PATCH_LEVEL, words, 4,
+                       true) < 0) {
         return amd_psp_launch_failed(s, "PCR 18 extend with the patch level "
                                      "failed");
     }
@@ -665,10 +761,14 @@ static uint16_t amd_psp_cmd_extend_ossl_digest(AmdPspState *s)
     }
     trace_amd_psp_drtm_extend_ossl_digest(base, size,
                                           amd_psp_hex(digest, hex));
-    if (amd_psp_pcr_extend(s, 17, digest) < 0 ||
-        amd_psp_pcr_extend(s, 18, digest) < 0 ||
-        amd_psp_extend(s, 17, OSSL_MARKER, OSSL_MARKER_LEN) < 0 ||
-        amd_psp_extend(s, 18, OSSL_MARKER, OSSL_MARKER_LEN) < 0) {
+    if (amd_psp_extend_digest(s, 17, AMD_PSP_EV_OS_SL_LOAD, digest, NULL,
+                              0) < 0 ||
+        amd_psp_extend_digest(s, 18, AMD_PSP_EV_OS_SL_LOAD, digest, NULL,
+                              0) < 0 ||
+        amd_psp_extend(s, 17, AMD_PSP_EV_AMD_SL_SEPARATOR, OSSL_MARKER,
+                       OSSL_MARKER_LEN, true) < 0 ||
+        amd_psp_extend(s, 18, AMD_PSP_EV_AMD_SL_SEPARATOR, OSSL_MARKER,
+                       OSSL_MARKER_LEN, true) < 0) {
         amd_drtm_guest_error(s->platform, "amd-psp: EXTEND_OSSL_DIGEST could "
                              "not extend PCR 17 and PCR 18");
         return AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED;
@@ -685,6 +785,23 @@ static uint16_t amd_psp_cmd_tpm_locality_access(AmdPspState *s)
     trace_amd_psp_drtm_tpm_locality_access();
     s->locks |= BIT(2);
     amd_psp_unlock(s, BIT(4));
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
+/*
+ * The log's size in C2PMSG_93 and its address in _94 and _95, as the
+ * board answered. What the board answers before any launch is untested:
+ * an empty log is taken as the failed status.
+ */
+static uint16_t amd_psp_cmd_get_tcg_logs(AmdPspState *s)
+{
+    if (!s->tcg_log_len || s->tcg_log_full) {
+        return AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR;
+    }
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG0] = s->tcg_log_len;
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG1] = s->tcg_log_base;
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG2] = s->tcg_log_base >> 32;
+    trace_amd_psp_drtm_get_tcg_logs(s->tcg_log_base, s->tcg_log_len);
     return AMD_PSP_DRTM_NO_ERROR;
 }
 
@@ -770,10 +887,11 @@ static uint16_t amd_psp_dispatch(AmdPspState *s, uint8_t cmd, unsigned index)
     case AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS:
         return amd_psp_cmd_tpm_locality_access(s);
     case AMD_PSP_DRTM_CMD_GET_TCG_LOGS:
+        return amd_psp_cmd_get_tcg_logs(s);
     case AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS:
     case AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY:
     case AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO:
-        /* The four the fork never issues, not modelled */
+        /* The three the fork never issues, not modelled */
         return AMD_PSP_DRTM_NOT_SUPPORTED;
     default:
         return AMD_PSP_DRTM_INVALID_SERVICE_ID_ERROR;
@@ -918,6 +1036,7 @@ static void amd_psp_reset(DeviceState *dev)
         for (i = 0; i < AMD_PSP_DRTM_TMR_MAX; i++) {
             amd_psp_tmr_release(s, i);
         }
+        amd_psp_log_clear(s);
     }
     s->kicked = false;
     s->busy = false;
@@ -969,10 +1088,22 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
                        "2^24");
             return;
         }
+        if (s->tcg_log_base & (AMD_PSP_TCG_LOG_SIZE - 1)) {
+            error_setg(errp, "tcg-log-base must be aligned to 0x%x",
+                       AMD_PSP_TCG_LOG_SIZE);
+            return;
+        }
         s->bh = qemu_bh_new_guarded(amd_psp_run_command, s,
                                     &DEVICE(s)->mem_reentrancy_guard);
         s->delay_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                       amd_psp_delay_expired, s);
+        /* The event log, read like memory, written by the service alone */
+        if (!memory_region_init_rom(&s->tcg_log, OBJECT(s), "amd-psp-tcg-log",
+                                    AMD_PSP_TCG_LOG_SIZE, errp)) {
+            return;
+        }
+        memory_region_add_subregion(get_system_memory(), s->tcg_log_base,
+                                    &s->tcg_log);
     }
 
     memory_region_init_io(&s->mmio, OBJECT(s), &amd_psp_mmio_ops, s,
@@ -998,6 +1129,7 @@ static void amd_psp_exit(PCIDevice *pci_dev)
 
     memory_region_del_subregion(get_system_memory(), &s->window);
     if (s->drtm_service) {
+        memory_region_del_subregion(get_system_memory(), &s->tcg_log);
         timer_free(s->delay_timer);
         qemu_bh_delete(s->bh);
     }
@@ -1024,6 +1156,8 @@ static const Property amd_psp_properties[] = {
     /* Milliseconds the ready bit stays clear after each command */
     DEFINE_PROP_UINT32("command-delay", AmdPspState, command_delay, 0),
     DEFINE_PROP_BOOL("locality-locks", AmdPspState, locality_locks, true),
+    DEFINE_PROP_UINT64("tcg-log-base", AmdPspState, tcg_log_base,
+                       AMD_PSP_TCG_LOG_BASE),
 };
 
 static void amd_psp_class_init(ObjectClass *klass, const void *data)

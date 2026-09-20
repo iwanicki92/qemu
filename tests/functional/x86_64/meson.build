@@ -6,6 +6,7 @@ test_x86_64_timeouts = {
   'kvm_xen' : 180,
   'netdev_ethtool' : 180,
   'replay' : 480,
+  'trenchboot' : 600,
   'virtio_balloon': 120,
 }
 
@@ -51,4 +52,5 @@ tests_x86_64_system_thorough = [
   'virtio_balloon',
   'virtio_gpu',
   'rebuild_vmfd',
+  'trenchboot',
 ]

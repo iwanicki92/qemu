@@ -730,6 +730,74 @@ static void test_launch_fails(const void *data)
     tpm_stop(s, swtpm_pid, addr);
 }
 
+/*
+ * The signature check on a real AMDSL SKL image: the launch fails when a
+ * signature byte or a signed byte is flipped, and passes with the image
+ * whole. A build without gcrypt or nettle skips the check and passes
+ * regardless.
+ */
+#define SKL_IMAGE "tests/data/amd-psp-drtm/skl.bin"
+
+static void test_launch_signature(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t launch = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH, 0);
+    g_autofree uint8_t *slb = g_malloc0(AMD_PSP_SLB_SIZE);
+    g_autofree char *skl = NULL;
+    uint8_t pcr18[SHA256_LEN];
+    uint32_t words[1];
+    uint32_t measured, hdr_off, signed_len, sec_patch_level;
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    gsize len;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    g_assert_true(g_file_get_contents(SKL_IMAGE, &skl, &len, NULL));
+    g_assert_cmpuint(len, <=, AMD_PSP_SLB_SIZE);
+    memcpy(slb, skl, len);
+    measured = lduw_le_p(slb + 2);
+    hdr_off = ROUND_UP(measured, 16);
+    g_assert_cmpmem(slb + hdr_off + 0x10, 4, "$AS1", 4);
+    signed_len = ldl_le_p(slb + hdr_off + 0x14);
+    sec_patch_level = ldl_le_p(slb + hdr_off + 0x4c);
+    g_assert_cmpuint(signed_len + 0x200 + TOKEN_LEN, <=, len);
+
+    s = tpm_start(tpm_path, PSP, &swtpm_pid, &addr);
+    qtest_memwrite(s, SLB_BASE, slb, AMD_PSP_SLB_SIZE);
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+
+#if defined(CONFIG_GCRYPT) || \
+    (defined(CONFIG_NETTLE) && defined(CONFIG_HOGWEED))
+    /* A signature byte flipped */
+    qtest_writeb(s, SLB_BASE + signed_len, slb[signed_len] ^ 0xff);
+    skinit(s, measured);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    qtest_writeb(s, SLB_BASE + signed_len, slb[signed_len]);
+
+    /* A signed but unmeasured byte flipped: the header's image version */
+    qtest_writeb(s, SLB_BASE + hdr_off + 0x60, slb[hdr_off + 0x60] ^ 0xff);
+    skinit(s, measured);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    qtest_writeb(s, SLB_BASE + hdr_off + 0x60, slb[hdr_off + 0x60]);
+#endif
+
+    skinit(s, measured);
+    pcr_read(s, 18, pcr18);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_NO_ERROR);
+    extend(pcr18, slb + signed_len + 0x200, TOKEN_LEN);
+    words[0] = cpu_to_le32(sec_patch_level);
+    extend(pcr18, words, sizeof(words));
+    assert_pcr(s, 18, pcr18);
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
 /* locality-locks=off leaves the TIS as it is without a PSP */
 static void test_locks_off(const void *data)
 {
@@ -778,6 +846,8 @@ int main(int argc, char **argv)
     qtest_add_data_func("/amd-psp/drtm/launch", tpm_path, test_launch);
     qtest_add_data_func("/amd-psp/drtm/launch-fails", tpm_path,
                         test_launch_fails);
+    qtest_add_data_func("/amd-psp/drtm/launch-signature", tpm_path,
+                        test_launch_signature);
     qtest_add_data_func("/amd-psp/drtm/locks-off", tpm_path, test_locks_off);
 
     ret = g_test_run();

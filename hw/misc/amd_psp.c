@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/misc/amd_psp.h"
+#include "crypto/akcipher.h"
 #include "crypto/hash.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/i386/amd_drtm.h"
@@ -41,6 +42,21 @@
 #define TOKEN_LEN                   0x440
 #define SIG_TAG                     "$AS1"
 
+/*
+ * The key token: the sizes in bits, then the exponent and the modulus,
+ * each little-endian in a 512-byte field. The signature is RSA-PSS over
+ * the first SizeFWSigned bytes with SHA-384, MGF1 and a salt as long as
+ * the hash (RFC 8017), little-endian too.
+ */
+#define KEY_HDR_EXP_BITS            56
+#define KEY_HDR_MOD_BITS            60
+#define KEY_EXP_OFF                 64
+#define KEY_MOD_OFF                 576
+#define KEY_PART_LEN                512
+#define SHA384_LEN                  48
+#define PSS_SALT_LEN                SHA384_LEN
+#define PSS_TRAILER                 0xbc
+
 /* The stepping is masked when the SOC flag list is compared */
 #define CPUID_STEPPING_MASK         0xf
 
@@ -58,15 +74,24 @@
 #define TPM2_PCR_READ_RSP_LEN       62
 #define TPM2_PCR_READ_DIGEST_OFF    30
 
-static void amd_psp_sha256(const void *data, size_t len, uint8_t *digest)
+/* SHA-256 and SHA-384 are always there, through glib when no library is */
+static void amd_psp_hash(QCryptoHashAlgo alg, const void *data, size_t len,
+                         uint8_t *digest, size_t digest_len)
 {
-    size_t digest_len = SHA256_LEN;
-
-    /* SHA-256 is always there, through glib when no library is */
-    if (qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256, data, len, &digest,
-                           &digest_len, &error_abort) < 0) {
+    if (qcrypto_hash_bytes(alg, data, len, &digest, &digest_len,
+                           &error_abort) < 0) {
         g_assert_not_reached();
     }
+}
+
+static void amd_psp_sha256(const void *data, size_t len, uint8_t *digest)
+{
+    amd_psp_hash(QCRYPTO_HASH_ALGO_SHA256, data, len, digest, SHA256_LEN);
+}
+
+static void amd_psp_sha384(const void *data, size_t len, uint8_t *digest)
+{
+    amd_psp_hash(QCRYPTO_HASH_ALGO_SHA384, data, len, digest, SHA384_LEN);
 }
 
 static const char *amd_psp_hex(const uint8_t *digest, char *out)
@@ -241,14 +266,188 @@ static void amd_psp_check_soc_flags(AmdPspState *s, const uint8_t *slb)
     trace_amd_psp_drtm_soc_flags(cpu, count, match);
 }
 
-/* The signature check, to come: nothing verifies yet */
+static size_t der_put_len(uint8_t *out, size_t len)
+{
+    if (len < 0x80) {
+        out[0] = len;
+        return 1;
+    }
+    if (len < 0x100) {
+        out[0] = 0x81;
+        out[1] = len;
+        return 2;
+    }
+    out[0] = 0x82;
+    out[1] = len >> 8;
+    out[2] = len;
+    return 3;
+}
+
+/* A DER INTEGER from a big-endian magnitude */
+static size_t der_put_uint(uint8_t *out, const uint8_t *be, size_t len)
+{
+    size_t n = 0;
+    bool pad;
+
+    while (len > 1 && be[0] == 0) {
+        be++;
+        len--;
+    }
+    pad = be[0] & 0x80;
+    out[n++] = 0x02;
+    n += der_put_len(out + n, len + pad);
+    if (pad) {
+        out[n++] = 0;
+    }
+    memcpy(out + n, be, len);
+    return n + len;
+}
+
+/* The token's key as the PKCS#1 RSAPublicKey the crypto layer parses */
+static size_t amd_psp_token_to_der(const uint8_t *token, uint8_t *der,
+                                   Error **errp)
+{
+    uint32_t exp_bits = ldl_le_p(token + KEY_HDR_EXP_BITS);
+    uint32_t mod_bits = ldl_le_p(token + KEY_HDR_MOD_BITS);
+    uint8_t exp[KEY_PART_LEN], mod[KEY_PART_LEN];
+    uint8_t body[2 * (KEY_PART_LEN + 5)];
+    size_t n, i;
+
+    if (mod_bits != 8 * SIG_LEN || !exp_bits || exp_bits % 8 ||
+        exp_bits > 8 * KEY_PART_LEN) {
+        error_setg(errp, "key token with a %u-bit modulus and a %u-bit "
+                   "exponent", mod_bits, exp_bits);
+        return 0;
+    }
+    for (i = 0; i < mod_bits / 8; i++) {
+        mod[i] = token[KEY_MOD_OFF + mod_bits / 8 - 1 - i];
+    }
+    for (i = 0; i < exp_bits / 8; i++) {
+        exp[i] = token[KEY_EXP_OFF + exp_bits / 8 - 1 - i];
+    }
+    n = der_put_uint(body, mod, mod_bits / 8);
+    n += der_put_uint(body + n, exp, exp_bits / 8);
+    der[0] = 0x30;
+    i = 1 + der_put_len(der + 1, n);
+    memcpy(der + i, body, n);
+    return i + n;
+}
+
+static void amd_psp_mgf1(const uint8_t *seed, uint8_t *mask, size_t mask_len)
+{
+    uint8_t buf[SHA384_LEN + 4], digest[SHA384_LEN];
+    uint32_t counter = 0;
+    size_t n;
+
+    memcpy(buf, seed, SHA384_LEN);
+    while (mask_len) {
+        stl_be_p(buf + SHA384_LEN, counter++);
+        amd_psp_sha384(buf, sizeof(buf), digest);
+        n = MIN(mask_len, SHA384_LEN);
+        memcpy(mask, digest, n);
+        mask += n;
+        mask_len -= n;
+    }
+}
+
+/*
+ * RFC 8017 9.1.2 on the encoded message the public key operation gave:
+ * with a 4096-bit modulus emBits is 4095, so the top bit of the masked
+ * data block must be clear.
+ */
+static bool amd_psp_pss_verify(const uint8_t *em, const uint8_t *msg,
+                               size_t msg_len, Error **errp)
+{
+    uint8_t db[SIG_LEN - SHA384_LEN - 1];
+    uint8_t mprime[8 + 2 * SHA384_LEN], h[SHA384_LEN];
+    const size_t ps_len = sizeof(db) - PSS_SALT_LEN - 1;
+    const uint8_t *hash = em + sizeof(db);
+    size_t i;
+
+    if (em[SIG_LEN - 1] != PSS_TRAILER) {
+        error_setg(errp, "no PSS trailer");
+        return false;
+    }
+    if (em[0] & 0x80) {
+        error_setg(errp, "PSS encoding wider than the modulus");
+        return false;
+    }
+    amd_psp_mgf1(hash, db, sizeof(db));
+    for (i = 0; i < sizeof(db); i++) {
+        db[i] ^= em[i];
+    }
+    db[0] &= 0x7f;
+    for (i = 0; i < ps_len; i++) {
+        if (db[i]) {
+            error_setg(errp, "PSS padding not zero");
+            return false;
+        }
+    }
+    if (db[ps_len] != 0x01) {
+        error_setg(errp, "no PSS salt separator");
+        return false;
+    }
+    memset(mprime, 0, 8);
+    amd_psp_sha384(msg, msg_len, mprime + 8);
+    memcpy(mprime + 8 + SHA384_LEN, db + ps_len + 1, PSS_SALT_LEN);
+    amd_psp_sha384(mprime, sizeof(mprime), h);
+    if (memcmp(h, hash, SHA384_LEN)) {
+        error_setg(errp, "PSS hash mismatch");
+        return false;
+    }
+    return true;
+}
+
+/*
+ * The signature check over the first SizeFWSigned bytes with the token's
+ * key. The crypto layer offers the raw RSA operation with gcrypt or
+ * nettle and no PSS, so the decode is done here. Without either library
+ * the check is skipped.
+ */
 static AmdPspSignatureResult amd_psp_verify_signature(AmdPspState *s,
                                                       const uint8_t *slb,
                                                       uint32_t signed_len,
                                                       const uint8_t *sig,
-                                                      const uint8_t *token)
+                                                      const uint8_t *token,
+                                                      Error **errp)
 {
-    return AMD_PSP_SIGNATURE_UNSUPPORTED;
+    QCryptoAkCipherOptions opts = {
+        .alg = QCRYPTO_AK_CIPHER_ALGO_RSA,
+        .u.rsa = {
+            .padding_alg = QCRYPTO_RSA_PADDING_ALGO_RAW,
+            .hash_alg = QCRYPTO_HASH_ALGO_SHA384,
+        },
+    };
+    g_autoptr(QCryptoAkCipher) key = NULL;
+    uint8_t der[4 + 2 * (KEY_PART_LEN + 5)];
+    uint8_t sig_be[SIG_LEN], em[SIG_LEN];
+    size_t der_len, i;
+
+    if (!qcrypto_akcipher_supports(&opts)) {
+        warn_report_once("amd-psp: no gcrypt or nettle in this build, the "
+                         "SKL signature is not checked");
+        return AMD_PSP_SIGNATURE_UNSUPPORTED;
+    }
+    der_len = amd_psp_token_to_der(token, der, errp);
+    if (!der_len) {
+        return AMD_PSP_SIGNATURE_FAILED;
+    }
+    key = qcrypto_akcipher_new(&opts, QCRYPTO_AK_CIPHER_KEY_TYPE_PUBLIC, der,
+                               der_len, errp);
+    if (!key) {
+        return AMD_PSP_SIGNATURE_FAILED;
+    }
+    for (i = 0; i < SIG_LEN; i++) {
+        sig_be[i] = sig[SIG_LEN - 1 - i];
+    }
+    if (qcrypto_akcipher_encrypt(key, sig_be, SIG_LEN, em, SIG_LEN,
+                                 errp) != SIG_LEN) {
+        return AMD_PSP_SIGNATURE_FAILED;
+    }
+    if (!amd_psp_pss_verify(em, slb, signed_len, errp)) {
+        return AMD_PSP_SIGNATURE_FAILED;
+    }
+    return AMD_PSP_SIGNATURE_VERIFIED;
 }
 
 /*
@@ -308,9 +507,16 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
     sec_patch_level = ldl_le_p(slb + hdr_off + SIG_HDR_SEC_PATCH_LEVEL);
 
     if (s->verify) {
-        s->signature = amd_psp_verify_signature(s, slb, signed_len, sig, token);
+        Error *err = NULL;
+
+        s->signature = amd_psp_verify_signature(s, slb, signed_len, sig, token,
+                                                &err);
         if (s->signature == AMD_PSP_SIGNATURE_FAILED) {
-            return amd_psp_launch_failed(s, "the signature does not verify");
+            uint16_t status = amd_psp_launch_failed(s, "the signature does not "
+                                                    "verify: %s",
+                                                    error_get_pretty(err));
+            error_free(err);
+            return status;
         }
     } else {
         s->signature = AMD_PSP_SIGNATURE_SKIPPED;

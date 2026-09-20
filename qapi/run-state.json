@@ -506,10 +506,13 @@
 #
 # @sev: AMD SEV-ES guest termination information type (Since: 11.0)
 #
+# @amd-drtm: a rule of the AMD dynamic launch broken under strict
+#     mode (Since: 11.2)
+#
 # Since: 2.9
 ##
 { 'enum': 'GuestPanicInformationType',
-  'data': [ 'hyper-v', 's390', 'tdx', 'sev' ] }
+  'data': [ 'hyper-v', 's390', 'tdx', 'sev', 'amd-drtm' ] }
 
 ##
 # @GuestPanicInformation:
@@ -526,7 +529,8 @@
  'data': {'hyper-v': 'GuestPanicInformationHyperV',
           's390': 'GuestPanicInformationS390',
           'tdx': 'GuestPanicInformationTdx',
-          'sev': 'GuestPanicInformationSev' }}
+          'sev': 'GuestPanicInformationSev',
+          'amd-drtm': 'GuestPanicInformationAmdDrtm' }}
 
 ##
 # @GuestPanicInformationHyperV:
@@ -643,6 +647,20 @@
 {'struct': 'GuestPanicInformationSev',
  'data': {'set': 'uint32',
           'code': 'uint32'}}
+
+##
+# @GuestPanicInformationAmdDrtm:
+#
+# The rule the guest broke, as amd-drtm-platform with strict=on
+# stops the VM for it.  The same text goes to the guest_errors log.
+#
+# @rule: the rule, with the APM section it comes from and the values
+#     seen
+#
+# Since: 11.2
+##
+{'struct': 'GuestPanicInformationAmdDrtm',
+ 'data': {'rule': 'str'}}
 
 ##
 # @MEMORY_FAILURE:

@@ -148,3 +148,4 @@ amd_drtm_hash(uint64_t base, uint16_t length, const char *result) "SLB base 0x%"
 amd_drtm_sl_dev_release(bool launched, bool sl_dev) "launched %d sl_dev %d"
 amd_drtm_block_dma(const char *name, uint64_t base, uint64_t len) "%s base 0x%" PRIx64 " len 0x%" PRIx64
 amd_drtm_unblock_dma(const char *name, bool found) "%s found %d"
+amd_drtm_guest_error(const char *rule, bool strict) "%s (strict %d)"

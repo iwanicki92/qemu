@@ -74,6 +74,46 @@ static void test_launch(void)
     qtest_quit(s);
 }
 
+/*
+ * strict=on turns the guest error a launch without a TPM logs into a
+ * guest panic carrying the rule, and the VM stops. Off, it runs on.
+ */
+static void test_strict(void)
+{
+    QTestState *s;
+    QDict *event, *data, *info, *status;
+    const char *rule;
+
+    s = qtest_init("-M q35 -device amd-drtm-platform,strict=on"
+                   " -action panic=pause");
+    qtest_qmp_assert_success(s, "{ 'execute': 'x-amd-drtm-launch', "
+                             "'arguments': { 'base': %d, 'length': %d } }",
+                             SLB_BASE, SLB_LENGTH);
+
+    event = qtest_qmp_eventwait_ref(s, "GUEST_PANICKED");
+    data = qdict_get_qdict(event, "data");
+    g_assert_cmpstr(qdict_get_str(data, "action"), ==, "pause");
+    info = qdict_get_qdict(data, "info");
+    g_assert_cmpstr(qdict_get_str(info, "type"), ==, "amd-drtm");
+    rule = qdict_get_str(info, "rule");
+    g_assert_nonnull(strstr(rule, "no TPM"));
+    qobject_unref(event);
+
+    status = qtest_qmp_assert_success_ref(s, "{ 'execute': 'query-status' }");
+    g_assert_cmpstr(qdict_get_str(status, "status"), ==, "guest-panicked");
+    qobject_unref(status);
+    qtest_quit(s);
+
+    s = qtest_init("-M q35 -device amd-drtm-platform");
+    qtest_qmp_assert_success(s, "{ 'execute': 'x-amd-drtm-launch', "
+                             "'arguments': { 'base': %d, 'length': %d } }",
+                             SLB_BASE, SLB_LENGTH);
+    status = qtest_qmp_assert_success_ref(s, "{ 'execute': 'query-status' }");
+    g_assert_cmpstr(qdict_get_str(status, "status"), ==, "running");
+    qobject_unref(status);
+    qtest_quit(s);
+}
+
 static void test_second_instance_rejected(void)
 {
     QTestState *s = qtest_init_ext(NULL, "-M q35 -device amd-drtm-platform "
@@ -94,6 +134,7 @@ int main(int argc, char **argv)
     }
 
     qtest_add_func("/q35/amd-drtm/launch", test_launch);
+    qtest_add_func("/q35/amd-drtm/strict", test_strict);
     qtest_add_func("/q35/amd-drtm/second-instance-rejected",
                    test_second_instance_rejected);
     return g_test_run();

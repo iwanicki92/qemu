@@ -45,12 +45,20 @@ struct AmdDrtmPlatform {
     AmdDrtmHashResult hash;
     QLIST_HEAD(, AmdDrtmBlock) blocks;
 
+    bool strict;
     TPMIf *tpm;
     DeviceState *iommu;
 };
 
 /* NULL unless exactly one platform object exists. */
 AmdDrtmPlatform *amd_drtm_platform_find(void);
+
+/*
+ * A rule of the launch the guest broke, one hardware would let through.
+ * Logged as a guest error, and with strict=on the VM stops on it.
+ */
+void amd_drtm_guest_error(AmdDrtmPlatform *p, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
 
 /*
  * Record the SLB SKINIT is entering and measure it into PCR 17. The CPU

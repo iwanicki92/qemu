@@ -599,8 +599,9 @@ void helper_stgi(CPUX86State *env)
     cpu_svm_check_intercept_param(env, SVM_EXIT_STGI, 0, GETPC());
 
     if (env->vm_cr & MSR_VM_CR_R_INIT) {
-        qemu_log_mask(LOG_GUEST_ERROR, "STGI with VM_CR.R_INIT still set:"
-                      " an INIT now arrives as #SX (APM 15.30.1)\n");
+        amd_drtm_guest_error(amd_drtm_platform_find(), "STGI with VM_CR.R_INIT"
+                             " still set: an INIT now arrives as #SX"
+                             " (APM 15.30.1)");
     }
     if (virtual_gif_enabled(env)) {
         env->int_ctl |= V_GIF_MASK;
@@ -644,17 +645,17 @@ void helper_skinit(CPUX86State *env)
 
     /* What hardware assumes rather than checks, APM 15.27.2 and 15.27.8 */
     if (length < 4 || entry >= length) {
-        qemu_log_mask(LOG_GUEST_ERROR, "SKINIT: SLB at 0x%" HWADDR_PRIx
-                      " has entry offset 0x%x outside its measured length"
-                      " 0x%x (APM 15.27.2)\n", base, entry, length);
+        amd_drtm_guest_error(p, "SKINIT: SLB at 0x%" HWADDR_PRIx " has entry"
+                             " offset 0x%x outside its measured length 0x%x"
+                             " (APM 15.27.2)", base, entry, length);
     }
     CPU_FOREACH(other) {
         APICCommonState *apic = X86_CPU(other)->apic_state;
 
         if (other != cs && !(apic && apic->wait_for_sipi)) {
-            qemu_log_mask(LOG_GUEST_ERROR, "SKINIT: CPU %d is not parked"
-                          " in wait-for-SIPI (APM 15.27.8)\n",
-                          other->cpu_index);
+            amd_drtm_guest_error(p, "SKINIT: CPU %d is not parked in"
+                                 " wait-for-SIPI (APM 15.27.8)",
+                                 other->cpu_index);
         }
     }
 

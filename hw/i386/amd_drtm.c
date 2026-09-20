@@ -18,8 +18,10 @@
 #include "qapi/qapi-commands-misc-i386.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
 #include "system/tpm.h"
 #include "trace.h"
 
@@ -28,6 +30,36 @@ AmdDrtmPlatform *amd_drtm_platform_find(void)
     Object *obj = object_resolve_path_type("", TYPE_AMD_DRTM_PLATFORM, NULL);
 
     return obj ? AMD_DRTM_PLATFORM(obj) : NULL;
+}
+
+void amd_drtm_guest_error(AmdDrtmPlatform *p, const char *fmt, ...)
+{
+    g_autofree char *rule = NULL;
+    bool strict = p && p->strict;
+    va_list ap;
+
+    va_start(ap, fmt);
+    rule = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+
+    qemu_log_mask(LOG_GUEST_ERROR, "%s\n", rule);
+    trace_amd_drtm_guest_error(rule, strict);
+
+    if (strict) {
+        GuestPanicInformation *info = g_new0(GuestPanicInformation, 1);
+        bool locked = bql_locked();
+
+        info->type = GUEST_PANIC_INFORMATION_TYPE_AMD_DRTM;
+        info->u.amd_drtm.rule = g_steal_pointer(&rule);
+        /* The CPU's own rule checks arrive without the lock */
+        if (!locked) {
+            bql_lock();
+        }
+        qemu_system_guest_panicked(info);
+        if (!locked) {
+            bql_unlock();
+        }
+    }
 }
 
 /*
@@ -43,9 +75,9 @@ static void amd_drtm_hash(AmdDrtmPlatform *p)
 
     p->tpm = tpm_find();
     if (!p->tpm) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "amd-drtm: SKINIT with no TPM to measure the SLB at 0x%"
-                      HWADDR_PRIx ", PCR 17 stays unmeasured\n", p->slb_base);
+        amd_drtm_guest_error(p, "amd-drtm: SKINIT with no TPM to measure the "
+                             "SLB at 0x%" HWADDR_PRIx ", PCR 17 stays "
+                             "unmeasured", p->slb_base);
         p->hash = AMD_DRTM_HASH_RESULT_UNSUPPORTED;
         goto out;
     }
@@ -53,10 +85,9 @@ static void amd_drtm_hash(AmdDrtmPlatform *p)
     res = address_space_read(&address_space_memory, p->slb_base,
                              MEMTXATTRS_UNSPECIFIED, image, p->slb_length);
     if (res != MEMTX_OK) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "amd-drtm: SLB at 0x%" HWADDR_PRIx " length %u is not "
-                      "readable memory, PCR 17 stays unmeasured\n",
-                      p->slb_base, p->slb_length);
+        amd_drtm_guest_error(p, "amd-drtm: SLB at 0x%" HWADDR_PRIx " length "
+                             "%u is not readable memory, PCR 17 stays "
+                             "unmeasured", p->slb_base, p->slb_length);
         p->hash = AMD_DRTM_HASH_RESULT_FAILED;
         goto out;
     }
@@ -65,10 +96,9 @@ static void amd_drtm_hash(AmdDrtmPlatform *p)
     if (ret == 0) {
         p->hash = AMD_DRTM_HASH_RESULT_OK;
     } else if (ret == -ENOTSUP) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "amd-drtm: the TPM has no locality 4 path (tpm-tis on a "
-                      "swtpm with hashing is needed), PCR 17 stays "
-                      "unmeasured\n");
+        amd_drtm_guest_error(p, "amd-drtm: the TPM has no locality 4 path "
+                             "(tpm-tis on a swtpm with hashing is needed), "
+                             "PCR 17 stays unmeasured");
         p->hash = AMD_DRTM_HASH_RESULT_UNSUPPORTED;
     } else {
         warn_report("amd-drtm: TPM hash of the SLB failed: %s",
@@ -101,8 +131,8 @@ void amd_drtm_sl_dev_release(AmdDrtmPlatform *p)
 {
     trace_amd_drtm_sl_dev_release(p->launched, p->sl_dev);
     if (!p->launched) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "amd-drtm: SL_DEV released with no launch active\n");
+        amd_drtm_guest_error(p, "amd-drtm: SL_DEV released with no launch "
+                             "active");
     }
     p->sl_dev = false;
     amd_drtm_unblock_dma(p, AMD_DRTM_SL_DEV_BLOCK);
@@ -235,6 +265,8 @@ static const Property amd_drtm_platform_properties[] = {
     /* Where SL_DEV and the TMR will be enforced. Nothing reads it yet. */
     DEFINE_PROP_LINK("iommu", AmdDrtmPlatform, iommu, TYPE_AMD_IOMMU_DEVICE,
                      DeviceState *),
+    /* Every guest error the launch logs also stops the VM as a panic */
+    DEFINE_PROP_BOOL("strict", AmdDrtmPlatform, strict, false),
 };
 
 static void amd_drtm_platform_class_init(ObjectClass *klass, const void *data)

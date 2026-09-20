@@ -10,10 +10,22 @@
 #include "hw/i386/amd_drtm.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-misc-i386.h"
+#include "qemu/log.h"
 
 AmdDrtmPlatform *amd_drtm_platform_find(void)
 {
     return NULL;
+}
+
+void amd_drtm_guest_error(AmdDrtmPlatform *p, const char *fmt, ...)
+{
+    g_autofree char *rule = NULL;
+    va_list ap;
+
+    va_start(ap, fmt);
+    rule = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    qemu_log_mask(LOG_GUEST_ERROR, "%s\n", rule);
 }
 
 void amd_drtm_launch(AmdDrtmPlatform *p, hwaddr base, uint16_t length)

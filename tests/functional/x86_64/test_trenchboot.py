@@ -87,10 +87,13 @@ class TrenchBootXen(QemuSystemTest):
 
         self.vm.set_console()
         # Strict, so a broken launch rule stops the VM instead of leaving
-        # a line in the log. The rule is then logged as a guest error.
+        # a line in the log, and paused rather than exited so the log
+        # names the rule under a stopped VM. The rule is logged as a
+        # guest error.
         self.vm.add_args('-accel', 'tcg', '-smp', '2', '-m', '4G',
                          '-machine', 'amd-drtm=on',
                          '-global', 'amd-drtm-platform.strict=on',
+                         '-action', 'panic=pause',
                          '-d', 'guest_errors',
                          '-cpu', 'EPYC-Genoa',
                          '-chardev', f'socket,id=chrtpm,path={tpm_sock}',

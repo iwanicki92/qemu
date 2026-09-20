@@ -10,10 +10,18 @@ import shutil
 import subprocess
 import time
 
+from unittest import skipUnless
+
 from qemu_test import QemuSystemTest, Asset
 from qemu_test import exec_command_and_wait_for_pattern
 from qemu_test import wait_for_console_pattern
 from qemu_test import skipBigDataTest, skipIfMissingCommands
+
+
+# A meta-trenchboot image with the AMDSL SKL and the PSP drivers, which no
+# release carries yet, for the PSP-assisted case. Unset, the case is
+# skipped.
+PSP_IMAGE = os.getenv('QEMU_TEST_TRENCHBOOT_PSP_IMAGE')
 
 
 class TrenchBootXen(QemuSystemTest):
@@ -21,7 +29,8 @@ class TrenchBootXen(QemuSystemTest):
     Boots the meta-trenchboot release image under Dasharo's coreboot+UEFI
     build with the AMD dynamic launch devices, picks the "Boot Xen with
     TrenchBoot (EFI)" GRUB entry and checks that the launch reached dom0
-    with PCR 17 extended.
+    with PCR 17 extended. A second case boots a build with the AMDSL SKL
+    through the emulated PSP DRTM service.
     """
 
     ASSET_FIRMWARE = Asset(
@@ -72,9 +81,11 @@ class TrenchBootXen(QemuSystemTest):
         self.assertIsNotNone(match, f'no PCR {index} in {out!r}')
         return match.group(1).decode()
 
-    @skipIfMissingCommands('swtpm')
-    @skipBigDataTest()
-    def test_x86_64_trenchboot_xen_efi(self):
+    def boot_xen_efi(self, image, *devices):
+        '''
+        Boot the image, pick the Xen EFI launch entry and wait for the
+        login prompt, with any extra device arguments on the machine.
+        '''
         self.set_machine('q35')
         self.require_accelerator('tcg')
         self.require_device('amd-drtm-platform')
@@ -82,7 +93,6 @@ class TrenchBootXen(QemuSystemTest):
 
         firmware = self.scratch_file('firmware.rom')
         shutil.copy(self.ASSET_FIRMWARE.fetch(), firmware)
-        image = self.uncompress(self.ASSET_IMAGE, target='tb-full-image.wic')
         tpm_sock = self.start_swtpm()
 
         self.vm.set_console()
@@ -103,6 +113,8 @@ class TrenchBootXen(QemuSystemTest):
                          '-drive', f'file={image},format=raw,if=none,id=hd,'
                                    'snapshot=on',
                          '-device', 'ide-hd,drive=hd', '-nic', 'none')
+        for device in devices:
+            self.vm.add_args('-device', device)
         self.vm.launch()
 
         wait_for_console_pattern(self, self.GRUB_ENTRY)
@@ -111,8 +123,12 @@ class TrenchBootXen(QemuSystemTest):
             self.KEY_DOWN * self.GRUB_ENTRY_INDEX + b'\r')
         wait_for_console_pattern(self, 'Enabling slaunch')
         wait_for_console_pattern(self, '(XEN) Xen version', 'Panic on CPU')
-        wait_for_console_pattern(self, 'tb login:', 'Panic on CPU')
 
+    def assert_launched(self):
+        '''
+        The platform's record of a launch that reached dom0 with the SLB
+        released, then PCR 17 extended and 16 untouched, read from dom0.
+        '''
         info = self.vm.cmd('query-amd-drtm')
         self.assertTrue(info['launched'])
         self.assertEqual(info['hash'], 'ok')
@@ -123,6 +139,37 @@ class TrenchBootXen(QemuSystemTest):
         exec_command_and_wait_for_pattern(self, 'root', self.PROMPT)
         self.assertEqual(self.read_pcr(16), self.PCR_ZERO)
         self.assertNotEqual(self.read_pcr(17), self.PCR_ZERO)
+        return info
+
+    @skipIfMissingCommands('swtpm')
+    @skipBigDataTest()
+    def test_x86_64_trenchboot_xen_efi(self):
+        image = self.uncompress(self.ASSET_IMAGE, target='tb-full-image.wic')
+        self.boot_xen_efi(image)
+        wait_for_console_pattern(self, 'tb login:', 'Panic on CPU')
+        self.assert_launched()
+
+    @skipIfMissingCommands('swtpm')
+    @skipUnless(PSP_IMAGE, 'QEMU_TEST_TRENCHBOOT_PSP_IMAGE not set')
+    def test_x86_64_trenchboot_xen_efi_psp(self):
+        '''
+        The PSP path: GRUB sets a TMR up and SKL has the service launch,
+        the signature verified, then Xen releases the TMR once its IOMMU
+        is up. PCR 18 carries the key token, so it is extended too.
+        '''
+        self.require_device('amd-psp')
+        self.boot_xen_efi(PSP_IMAGE, 'amd-psp,drtm-service=on')
+        wait_for_console_pattern(self, 'SLAUNCH: PSP-assisted launch',
+                                 'Panic on CPU')
+        wait_for_console_pattern(self, 'SLAUNCH: released TMR 0',
+                                 'Panic on CPU')
+        wait_for_console_pattern(self, 'tb login:', 'Panic on CPU')
+
+        info = self.assert_launched()
+        self.assertEqual(info['psp'], {'kicked': True, 'launch': 'ok',
+                                       'signature': 'verified',
+                                       'command': 3, 'status': 0})
+        self.assertNotEqual(self.read_pcr(18), self.PCR_ZERO)
 
 
 if __name__ == '__main__':

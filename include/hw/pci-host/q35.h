@@ -56,6 +56,7 @@ struct MCHPCIState {
     uint64_t above_4g_mem_size;
     uint64_t pci_hole64_size;
     uint16_t ext_tseg_mbytes;
+    bool smn;
 };
 
 struct Q35PCIHost {
@@ -111,6 +112,19 @@ struct Q35PCIHost {
 #define MCH_HOST_BRIDGE_PCIEXBAR_LENGTH_64M    ((uint64_t)(0x2 << 1))
 #define MCH_HOST_BRIDGE_PCIEXBAR_LENGTH_RVD    ((uint64_t)(0x3 << 1))
 #define MCH_HOST_BRIDGE_PCIEXBAREN             ((uint64_t)1)
+
+/*
+ * The SMN access pair an AMD host bridge has at 00:00.0: the address goes
+ * to the first, the data comes back from the second. The two addresses
+ * the DRTM path reads through it are PSP_BASE_ADDR_LO and _HI in
+ * IOHC0NBCFG, holding the Secure Processor's register block (58453,
+ * appendix G.2).
+ */
+#define MCH_HOST_BRIDGE_SMN_ADDR               0xb8
+#define MCH_HOST_BRIDGE_SMN_DATA               0xbc
+#define MCH_HOST_BRIDGE_SMN_PSP_BASE_LO        0x13b102e0
+#define MCH_HOST_BRIDGE_SMN_PSP_BASE_HI        0x13b102e4
+#define MCH_HOST_BRIDGE_SMN_PSP_BASE_MASK      0xfff00000
 
 #define MCH_HOST_BRIDGE_PAM_NB                 7
 #define MCH_HOST_BRIDGE_PAM_SIZE               7

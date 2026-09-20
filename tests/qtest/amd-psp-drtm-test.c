@@ -800,7 +800,7 @@ static void test_launch_signature(const void *data)
 
 /*
  * After a launch: EXTEND_OSSL_DIGEST hashes a range inside a TMR into
- * PCR 17 and PCR 18, then the SKL marker after it, and refuses an empty,
+ * PCR 17 and PCR 18, then the AMDSL marker after it, and refuses an empty,
  * wrapping or uncovered range. TPM_LOCALITY_ACCESS locks locality 2 and
  * opens 4. Both are unsupported before the launch.
  */
@@ -871,9 +871,9 @@ static void test_after_launch(const void *data)
     g_assert_cmphex(extend_ossl_digest(s, DLME_BASE, DLME_LEN), ==,
                     AMD_PSP_DRTM_NO_ERROR);
     extend(pcr17, dlme, DLME_LEN);
-    extend(pcr17, "SKL", 3);
+    extend(pcr17, "AMDSL", 5);
     extend(pcr18, dlme, DLME_LEN);
-    extend(pcr18, "SKL", 3);
+    extend(pcr18, "AMDSL", 5);
     assert_pcr(s, 17, pcr17);
     assert_pcr(s, 18, pcr18);
 

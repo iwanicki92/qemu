@@ -58,12 +58,12 @@
 #define PSS_TRAILER                 0xbc
 
 /*
- * The marker EXTEND_OSSL_DIGEST records after the range's digest, the
- * guide's sentence taken literally. The board's own form is still open:
- * see the spec's "EXTEND_OSSL_DIGEST" section.
+ * The marker EXTEND_OSSL_DIGEST records after the range's digest, as the
+ * board's event log shows it: the EV_TYPE_AMD_SL_SEPARATOR event carries
+ * the five bytes "AMDSL", where 58453 prints 'SKL.'.
  */
-#define OSSL_MARKER                 "SKL"
-#define OSSL_MARKER_LEN             3
+#define OSSL_MARKER                 "AMDSL"
+#define OSSL_MARKER_LEN             5
 #define OSSL_CHUNK                  0x10000
 
 /* The stepping is masked when the SOC flag list is compared */

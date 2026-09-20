@@ -608,6 +608,13 @@ void helper_stgi(CPUX86State *env)
         env->hflags2 |= HF2_VGIF_MASK;
     } else {
         env->hflags2 |= HF2_GIF_MASK;
+        /* An INIT that waited for GIF is taken now, as reset or #SX */
+        if (env->init_pending) {
+            env->init_pending = false;
+            bql_lock();
+            cpu_interrupt(env_cpu(env), CPU_INTERRUPT_INIT);
+            bql_unlock();
+        }
     }
 }
 

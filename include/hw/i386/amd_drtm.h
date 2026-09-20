@@ -61,10 +61,21 @@ struct AmdDrtmPlatform {
     bool strict;
     TPMIf *tpm;
     DeviceState *iommu;
+
+    /* The PSP DRTM service's record for query-amd-drtm, when one exists */
+    AmdPspDrtmInfo *(*psp_query)(void *psp);
+    void *psp;
 };
 
 /* NULL unless exactly one platform object exists. */
 AmdDrtmPlatform *amd_drtm_platform_find(void);
+
+/*
+ * The amd-psp device with the DRTM service registers how to describe
+ * itself here, and unregisters with a NULL @query.
+ */
+void amd_drtm_set_psp(AmdDrtmPlatform *p, AmdPspDrtmInfo *(*query)(void *),
+                      void *psp);
 
 /*
  * A rule of the launch the guest broke, one hardware would let through.

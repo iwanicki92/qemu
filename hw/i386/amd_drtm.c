@@ -295,7 +295,17 @@ AmdDrtmInfo *qmp_query_amd_drtm(Error **errp)
         block->enforced = b->enforced;
         QAPI_LIST_APPEND(tail, block);
     }
+    if (p->psp_query) {
+        info->psp = p->psp_query(p->psp);
+    }
     return info;
+}
+
+void amd_drtm_set_psp(AmdDrtmPlatform *p, AmdPspDrtmInfo *(*query)(void *),
+                      void *psp)
+{
+    p->psp_query = query;
+    p->psp = psp;
 }
 
 void qmp_x_amd_drtm_launch(uint64_t base, uint16_t length, Error **errp)

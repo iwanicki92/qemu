@@ -513,6 +513,68 @@
             'enforced': 'bool' } }
 
 ##
+# @AmdPspLaunchState:
+#
+# What the PSP DRTM service's LAUNCH command last decided.
+#
+# @none: no LAUNCH since reset
+#
+# @ok: the last LAUNCH passed every check and extended the PCRs
+#
+# @failed: the last LAUNCH failed a check, or the TPM refused it
+#
+# Since: 11.2
+##
+{ 'enum': 'AmdPspLaunchState',
+  'data': [ 'none', 'ok', 'failed' ] }
+
+##
+# @AmdPspSignatureResult:
+#
+# What the PSP DRTM service found of the SL image's signature in its
+# last LAUNCH.
+#
+# @none: no LAUNCH reached the signature, or none was issued
+#
+# @verified: the RSA-PSS signature verified against the key token
+#
+# @failed: the signature did not verify
+#
+# @skipped: the device was told not to verify, with verify=off
+#
+# @unsupported: the build has no crypto library able to verify it
+#
+# Since: 11.2
+##
+{ 'enum': 'AmdPspSignatureResult',
+  'data': [ 'none', 'verified', 'failed', 'skipped', 'unsupported' ] }
+
+##
+# @AmdPspDrtmInfo:
+#
+# The state of the DRTM service behind an amd-psp device.
+#
+# @kicked: whether the guest's zero write, which the service waits for
+#     before answering commands, has happened since reset
+#
+# @launch: what the last LAUNCH command decided
+#
+# @signature: what the last LAUNCH found of the image's signature
+#
+# @command: the last command issued to the service, 0 if none
+#
+# @status: the status the last command was answered with
+#
+# Since: 11.2
+##
+{ 'struct': 'AmdPspDrtmInfo',
+  'data': { 'kicked': 'bool',
+            'launch': 'AmdPspLaunchState',
+            'signature': 'AmdPspSignatureResult',
+            'command': 'uint8',
+            'status': 'uint16' } }
+
+##
 # @AmdDrtmInfo:
 #
 # The state of the AMD dynamic launch platform.
@@ -529,6 +591,8 @@
 #
 # @dma-blocks: the ranges currently kept from device DMA
 #
+# @psp: the PSP DRTM service, when an amd-psp device offers one
+#
 # Since: 11.2
 ##
 { 'struct': 'AmdDrtmInfo',
@@ -537,7 +601,8 @@
             'slb-length': 'uint16',
             'sl-dev': 'bool',
             'hash': 'AmdDrtmHashResult',
-            'dma-blocks': ['AmdDrtmDmaBlock'] } }
+            'dma-blocks': ['AmdDrtmDmaBlock'],
+            '*psp': 'AmdPspDrtmInfo' } }
 
 ##
 # @query-amd-drtm:

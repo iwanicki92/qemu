@@ -86,8 +86,9 @@ class TrenchBootXen(QemuSystemTest):
 
         self.vm.set_console()
         self.vm.add_args('-accel', 'tcg', '-smp', '2', '-m', '4G',
-                         '-cpu', 'EPYC-Genoa,+skinit,mmio-conf-base=0xb0000001',
+                         '-cpu', 'EPYC-Genoa,+skinit',
                          '-global', 'q35-pcihost.mch-multifunction=on',
+                         '-global', 'q35-pcihost.cf8-extended-config=on',
                          '-device', 'amd-drtm-platform',
                          '-device', 'amd-nb',
                          '-device', 'AMDVI-PCI,id=iommu0,addr=0.2',

@@ -333,7 +333,7 @@ amd_psp_launch_failed(AmdPspState *s, const char *fmt, ...)
     for (pcr = 18; pcr <= 20; pcr++) {
         amd_psp_pcr_extend(s, pcr, ones);
     }
-    s->launch = AMD_PSP_LAUNCH_FAILED;
+    s->launch = AMD_PSP_LAUNCH_STATE_FAILED;
     amd_psp_log_clear(s);
     amd_psp_unlock(s, BIT(4));
     return AMD_PSP_DRTM_LAUNCH_ERROR;
@@ -526,28 +526,28 @@ static AmdPspSignatureResult amd_psp_verify_signature(AmdPspState *s,
     if (!qcrypto_akcipher_supports(&opts)) {
         warn_report_once("amd-psp: no gcrypt or nettle in this build, the "
                          "SKL signature is not checked");
-        return AMD_PSP_SIGNATURE_UNSUPPORTED;
+        return AMD_PSP_SIGNATURE_RESULT_UNSUPPORTED;
     }
     der_len = amd_psp_token_to_der(token, der, errp);
     if (!der_len) {
-        return AMD_PSP_SIGNATURE_FAILED;
+        return AMD_PSP_SIGNATURE_RESULT_FAILED;
     }
     key = qcrypto_akcipher_new(&opts, QCRYPTO_AK_CIPHER_KEY_TYPE_PUBLIC, der,
                                der_len, errp);
     if (!key) {
-        return AMD_PSP_SIGNATURE_FAILED;
+        return AMD_PSP_SIGNATURE_RESULT_FAILED;
     }
     for (i = 0; i < SIG_LEN; i++) {
         sig_be[i] = sig[SIG_LEN - 1 - i];
     }
     if (qcrypto_akcipher_encrypt(key, sig_be, SIG_LEN, em, SIG_LEN,
                                  errp) != SIG_LEN) {
-        return AMD_PSP_SIGNATURE_FAILED;
+        return AMD_PSP_SIGNATURE_RESULT_FAILED;
     }
     if (!amd_psp_pss_verify(em, slb, signed_len, errp)) {
-        return AMD_PSP_SIGNATURE_FAILED;
+        return AMD_PSP_SIGNATURE_RESULT_FAILED;
     }
-    return AMD_PSP_SIGNATURE_VERIFIED;
+    return AMD_PSP_SIGNATURE_RESULT_VERIFIED;
 }
 
 /*
@@ -567,7 +567,7 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
     hwaddr base;
 
     s->tpm = tpm_find();
-    s->signature = AMD_PSP_SIGNATURE_NONE;
+    s->signature = AMD_PSP_SIGNATURE_RESULT_NONE;
 
     if (!amd_drtm_launched(p)) {
         return amd_psp_launch_failed(s, "no SKINIT recorded, no SKL address "
@@ -611,7 +611,7 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
 
         s->signature = amd_psp_verify_signature(s, slb, signed_len, sig, token,
                                                 &err);
-        if (s->signature == AMD_PSP_SIGNATURE_FAILED) {
+        if (s->signature == AMD_PSP_SIGNATURE_RESULT_FAILED) {
             uint16_t status = amd_psp_launch_failed(s, "the signature does not "
                                                     "verify: %s",
                                                     error_get_pretty(err));
@@ -619,7 +619,7 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
             return status;
         }
     } else {
-        s->signature = AMD_PSP_SIGNATURE_SKIPPED;
+        s->signature = AMD_PSP_SIGNATURE_RESULT_SKIPPED;
     }
     trace_amd_psp_drtm_signature(s->signature);
 
@@ -669,7 +669,7 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
 
     s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG0] = 1;
     s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG1] = 0;
-    s->launch = AMD_PSP_LAUNCH_OK;
+    s->launch = AMD_PSP_LAUNCH_STATE_OK;
     amd_psp_unlock(s, BIT(1) | BIT(2));
     amd_drtm_sl_dev_release(p);
     trace_amd_psp_drtm_launch_ok(base, length, sec_patch_level);
@@ -738,7 +738,7 @@ static uint16_t amd_psp_cmd_extend_ossl_digest(AmdPspState *s)
     uint8_t digest[SHA256_LEN];
     char hex[2 * SHA256_LEN + 1];
 
-    if (s->launch != AMD_PSP_LAUNCH_OK) {
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK) {
         return AMD_PSP_DRTM_NOT_SUPPORTED;
     }
     if (!size || base + size < base) {
@@ -779,7 +779,7 @@ static uint16_t amd_psp_cmd_extend_ossl_digest(AmdPspState *s)
 /* Locality 2 back to the PSP, locality 4 to the OS, as Xen asks on exit */
 static uint16_t amd_psp_cmd_tpm_locality_access(AmdPspState *s)
 {
-    if (s->launch != AMD_PSP_LAUNCH_OK) {
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK) {
         return AMD_PSP_DRTM_NOT_SUPPORTED;
     }
     trace_amd_psp_drtm_tpm_locality_access();
@@ -830,7 +830,7 @@ static uint16_t amd_psp_cmd_tmr_setup(AmdPspState *s, unsigned index)
     uint64_t len = units * AMD_PSP_DRTM_TMR_UNIT;
     AmdPspTmr *tmr;
 
-    if (s->launch == AMD_PSP_LAUNCH_OK) {
+    if (s->launch == AMD_PSP_LAUNCH_STATE_OK) {
         return AMD_PSP_DRTM_TMR_SETUP_NOT_ALLOWED;
     }
     if (index >= s->tmr_count) {
@@ -1042,8 +1042,8 @@ static void amd_psp_reset(DeviceState *dev)
     s->busy = false;
     s->command = 0;
     s->status = 0;
-    s->launch = AMD_PSP_LAUNCH_NONE;
-    s->signature = AMD_PSP_SIGNATURE_NONE;
+    s->launch = AMD_PSP_LAUNCH_STATE_NONE;
+    s->signature = AMD_PSP_SIGNATURE_RESULT_NONE;
     memset(s->c2pmsg, 0, sizeof(s->c2pmsg));
     /*
      * The board's TPM_ACCESS before any launch: localities 1 to 4 locked,
@@ -1062,6 +1062,20 @@ static void amd_psp_reset(DeviceState *dev)
     if (s->drtm_ready) {
         s->c2pmsg[AMD_PSP_C2PMSG_DRTM] = AMD_PSP_DRTM_READY;
     }
+}
+
+/* The service's record on query-amd-drtm */
+static AmdPspDrtmInfo *amd_psp_drtm_info(void *opaque)
+{
+    AmdPspState *s = opaque;
+    AmdPspDrtmInfo *info = g_new0(AmdPspDrtmInfo, 1);
+
+    info->kicked = s->kicked;
+    info->launch = s->launch;
+    info->signature = s->signature;
+    info->command = s->command;
+    info->status = s->status;
+    return info;
 }
 
 static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
@@ -1104,6 +1118,7 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
         }
         memory_region_add_subregion(get_system_memory(), s->tcg_log_base,
                                     &s->tcg_log);
+        amd_drtm_set_psp(s->platform, amd_psp_drtm_info, s);
     }
 
     memory_region_init_io(&s->mmio, OBJECT(s), &amd_psp_mmio_ops, s,
@@ -1129,6 +1144,7 @@ static void amd_psp_exit(PCIDevice *pci_dev)
 
     memory_region_del_subregion(get_system_memory(), &s->window);
     if (s->drtm_service) {
+        amd_drtm_set_psp(s->platform, NULL, NULL);
         memory_region_del_subregion(get_system_memory(), &s->tcg_log);
         timer_free(s->delay_timer);
         qemu_bh_delete(s->bh);

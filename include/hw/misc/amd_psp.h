@@ -10,6 +10,7 @@
 #define HW_MISC_AMD_PSP_H
 
 #include "hw/pci/pci_device.h"
+#include "qapi/qapi-types-misc-i386.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -131,20 +132,6 @@ enum {
 #define AMD_PSP_ASPT_BASE 0xfeda0000ULL
 #define AMD_PSP_ASPT_WINDOW 0x10000
 #define AMD_PSP_ASPT_SIZE 0x1000
-
-typedef enum AmdPspLaunchState {
-    AMD_PSP_LAUNCH_NONE,
-    AMD_PSP_LAUNCH_OK,
-    AMD_PSP_LAUNCH_FAILED,
-} AmdPspLaunchState;
-
-typedef enum AmdPspSignatureResult {
-    AMD_PSP_SIGNATURE_NONE,
-    AMD_PSP_SIGNATURE_VERIFIED,
-    AMD_PSP_SIGNATURE_FAILED,
-    AMD_PSP_SIGNATURE_SKIPPED,
-    AMD_PSP_SIGNATURE_UNSUPPORTED,
-} AmdPspSignatureResult;
 
 typedef struct TPMIf TPMIf;
 

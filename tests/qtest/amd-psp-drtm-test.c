@@ -109,10 +109,29 @@ static void assert_no_blocks(QTestState *s)
     qobject_unref(info);
 }
 
+/* The service's own record on query-amd-drtm */
+static void assert_psp(QTestState *s, bool kicked, const char *launch,
+                       const char *signature, unsigned command,
+                       unsigned status)
+{
+    QDict *info, *psp;
+
+    info = qtest_qmp_assert_success_ref(s, "{ 'execute': 'query-amd-drtm' }");
+    psp = qdict_get_qdict(info, "psp");
+    g_assert_nonnull(psp);
+    g_assert_cmpint(qdict_get_bool(psp, "kicked"), ==, kicked);
+    g_assert_cmpstr(qdict_get_str(psp, "launch"), ==, launch);
+    g_assert_cmpstr(qdict_get_str(psp, "signature"), ==, signature);
+    g_assert_cmphex(qdict_get_int(psp, "command"), ==, command);
+    g_assert_cmphex(qdict_get_int(psp, "status"), ==, status);
+    qobject_unref(info);
+}
+
 /* With the service off the device is what it was: writes are dropped */
 static void test_service_off(void)
 {
     QTestState *s = qtest_init(PLATFORM "-device amd-psp");
+    QDict *info;
 
     g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, AMD_PSP_DRTM_READY);
     qtest_writel(s, MBOX_CMD, AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_GET_CAPABILITY,
@@ -120,6 +139,11 @@ static void test_service_off(void)
     g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, AMD_PSP_DRTM_READY);
     qtest_writel(s, MBOX_ARG0, 0x1234);
     g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, 0);
+
+    /* And query-amd-drtm has no record of it */
+    info = qtest_qmp_assert_success_ref(s, "{ 'execute': 'query-amd-drtm' }");
+    g_assert_false(qdict_haskey(info, "psp"));
+    qobject_unref(info);
     qtest_quit(s);
 }
 
@@ -151,11 +175,15 @@ static void test_kick_and_capability(void)
         g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, cap);
     }
     g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, 0);
+    assert_psp(s, false, "none", "none", 0, 0);
 
     mbox_kick(s);
     g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, AMD_PSP_DRTM_READY);
+    assert_psp(s, true, "none", "none", 0, 0);
 
     g_assert_cmphex(mbox_command(s, cap), ==, AMD_PSP_DRTM_NO_ERROR);
+    assert_psp(s, true, "none", "none", AMD_PSP_DRTM_CMD_GET_CAPABILITY,
+               AMD_PSP_DRTM_NO_ERROR);
     g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==,
                     AMD_PSP_DRTM_CAP_ENABLED | AMD_PSP_DRTM_CAP_ANTI_ROLLBACK);
     g_assert_cmphex(qtest_readl(s, MBOX_ARG1), ==, AMD_PSP_DRTM_VERSION);
@@ -231,6 +259,8 @@ static void test_unsupported(void)
     for (i = 0; i < ARRAY_SIZE(unsupported); i++) {
         g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(unsupported[i], 0)),
                         ==, AMD_PSP_DRTM_NOT_SUPPORTED);
+        assert_psp(s, true, "none", "none", unsupported[i],
+                   AMD_PSP_DRTM_NOT_SUPPORTED);
     }
     for (i = 0; i < ARRAY_SIZE(before_launch); i++) {
         g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(before_launch[i], 0)),
@@ -616,6 +646,8 @@ static void test_launch(const void *data)
                     ==, AMD_PSP_DRTM_NO_ERROR);
     g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, 1);
     g_assert_cmphex(qtest_readl(s, MBOX_ARG1), ==, 0);
+    assert_psp(s, true, "ok", "skipped", AMD_PSP_DRTM_CMD_LAUNCH,
+               AMD_PSP_DRTM_NO_ERROR);
 
     /* Seized: the guest asks again, as SKL learned to */
     g_assert_cmphex(tis_access(s, 0) & (TPM_TIS_ACCESS_ACTIVE_LOCALITY |
@@ -651,11 +683,12 @@ static void test_launch(const void *data)
     g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==,
                     AMD_PSP_DRTM_TMR_SETUP_NOT_ALLOWED);
 
-    /* Reset locks the localities again */
+    /* Reset locks the localities again and forgets the launch */
     qtest_system_reset(s);
     for (l = 1; l <= 4; l++) {
         g_assert_cmphex(tis_access(s, l), ==, 0xffffffff);
     }
+    assert_psp(s, false, "none", "none", 0, 0);
 
     tpm_stop(s, swtpm_pid, addr);
 }
@@ -697,6 +730,8 @@ static void test_launch_fails(const void *data)
         extend_digest(cap[i], ones);
     }
     g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    assert_psp(s, true, "failed", "none", AMD_PSP_DRTM_CMD_LAUNCH,
+               AMD_PSP_DRTM_LAUNCH_ERROR);
     assert_pcr(s, 17, pcr17);
     for (i = 0; i < 3; i++) {
         assert_pcr(s, 18 + i, cap[i]);
@@ -782,6 +817,8 @@ static void test_launch_signature(const void *data)
     qtest_writeb(s, SLB_BASE + signed_len, slb[signed_len] ^ 0xff);
     skinit(s, measured);
     g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    assert_psp(s, true, "failed", "failed", AMD_PSP_DRTM_CMD_LAUNCH,
+               AMD_PSP_DRTM_LAUNCH_ERROR);
     qtest_writeb(s, SLB_BASE + signed_len, slb[signed_len]);
 
     /* A signed but unmeasured byte flipped: the header's image version */
@@ -794,6 +831,14 @@ static void test_launch_signature(const void *data)
     skinit(s, measured);
     pcr_read(s, 18, pcr18);
     g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_NO_ERROR);
+#if defined(CONFIG_GCRYPT) || \
+    (defined(CONFIG_NETTLE) && defined(CONFIG_HOGWEED))
+    assert_psp(s, true, "ok", "verified", AMD_PSP_DRTM_CMD_LAUNCH,
+               AMD_PSP_DRTM_NO_ERROR);
+#else
+    assert_psp(s, true, "ok", "unsupported", AMD_PSP_DRTM_CMD_LAUNCH,
+               AMD_PSP_DRTM_NO_ERROR);
+#endif
     extend(pcr18, slb + signed_len + 0x200, TOKEN_LEN);
     words[0] = cpu_to_le32(sec_patch_level);
     extend(pcr18, words, sizeof(words));

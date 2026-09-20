@@ -31,6 +31,7 @@
 #include "hw/i386/topology.h"
 #include "qapi/qapi-types-common.h"
 #include "qemu/cpu-float.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "standard-headers/asm-x86/kvm_para.h"
 
@@ -2506,7 +2507,10 @@ struct ArchCPU {
      */
     bool pdcm_on_even_without_pmu;
 
-    /* Reset value of MSR_AMD64_MMIO_CONF_BASE, since no firmware sets it */
+    /*
+     * Reset value of MSR_AMD64_MMIO_CONF_BASE, since no firmware sets it.
+     * Only a guest write remaps MMCONFIG, so name what firmware mapped.
+     */
     uint64_t mmio_conf_base;
 
     /* Number of physical address bits supported */
@@ -2582,6 +2586,19 @@ struct X86CPUClass {
 
 #ifndef CONFIG_USER_ONLY
 extern const VMStateDescription vmstate_x86_cpu;
+
+/*
+ * What the BSP last wrote to MSR_AMD64_MMIO_CONF_BASE, decoded for the
+ * machine that maps MMCONFIG from it. Passed as the notifier's data.
+ */
+typedef struct X86MmioConfBase {
+    bool enable;
+    hwaddr base;
+    uint32_t size;
+} X86MmioConfBase;
+
+void x86_cpu_mmio_conf_base_notifier_add(Notifier *n);
+void x86_cpu_mmio_conf_base_notify(X86CPU *cpu);
 #endif
 
 int x86_cpu_write_elf64_note(WriteCoreDumpFunction f, CPUState *cpu,

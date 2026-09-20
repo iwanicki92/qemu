@@ -129,6 +129,16 @@ static int ehci_create_ich9_with_companions(PCIBus *bus, int slot)
     return 0;
 }
 
+/* MSR_AMD64_MMIO_CONF_BASE maps MMCONFIG the way PCIEXBAR does */
+static void pc_q35_mmio_conf_base(Notifier *n, void *data)
+{
+    Q35PCIHost *phb = container_of(n, Q35PCIHost, mmio_conf_notifier);
+    X86MmioConfBase *conf = data;
+
+    pcie_host_mmcfg_update(PCIE_HOST_BRIDGE(phb), conf->enable, conf->base,
+                           conf->size);
+}
+
 /* PC hardware initialisation */
 static void pc_q35_init(MachineState *machine)
 {
@@ -228,6 +238,9 @@ static void pc_q35_init(MachineState *machine)
     object_property_set_bool(phb, PCI_HOST_PROP_SMM_RANGES,
                              x86_machine_is_smm_enabled(x86ms), NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(phb), &error_fatal);
+    Q35_HOST_DEVICE(phb)->mmio_conf_notifier.notify = pc_q35_mmio_conf_base;
+    x86_cpu_mmio_conf_base_notifier_add(
+        &Q35_HOST_DEVICE(phb)->mmio_conf_notifier);
 
     /* pci */
     pcms->pcibus = PCI_BUS(qdev_get_child_bus(DEVICE(phb), "pcie.0"));

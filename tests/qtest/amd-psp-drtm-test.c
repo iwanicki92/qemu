@@ -215,7 +215,7 @@ static void test_bar(void)
 static void test_unsupported(void)
 {
     static const uint8_t unsupported[] = {
-        AMD_PSP_DRTM_CMD_GET_TCG_LOGS, AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS,
+        AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS,
         AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY,
         AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO,
     };
@@ -240,6 +240,10 @@ static void test_unsupported(void)
         g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(invalid[i], 0)), ==,
                         AMD_PSP_DRTM_INVALID_SERVICE_ID_ERROR);
     }
+    /* The log is empty before a launch */
+    g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(
+                                     AMD_PSP_DRTM_CMD_GET_TCG_LOGS, 0)),
+                    ==, AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR);
 
     /* LAUNCH with no SKINIT recorded is the guide's first failed step */
     g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH,
@@ -888,6 +892,143 @@ static void test_after_launch(const void *data)
     tpm_stop(s, swtpm_pid, addr);
 }
 
+/*
+ * GET_TCG_LOGS after a launch and an extend: the region holds the TCG2
+ * header the board showed and one event per extend the service made, in
+ * its order, with the digests and event data the test computes itself.
+ * Replaying them gives the PCR values. Guest writes to the region are
+ * dropped and a reset empties it.
+ */
+static const uint8_t tcg_log_header[] = {
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x21, 0x00, 0x00, 0x00,
+    'S', 'p', 'e', 'c', ' ', 'I', 'D', ' ', 'E', 'v', 'e', 'n', 't', '0',
+    '3', 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00,
+    0x0b, 0x00, 0x20, 0x00, 0x00,
+};
+
+typedef struct {
+    uint32_t pcr;
+    uint32_t type;
+    uint8_t digest[SHA256_LEN];
+    uint32_t data_len;
+    const void *data;
+} TcgEvent;
+
+/* One TCG_PCR_EVENT2 at log + off, checked field by field */
+static size_t assert_event(const uint8_t *log, size_t off, size_t len,
+                           const TcgEvent *ev)
+{
+    size_t need = 12 + 2 + SHA256_LEN + 4 + ev->data_len;
+
+    g_assert_cmpuint(off + need, <=, len);
+    g_assert_cmphex(ldl_le_p(log + off), ==, ev->pcr);
+    g_assert_cmphex(ldl_le_p(log + off + 4), ==, ev->type);
+    g_assert_cmphex(ldl_le_p(log + off + 8), ==, 1);
+    g_assert_cmphex(lduw_le_p(log + off + 12), ==, 0x000b);
+    g_assert_cmpmem(log + off + 14, SHA256_LEN, ev->digest, SHA256_LEN);
+    g_assert_cmphex(ldl_le_p(log + off + 14 + SHA256_LEN), ==, ev->data_len);
+    if (ev->data_len) {
+        g_assert_cmpmem(log + off + 18 + SHA256_LEN, ev->data_len, ev->data,
+                        ev->data_len);
+    }
+    return off + need;
+}
+
+static void test_tcg_logs(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t launch = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH, 0);
+    const uint32_t get_logs = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_GET_TCG_LOGS,
+                                               0);
+    static const uint32_t splt = 0, fuse[2] = { 0, 1 }, patch = SEC_PATCH_LEVEL;
+    uint8_t slb[AMD_PSP_SLB_SIZE], dlme[DLME_LEN], log[AMD_PSP_TCG_LOG_SIZE];
+    uint8_t pcr17[SHA256_LEN] = { 0 }, pcr18[SHA256_LEN] = { 0 };
+    TcgEvent ev[9] = {
+        { 17, AMD_PSP_EV_SL_IMAGE, { 0 }, 0, NULL },
+        { 17, AMD_PSP_EV_SPLT_VERSION, { 0 }, 4, &splt },
+        { 17, AMD_PSP_EV_FUSE_STATE, { 0 }, 8, fuse },
+        { 18, AMD_PSP_EV_KEY_TOKEN, { 0 }, 0, NULL },
+        { 18, AMD_PSP_EV_SEC_PATCH_LEVEL, { 0 }, 4, &patch },
+        { 17, AMD_PSP_EV_OS_SL_LOAD, { 0 }, 0, NULL },
+        { 18, AMD_PSP_EV_OS_SL_LOAD, { 0 }, 0, NULL },
+        { 17, AMD_PSP_EV_AMD_SL_SEPARATOR, { 0 }, 5, "AMDSL" },
+        { 18, AMD_PSP_EV_AMD_SL_SEPARATOR, { 0 }, 5, "AMDSL" },
+    };
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    size_t len, off;
+    unsigned i;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, PSP ",verify=off", &swtpm_pid, &addr);
+    build_slb(slb);
+    qtest_memwrite(s, SLB_BASE, slb, sizeof(slb));
+    for (i = 0; i < DLME_LEN; i++) {
+        dlme[i] = i * 11 + 2;
+    }
+    qtest_memwrite(s, DLME_BASE, dlme, sizeof(dlme));
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(mbox_command(s, get_logs), ==,
+                    AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR);
+
+    skinit(s, SLB_MEASURED);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(extend_ossl_digest(s, DLME_BASE, DLME_LEN), ==,
+                    AMD_PSP_DRTM_NO_ERROR);
+
+    sha256(slb, SLB_MEASURED, ev[0].digest);
+    sha256(&splt, 4, ev[1].digest);
+    sha256(fuse, 8, ev[2].digest);
+    sha256(slb + TOKEN_OFF, TOKEN_LEN, ev[3].digest);
+    sha256(&patch, 4, ev[4].digest);
+    sha256(dlme, DLME_LEN, ev[5].digest);
+    sha256(dlme, DLME_LEN, ev[6].digest);
+    sha256("AMDSL", 5, ev[7].digest);
+    sha256("AMDSL", 5, ev[8].digest);
+
+    g_assert_cmphex(mbox_command(s, get_logs), ==, AMD_PSP_DRTM_NO_ERROR);
+    len = qtest_readl(s, MBOX_ARG0);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG1), ==, AMD_PSP_TCG_LOG_BASE);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG2), ==, 0);
+    g_assert_cmpuint(len, <=, sizeof(log));
+    qtest_memread(s, AMD_PSP_TCG_LOG_BASE, log, sizeof(log));
+
+    g_assert_cmpuint(len, >=, sizeof(tcg_log_header));
+    g_assert_cmpmem(log, sizeof(tcg_log_header), tcg_log_header,
+                    sizeof(tcg_log_header));
+    off = sizeof(tcg_log_header);
+    for (i = 0; i < ARRAY_SIZE(ev); i++) {
+        off = assert_event(log, off, len, &ev[i]);
+        extend_digest(ev[i].pcr == 17 ? pcr17 : pcr18, ev[i].digest);
+    }
+    g_assert_cmpuint(off, ==, len);
+    assert_pcr(s, 17, pcr17);
+    assert_pcr(s, 18, pcr18);
+
+    /* Guest writes are dropped */
+    qtest_writel(s, AMD_PSP_TCG_LOG_BASE, 0xdeadbeef);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_TCG_LOG_BASE), ==, 0);
+
+    /* A reset empties the log */
+    qtest_system_reset(s);
+    mbox_kick(s);
+    g_assert_cmphex(mbox_command(s, get_logs), ==,
+                    AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_TCG_LOG_BASE + 4), ==, 0);
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
 /* locality-locks=off leaves the TIS as it is without a PSP */
 static void test_locks_off(const void *data)
 {
@@ -940,6 +1081,7 @@ int main(int argc, char **argv)
                         test_launch_signature);
     qtest_add_data_func("/amd-psp/drtm/after-launch", tpm_path,
                         test_after_launch);
+    qtest_add_data_func("/amd-psp/drtm/tcg-logs", tpm_path, test_tcg_logs);
     qtest_add_data_func("/amd-psp/drtm/locks-off", tpm_path, test_locks_off);
 
     ret = g_test_run();

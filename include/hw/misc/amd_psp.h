@@ -93,6 +93,20 @@ enum {
     AMD_PSP_DRTM_GET_IVRS_TABLE_FAILED = 0x10,
 };
 
+/*
+ * The event log GET_TCG_LOGS hands out: a TCG2 log in a region of the
+ * device's own, with the event types the board's log showed.
+ */
+#define AMD_PSP_TCG_LOG_BASE        0xfedb0000ULL
+#define AMD_PSP_TCG_LOG_SIZE        0x1000
+#define AMD_PSP_EV_SL_IMAGE         0x8001
+#define AMD_PSP_EV_SPLT_VERSION     0x8002
+#define AMD_PSP_EV_FUSE_STATE       0x8003
+#define AMD_PSP_EV_KEY_TOKEN        0x8004
+#define AMD_PSP_EV_SEC_PATCH_LEVEL  0x8005
+#define AMD_PSP_EV_OS_SL_LOAD       0x8006
+#define AMD_PSP_EV_AMD_SL_SEPARATOR 0x8007
+
 /* GET_CAPABILITY: C2PMSG_93 flags, _94 the version, _95 alignment and count */
 #define AMD_PSP_DRTM_CAP_ENABLED (1u << 0)
 #define AMD_PSP_DRTM_CAP_TSME (1u << 1)
@@ -170,6 +184,10 @@ struct AmdPspState {
      */
     AmdDrtmPlatform *platform;
     TPMIf *tpm;
+    uint64_t tcg_log_base;
+    MemoryRegion tcg_log;
+    uint32_t tcg_log_len;
+    bool tcg_log_full;
     bool kicked;
     bool busy;
     uint8_t command;

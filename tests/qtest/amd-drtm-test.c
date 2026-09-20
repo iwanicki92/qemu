@@ -269,6 +269,91 @@ static void test_second_instance_rejected(void)
     qtest_quit(s);
 }
 
+/* The devfn and the offset with the extended register bits, SKL's way */
+#define CF8_EXT_ADDR(devfn, offset) \
+    (0x80000000 | (((offset) & 0xf00) << 16) | ((devfn) << 8) | \
+     ((offset) & 0xfc))
+
+static bool sl_dev_armed(QTestState *s)
+{
+    QDict *info = query_amd_drtm(s);
+    bool armed = qdict_get_bool(info, "sl-dev");
+
+    qobject_unref(info);
+    return armed;
+}
+
+static void test_machine(void)
+{
+    QTestState *s;
+    const uint32_t memprot = CF8_EXT_ADDR(AMD_NB_DEVFN, AMD_NB_MEMPROT_CR);
+    QPCIBus *bus;
+    QPCIDevice *dev;
+    QDict *resp, *info;
+    uint8_t cap;
+
+    if (!qtest_has_device("amd-iommu")) {
+        g_test_skip("amd-iommu not available");
+        return;
+    }
+
+    /* The platform answers, and the CPU has the instruction */
+    s = qtest_init("-M q35,amd-drtm=on");
+    info = query_amd_drtm(s);
+    check_cleared(info);
+    qobject_unref(info);
+    resp = qtest_qmp(s, "{ 'execute': 'qom-get', 'arguments': {"
+                     " 'path': '/machine/unattached/device[0]',"
+                     " 'property': 'skinit' } }");
+    g_assert_true(qdict_get_bool(resp, "return"));
+    qobject_unref(resp);
+
+    bus = qpci_new_pc(s, NULL);
+
+    /* The MCH carries the IOMMU at 00:00.2, enabled as firmware leaves it */
+    dev = qpci_device_find(bus, PCI_DEVFN(0, 0));
+    g_assert_nonnull(dev);
+    g_assert_cmphex(qpci_config_readb(dev, PCI_HEADER_TYPE) &
+                    PCI_HEADER_TYPE_MULTI_FUNCTION, ==,
+                    PCI_HEADER_TYPE_MULTI_FUNCTION);
+    g_free(dev);
+    dev = qpci_device_find(bus, PCI_DEVFN(0, 2));
+    g_assert_nonnull(dev);
+    g_assert_cmphex(qpci_config_readw(dev, PCI_VENDOR_ID), ==,
+                    PCI_VENDOR_ID_AMD);
+    cap = qpci_find_capability(dev, AMDVI_CAPAB_ID_SEC, 0);
+    g_assert_cmphex(cap, !=, 0);
+    g_assert_cmphex(qpci_config_readl(dev, cap + AMDVI_CAPAB_BAR_LOW) &
+                    AMDVI_CAPAB_BAR_LOW_ENABLE, ==,
+                    AMDVI_CAPAB_BAR_LOW_ENABLE);
+    g_free(dev);
+
+    /* The northbridge is where SKL's node walk looks */
+    dev = qpci_device_find(bus, AMD_NB_DEVFN);
+    g_assert_nonnull(dev);
+    g_assert_cmphex(qpci_config_readw(dev, PCI_DEVICE_ID), ==,
+                    AMD_NB_DEFAULT_ID);
+    g_free(dev);
+    qpci_free_pc(bus);
+
+    /* And SKL's port 0xcf8 route reaches its MEMPROT_CR */
+    qtest_qmp_assert_success(s, "{ 'execute': 'x-amd-drtm-launch',"
+                             " 'arguments': { 'base': 1048576,"
+                             " 'length': 4096 } }");
+    g_assert_true(sl_dev_armed(s));
+    qtest_outl(s, 0xcf8, memprot);
+    qtest_outl(s, 0xcfc, qtest_inl(s, 0xcfc) & ~AMD_NB_MEMPROT_EN);
+    g_assert_false(sl_dev_armed(s));
+    qtest_quit(s);
+
+    /* The platform the machine made counts, so another is refused */
+    s = qtest_init_ext(NULL, "-M q35,amd-drtm=on -device amd-drtm-platform",
+                       NULL, false);
+    qtest_set_expected_status(s, 1);
+    qtest_wait_qemu(s);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -283,5 +368,6 @@ int main(int argc, char **argv)
     qtest_add_func("/q35/amd-drtm/strict", test_strict);
     qtest_add_func("/q35/amd-drtm/second-instance-rejected",
                    test_second_instance_rejected);
+    qtest_add_func("/q35/amd-drtm/machine", test_machine);
     return g_test_run();
 }

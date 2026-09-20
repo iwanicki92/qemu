@@ -306,6 +306,18 @@ bool tpm_backend_has_hash_sequence(TPMBackend *s);
  */
 int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len);
 
+/*
+ * The same sequence one signal at a time, for a frontend that receives it
+ * as register writes. hash_start returns -ENOTSUP without a locality 4
+ * path and -EBUSY with a guest command in flight. hash_data takes any
+ * length, a frontend buffers TPM_BACKEND_HASH_CHUNK bytes per call.
+ */
+#define TPM_BACKEND_HASH_CHUNK 4096
+
+int tpm_backend_hash_start(TPMBackend *s);
+int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len);
+int tpm_backend_hash_end(TPMBackend *s);
+
 TPMBackend *qemu_find_tpm_be(const char *id);
 TPMBackend *qemu_find_tpm_be_any(void);
 

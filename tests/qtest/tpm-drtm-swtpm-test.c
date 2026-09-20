@@ -81,48 +81,101 @@ static void expected_pcr17(const unsigned char *image, size_t len,
     g_assert_cmpuint(digest_len, ==, SHA256_LEN);
 }
 
+/* swtpm and QEMU with tpm-tis on it, started past TPM2_Startup */
+static QTestState *drtm_qtest_start(const char *tpm_path, const char *devices,
+                                    GPid *swtpm_pid, SocketAddress **addr)
+{
+    GError *error = NULL;
+    QTestState *s;
+    gboolean succ;
+    char *args;
+
+    succ = tpm_util_swtpm_start(tpm_path, swtpm_pid, addr, &error);
+    g_assert_true(succ);
+
+    args = g_strdup_printf(
+        "-machine q35 "
+        "-chardev socket,id=chr,path=%s "
+        "-tpmdev emulator,id=tpm0,chardev=chr %s",
+        (*addr)->u.q_unix.path, devices);
+    s = qtest_init(args);
+    g_free(args);
+
+    /* Before TPM2_Startup the sequence would land in PCR 0 as an H-CRTM. */
+    tpm_util_startup(s, tpm_tis_transfer);
+    return s;
+}
+
+static void drtm_qtest_stop(QTestState *s, GPid swtpm_pid, SocketAddress *addr)
+{
+    qtest_quit(s);
+    tpm_util_swtpm_kill(swtpm_pid);
+
+    g_unlink(addr->u.q_unix.path);
+    qapi_free_SocketAddress(addr);
+}
+
+static void fill_image(unsigned char *image, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        image[i] = (unsigned char)(i * 7 + 3);
+    }
+}
+
+/*
+ * The sequence through the locality 4 registers: any value starts and
+ * ends it, the image goes through HASH_DATA in whatever widths the
+ * writer picks.
+ */
+static void hash_through_registers(QTestState *s, const unsigned char *image,
+                                   size_t len)
+{
+    size_t off = 0;
+
+    qtest_writeb(s, TIS_REG(4, TPM_TIS_REG_HASH_START), 0);
+    while (len - off >= 4) {
+        qtest_writel(s, TIS_REG(4, TPM_TIS_REG_HASH_DATA),
+                     ldl_le_p(image + off));
+        off += 4;
+    }
+    while (off < len) {
+        qtest_writeb(s, TIS_REG(4, TPM_TIS_REG_HASH_DATA), image[off++]);
+    }
+    qtest_writeb(s, TIS_REG(4, TPM_TIS_REG_HASH_END), 0);
+}
+
 static void tpm_drtm_swtpm_test(const void *data)
 {
     const char *tpm_path = data;
     unsigned char image[IMAGE_LENGTH];
     unsigned char expected[SHA256_LEN];
     unsigned char digest[SHA256_LEN];
+    unsigned char before[SHA256_LEN];
     uint32_t access_before, access_after, sts_before, sts_after;
     SocketAddress *addr = NULL;
-    GError *error = NULL;
     GPid swtpm_pid;
-    gboolean succ;
     QTestState *s;
     QDict *rsp;
-    char *args;
-    size_t i;
 
     if (!tpm_util_swtpm_has_tpm2()) {
         g_test_skip("swtpm not in PATH or missing --tpm2 support");
         return;
     }
 
-    succ = tpm_util_swtpm_start(tpm_path, &swtpm_pid, &addr, &error);
-    g_assert_true(succ);
+    s = drtm_qtest_start(tpm_path, "-device tpm-tis,tpmdev=tpm0 "
+                         "-device amd-drtm-platform", &swtpm_pid, &addr);
 
-    args = g_strdup_printf(
-        "-machine q35 "
-        "-chardev socket,id=chr,path=%s "
-        "-tpmdev emulator,id=tpm0,chardev=chr "
-        "-device tpm-tis,tpmdev=tpm0 "
-        "-device amd-drtm-platform",
-        addr->u.q_unix.path);
-    s = qtest_init(args);
-    g_free(args);
-
-    /* Before TPM2_Startup the sequence would land in PCR 0 as an H-CRTM. */
-    tpm_util_startup(s, tpm_tis_transfer);
-
-    for (i = 0; i < sizeof(image); i++) {
-        image[i] = (unsigned char)(i * 7 + 3);
-    }
+    fill_image(image, sizeof(image));
     qtest_memwrite(s, IMAGE_BASE, image, sizeof(image));
     expected_pcr17(image, sizeof(image), expected);
+
+    /* Without locality4=on the registers are the hardware-only ones */
+    pcr17_read(s, before);
+    hash_through_registers(s, image, sizeof(image));
+    pcr17_read(s, digest);
+    g_assert_cmpmem(digest, sizeof(digest), before, sizeof(before));
 
     access_before = qtest_readb(s, TIS_REG(0, TPM_TIS_REG_ACCESS));
     sts_before = qtest_readl(s, TIS_REG(0, TPM_TIS_REG_STS));
@@ -150,11 +203,45 @@ static void tpm_drtm_swtpm_test(const void *data)
     pcr17_read(s, digest);
     g_assert_cmpmem(digest, sizeof(digest), expected, sizeof(expected));
 
-    qtest_quit(s);
-    tpm_util_swtpm_kill(swtpm_pid);
+    drtm_qtest_stop(s, swtpm_pid, addr);
+}
 
-    g_unlink(addr->u.q_unix.path);
-    qapi_free_SocketAddress(addr);
+/* The same measurement driven by software through the locality 4 registers */
+static void tpm_drtm_locality4_test(const void *data)
+{
+    const char *tpm_path = data;
+    unsigned char image[IMAGE_LENGTH];
+    unsigned char expected[SHA256_LEN];
+    unsigned char digest[SHA256_LEN];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = drtm_qtest_start(tpm_path, "-device tpm-tis,tpmdev=tpm0,locality4=on",
+                         &swtpm_pid, &addr);
+
+    fill_image(image, sizeof(image));
+    expected_pcr17(image, sizeof(image), expected);
+
+    g_assert_cmphex(qtest_readb(s, TIS_REG(0, TPM_TIS_REG_ACCESS)) &
+                    TPM_TIS_ACCESS_TPM_ESTABLISHMENT, ==,
+                    TPM_TIS_ACCESS_TPM_ESTABLISHMENT);
+
+    /* Data before HASH_START is dropped, so the digest covers the image */
+    qtest_writel(s, TIS_REG(4, TPM_TIS_REG_HASH_DATA), 0xdeadbeef);
+    hash_through_registers(s, image, sizeof(image));
+
+    g_assert_cmphex(qtest_readb(s, TIS_REG(0, TPM_TIS_REG_ACCESS)) &
+                    TPM_TIS_ACCESS_TPM_ESTABLISHMENT, ==, 0);
+    pcr17_read(s, digest);
+    g_assert_cmpmem(digest, sizeof(digest), expected, sizeof(expected));
+
+    drtm_qtest_stop(s, swtpm_pid, addr);
 }
 
 int main(int argc, char **argv)
@@ -169,6 +256,8 @@ int main(int argc, char **argv)
 
     qtest_add_data_func("/tpm/drtm-swtpm/test", tpm_path,
                         tpm_drtm_swtpm_test);
+    qtest_add_data_func("/tpm/drtm-swtpm/locality4", tpm_path,
+                        tpm_drtm_locality4_test);
     ret = g_test_run();
 
     tpm_util_rmdir(tpm_path);

@@ -102,6 +102,8 @@ static void tpm_tis_isa_reset(DeviceState *dev)
 static const Property tpm_tis_isa_properties[] = {
     DEFINE_PROP_UINT32("irq", TPMStateISA, state.irq_num, TPM_TIS_IRQ),
     DEFINE_PROP_TPMBE("tpmdev", TPMStateISA, state.be_driver),
+    /* Lets software drive the locality 4 hash, which no hardware allows */
+    DEFINE_PROP_BOOL("locality4", TPMStateISA, state.locality4, false),
 };
 
 static void tpm_tis_isa_initfn(Object *obj)

@@ -77,6 +77,15 @@ typedef struct TPMState {
 
     TPMPPI ppi;
     bool ppi_enabled;
+
+    /*
+     * The locality 4 registers, for software standing in for the
+     * processor's own hash. A sequence in flight does not migrate.
+     */
+    bool locality4;
+    bool hash_active;
+    uint16_t hash_len;
+    uint8_t hash_buf[TPM_BACKEND_HASH_CHUNK];
 } TPMState;
 
 extern const VMStateDescription vmstate_locty;

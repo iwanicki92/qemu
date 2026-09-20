@@ -86,8 +86,12 @@ class TrenchBootXen(QemuSystemTest):
         tpm_sock = self.start_swtpm()
 
         self.vm.set_console()
+        # Strict, so a broken launch rule stops the VM instead of leaving
+        # a line in the log. The rule is then logged as a guest error.
         self.vm.add_args('-accel', 'tcg', '-smp', '2', '-m', '4G',
                          '-machine', 'amd-drtm=on',
+                         '-global', 'amd-drtm-platform.strict=on',
+                         '-d', 'guest_errors',
                          '-cpu', 'EPYC-Genoa',
                          '-chardev', f'socket,id=chrtpm,path={tpm_sock}',
                          '-tpmdev', 'emulator,id=tpm0,chardev=chrtpm',

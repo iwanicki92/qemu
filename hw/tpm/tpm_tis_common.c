@@ -347,6 +347,11 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
         return 0;
     }
 
+    if (s->locked & BIT(locty)) {
+        trace_tpm_tis_locked(locty, false);
+        return val;
+    }
+
     switch (offset) {
     case TPM_TIS_REG_ACCESS:
         /* never show the SEIZE flag even though we use it internally */
@@ -536,6 +541,11 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
     trace_tpm_tis_mmio_write(size, addr, val);
 
     if (tpm_backend_had_startup_error(s->be_driver)) {
+        return;
+    }
+
+    if (s->locked & BIT(locty)) {
+        trace_tpm_tis_locked(locty, true);
         return;
     }
 
@@ -876,6 +886,46 @@ int tpm_tis_hash_image(TPMState *s, const uint8_t *data, size_t len)
     trace_tpm_tis_hash_image(len, ret);
 
     return ret;
+}
+
+/*
+ * A command for an agent beside the processor, the PSP at locality 3. It
+ * takes the TPM as a seize would: the guest's active locality loses the
+ * bus and is told so through beenSeized, and gets nothing back, so it
+ * requests the locality again afterwards, as SKL learned to. The
+ * exchange runs here, in the caller's thread, and the interface state
+ * of @locty is not touched, as with the locality 4 hash.
+ */
+int tpm_tis_run_command(TPMState *s, uint8_t locty, const uint8_t *in,
+                        size_t in_len, uint8_t *out, size_t out_len)
+{
+    TPMBackendCmd cmd = {
+        .locty = locty,
+        .in = in,
+        .in_len = in_len,
+        .out = out,
+        .out_len = out_len,
+    };
+    int ret;
+
+    if (tpm_backend_had_startup_error(s->be_driver)) {
+        return -EIO;
+    }
+    if (TPM_TIS_IS_VALID_LOCTY(s->active_locty) && s->active_locty != locty) {
+        trace_tpm_tis_seized_by_agent(s->active_locty, locty);
+        s->loc[s->active_locty].access &= ~TPM_TIS_ACCESS_ACTIVE_LOCALITY;
+        s->loc[s->active_locty].access |= TPM_TIS_ACCESS_BEEN_SEIZED;
+        s->active_locty = TPM_TIS_NO_LOCALITY;
+    }
+    ret = tpm_backend_run_sync(s->be_driver, &cmd);
+    trace_tpm_tis_run_command(locty, in_len, ret);
+    return ret;
+}
+
+void tpm_tis_set_locality_locks(TPMState *s, uint8_t locked)
+{
+    trace_tpm_tis_locality_locks(locked);
+    s->locked = locked;
 }
 
 /*

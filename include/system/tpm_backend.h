@@ -145,6 +145,20 @@ bool tpm_backend_had_startup_error(TPMBackend *s);
 void tpm_backend_deliver_request(TPMBackend *s, TPMBackendCmd *cmd);
 
 /**
+ * tpm_backend_run_sync:
+ * @s: the backend
+ * @cmd: the command to run
+ *
+ * Run a command in the caller's thread and return once its response is
+ * in @cmd->out, after any request in flight has completed. For the
+ * agents beside the processor that need the answer before they go on.
+ * Only the main loop may call this, since the wait polls its context.
+ *
+ * Returns 0, or a negative errno when the backend could not run it.
+ */
+int tpm_backend_run_sync(TPMBackend *s, TPMBackendCmd *cmd);
+
+/**
  * tpm_backend_reset:
  * @s: the backend to reset
  *

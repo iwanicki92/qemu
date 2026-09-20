@@ -112,6 +112,24 @@ void tpm_backend_deliver_request(TPMBackend *s, TPMBackendCmd *cmd)
                            tpm_backend_request_completed, s);
 }
 
+int tpm_backend_run_sync(TPMBackend *s, TPMBackendCmd *cmd)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+    Error *err = NULL;
+
+    if (s->had_startup_error) {
+        return -EIO;
+    }
+    tpm_backend_finish_sync(s);
+    k->handle_request(s, cmd, &err);
+    trace_tpm_backend_run_sync(cmd->locty, cmd->in_len, err == NULL);
+    if (err) {
+        error_report_err(err);
+        return -EIO;
+    }
+    return 0;
+}
+
 void tpm_backend_reset(TPMBackend *s)
 {
     TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);

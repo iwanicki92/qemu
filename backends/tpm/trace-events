@@ -43,3 +43,4 @@ tpm_emulator_set_state_blobs_error(const char *msg) "error while setting state b
 tpm_emulator_set_state_blobs_done(void) "Done setting state blobs"
 tpm_emulator_pre_save(void) ""
 tpm_emulator_inst_init(void) ""
+tpm_backend_run_sync(uint8_t locty, uint32_t len, bool ok) "locality %u len %u ok %d"

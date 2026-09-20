@@ -2513,6 +2513,9 @@ struct ArchCPU {
      */
     uint64_t mmio_conf_base;
 
+    /* Reset value of MSR_VM_CR, the bits firmware or a launch left set */
+    uint64_t vm_cr;
+
     /* Number of physical address bits supported */
     uint32_t phys_bits;
 

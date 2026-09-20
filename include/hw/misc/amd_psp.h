@@ -101,6 +101,9 @@ enum {
 #define AMD_PSP_DRTM_CAP_TMR_COUNT_SHIFT 24
 #define AMD_PSP_DRTM_CAP_TMR_ALIGNMENT_MASK 0xffffff
 
+/* The SLB the launch checks is 64 KiB, as SKINIT defines it */
+#define AMD_PSP_SLB_SIZE 0x10000
+
 /* A TMR's size comes in these units, up to this many TMRs exist */
 #define AMD_PSP_DRTM_TMR_UNIT 0x10000
 #define AMD_PSP_DRTM_TMR_MAX 8
@@ -120,6 +123,16 @@ typedef enum AmdPspLaunchState {
     AMD_PSP_LAUNCH_OK,
     AMD_PSP_LAUNCH_FAILED,
 } AmdPspLaunchState;
+
+typedef enum AmdPspSignatureResult {
+    AMD_PSP_SIGNATURE_NONE,
+    AMD_PSP_SIGNATURE_VERIFIED,
+    AMD_PSP_SIGNATURE_FAILED,
+    AMD_PSP_SIGNATURE_SKIPPED,
+    AMD_PSP_SIGNATURE_UNSUPPORTED,
+} AmdPspSignatureResult;
+
+typedef struct TPMIf TPMIf;
 
 typedef struct AmdPspTmr {
     bool set;
@@ -156,11 +169,14 @@ struct AmdPspState {
      * fires, or at once without a delay.
      */
     AmdDrtmPlatform *platform;
+    TPMIf *tpm;
     bool kicked;
     bool busy;
     uint8_t command;
     uint16_t status;
     AmdPspLaunchState launch;
+    AmdPspSignatureResult signature;
+    uint8_t locks;
     AmdPspTmr tmr[AMD_PSP_DRTM_TMR_MAX];
     QEMUBH *bh;
     QEMUTimer *delay_timer;

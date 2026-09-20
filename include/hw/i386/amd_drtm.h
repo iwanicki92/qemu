@@ -95,4 +95,7 @@ void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
                         const char *name, bool fetch);
 void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name);
 
+/* CPUID leaf 1 EAX of the first CPU, what the SL header's SOC flags name */
+uint32_t amd_drtm_cpu_signature(void);
+
 #endif

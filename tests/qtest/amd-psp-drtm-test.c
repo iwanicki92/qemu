@@ -12,8 +12,15 @@
 #include "libqos/pci-pc.h"
 #include "libqos/qos-iommu-testdev.h"
 #include "hw/misc/amd_psp.h"
+#include "hw/acpi/tpm.h"
+#include "qemu/bswap.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
+#include "tpm-util.h"
+#include "tpm-tis-util.h"
+#include <glib/gstdio.h>
+
+uint64_t tpm_tis_base_addr = TPM_TIS_ADDR_BASE;
 
 /* The mailbox through the ASPT window, which needs no BAR assignment */
 #define MBOX(reg) \
@@ -391,13 +398,372 @@ static void test_reset(void)
     qtest_quit(s);
 }
 
+/*
+ * An SLB the launch accepts with verify=off: the SL header, a measured
+ * body, the signature header with its tag and sizes, a signature nobody
+ * checks and a key token. The offsets are the real image's shape scaled
+ * down.
+ */
+#define SLB_BASE        0x200000
+#define SLB_MEASURED    0x1000
+#define SIG_HDR_OFF     SLB_MEASURED
+#define SIG_OFF         (SIG_HDR_OFF + 0x100)
+#define TOKEN_OFF       (SIG_OFF + 0x200)
+#define TOKEN_LEN       0x440
+#define SEC_PATCH_LEVEL 7
+#define SHA256_LEN      32
+
+static void build_slb(uint8_t *slb)
+{
+    size_t i;
+
+    memset(slb, 0, AMD_PSP_SLB_SIZE);
+    stw_le_p(slb + 0x00, 0x46);
+    stw_le_p(slb + 0x02, SLB_MEASURED);
+    memset(slb + 0x04, 0xda, 16);
+    stl_le_p(slb + 0x14, 0xffffffff);
+    stl_le_p(slb + 0x18, TOKEN_OFF + TOKEN_LEN);
+    stw_le_p(slb + 0x1c, 0x1e);
+    /* a SOC flag list the qtest CPU is not on, which only traces */
+    stl_le_p(slb + 0x1e, 2);
+    stl_le_p(slb + 0x22, 0x00a00f00);
+    stl_le_p(slb + 0x26, 0x00b00f00);
+    for (i = 0x46; i < SLB_MEASURED; i++) {
+        slb[i] = i * 7 + 3;
+    }
+    memcpy(slb + SIG_HDR_OFF + 0x10, "$AS1", 4);
+    stl_le_p(slb + SIG_HDR_OFF + 0x14, SIG_OFF);
+    stl_le_p(slb + SIG_HDR_OFF + 0x4c, SEC_PATCH_LEVEL);
+    for (i = 0; i < 0x200; i++) {
+        slb[SIG_OFF + i] = i;
+    }
+    stl_le_p(slb + TOKEN_OFF + 56, 4096);
+    stl_le_p(slb + TOKEN_OFF + 60, 4096);
+    for (i = 64; i < TOKEN_LEN; i++) {
+        slb[TOKEN_OFF + i] = i * 3 + 1;
+    }
+}
+
+static void sha256(const void *data, size_t len, uint8_t *out)
+{
+    gsize digest_len = SHA256_LEN;
+    GChecksum *sum = g_checksum_new(G_CHECKSUM_SHA256);
+
+    g_checksum_update(sum, data, len);
+    g_checksum_get_digest(sum, out, &digest_len);
+    g_checksum_free(sum);
+    g_assert_cmpuint(digest_len, ==, SHA256_LEN);
+}
+
+/* pcr = SHA256(pcr || digest) */
+static void extend_digest(uint8_t *pcr, const uint8_t *digest)
+{
+    uint8_t both[2 * SHA256_LEN];
+
+    memcpy(both, pcr, SHA256_LEN);
+    memcpy(both + SHA256_LEN, digest, SHA256_LEN);
+    sha256(both, sizeof(both), pcr);
+}
+
+/* pcr = SHA256(pcr || SHA256(data)) */
+static void extend(uint8_t *pcr, const void *data, size_t len)
+{
+    uint8_t digest[SHA256_LEN];
+
+    sha256(data, len, digest);
+    extend_digest(pcr, digest);
+}
+
+/* TPM2_PCR_Read of one PCR in the SHA-256 bank, at locality 0 */
+static void pcr_read(QTestState *s, unsigned pcr, uint8_t *digest)
+{
+    unsigned char cmd[] = {
+        0x80, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
+        0x01, 0x7e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0b,
+        0x03, 0x00, 0x00, 0x00
+    };
+    unsigned char rsp[1024];
+
+    cmd[17 + pcr / 8] = 1 << (pcr % 8);
+    tpm_tis_transfer(s, cmd, sizeof(cmd), rsp, sizeof(rsp));
+    g_assert_cmphex(ldl_be_p(&rsp[2]), ==, 62);
+    g_assert_cmphex(ldl_be_p(&rsp[6]), ==, 0);
+    g_assert_cmphex(lduw_be_p(&rsp[28]), ==, SHA256_LEN);
+    memcpy(digest, &rsp[30], SHA256_LEN);
+}
+
+static void assert_pcr(QTestState *s, unsigned pcr, const uint8_t *expected)
+{
+    uint8_t digest[SHA256_LEN];
+
+    pcr_read(s, pcr, digest);
+    if (memcmp(digest, expected, SHA256_LEN)) {
+        g_autofree char *got = g_strdup("");
+        g_autofree char *want = g_strdup("");
+        unsigned i;
+
+        for (i = 0; i < SHA256_LEN; i++) {
+            char *t = g_strdup_printf("%s%02x", got, digest[i]);
+            g_free(got);
+            got = t;
+            t = g_strdup_printf("%s%02x", want, expected[i]);
+            g_free(want);
+            want = t;
+        }
+        g_error("PCR %u is %s, expected %s", pcr, got, want);
+    }
+}
+
+static uint32_t tis_access(QTestState *s, unsigned locty)
+{
+    return qtest_readl(s, TIS_REG(locty, TPM_TIS_REG_ACCESS));
+}
+
+/* swtpm and QEMU with tpm-tis on it, started past TPM2_Startup */
+static QTestState *tpm_start(const char *tpm_path, const char *devices,
+                             GPid *swtpm_pid, SocketAddress **addr)
+{
+    GError *error = NULL;
+    QTestState *s;
+    gboolean succ;
+    char *args;
+
+    succ = tpm_util_swtpm_start(tpm_path, swtpm_pid, addr, &error);
+    g_assert_true(succ);
+
+    args = g_strdup_printf(
+        "-machine q35 "
+        "-chardev socket,id=chr,path=%s "
+        "-tpmdev emulator,id=tpm0,chardev=chr "
+        "-device tpm-tis,tpmdev=tpm0 -device amd-drtm-platform "
+        "-device amd-iommu %s",
+        (*addr)->u.q_unix.path, devices);
+    s = qtest_init(args);
+    g_free(args);
+
+    tpm_util_startup(s, tpm_tis_transfer);
+    return s;
+}
+
+static void tpm_stop(QTestState *s, GPid swtpm_pid, SocketAddress *addr)
+{
+    qtest_quit(s);
+    tpm_util_swtpm_kill(swtpm_pid);
+    g_unlink(addr->u.q_unix.path);
+    qapi_free_SocketAddress(addr);
+}
+
+static void skinit(QTestState *s, uint32_t length)
+{
+    qtest_qmp_assert_success(s, "{ 'execute': 'x-amd-drtm-launch', "
+                             "'arguments': { 'base': %d, 'length': %d } }",
+                             SLB_BASE, length);
+}
+
+/*
+ * The launch that passes: the PCR 17 and PCR 18 chain the board leaves,
+ * the SL_DEV release, the locality unlocks and the seize of the guest's
+ * locality while the PSP held the TPM.
+ */
+static void test_launch(const void *data)
+{
+    const char *tpm_path = data;
+    uint8_t slb[AMD_PSP_SLB_SIZE];
+    uint8_t pcr17[SHA256_LEN] = { 0 }, pcr18[SHA256_LEN] = { 0 };
+    uint32_t words[2] = { 0 };
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    QDict *info;
+    unsigned l;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, PSP ",verify=off", &swtpm_pid, &addr);
+    build_slb(slb);
+    qtest_memwrite(s, SLB_BASE, slb, sizeof(slb));
+
+    /* Localities 1 to 4 are locked until a launch: all-ones, writes dropped */
+    for (l = 1; l <= 4; l++) {
+        g_assert_cmphex(tis_access(s, l), ==, 0xffffffff);
+    }
+    qtest_writeb(s, TIS_REG(2, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_REQUEST_USE);
+    g_assert_cmphex(tis_access(s, 0) & TPM_TIS_ACCESS_PENDING_REQUEST, ==, 0);
+
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+
+    skinit(s, SLB_MEASURED);
+    extend(pcr17, slb, SLB_MEASURED);
+    assert_pcr(s, 17, pcr17);
+
+    /* The guest holds locality 0 while the PSP works */
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_REQUEST_USE);
+    g_assert_cmphex(tis_access(s, 0) & TPM_TIS_ACCESS_ACTIVE_LOCALITY, ==,
+                    TPM_TIS_ACCESS_ACTIVE_LOCALITY);
+
+    g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH,
+                                                     0)),
+                    ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, 1);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG1), ==, 0);
+
+    /* Seized: the guest asks again, as SKL learned to */
+    g_assert_cmphex(tis_access(s, 0) & (TPM_TIS_ACCESS_ACTIVE_LOCALITY |
+                                        TPM_TIS_ACCESS_BEEN_SEIZED), ==,
+                    TPM_TIS_ACCESS_BEEN_SEIZED);
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_BEEN_SEIZED);
+    g_assert_cmphex(tis_access(s, 0) & TPM_TIS_ACCESS_BEEN_SEIZED, ==, 0);
+
+    /* Localities 1 and 2 open, 3 and 4 stay locked */
+    g_assert_cmphex(tis_access(s, 1), !=, 0xffffffff);
+    g_assert_cmphex(tis_access(s, 2), !=, 0xffffffff);
+    g_assert_cmphex(tis_access(s, 3), ==, 0xffffffff);
+    g_assert_cmphex(tis_access(s, 4), ==, 0xffffffff);
+
+    /* The board's chain: SPLT version, then TSME and anti-rollback */
+    extend(pcr17, words, 4);
+    words[1] = 1;
+    extend(pcr17, words, 8);
+    assert_pcr(s, 17, pcr17);
+    extend(pcr18, slb + TOKEN_OFF, TOKEN_LEN);
+    words[0] = SEC_PATCH_LEVEL;
+    extend(pcr18, words, 4);
+    assert_pcr(s, 18, pcr18);
+
+    /* SL_DEV is released by the service, the TMR stays */
+    info = qtest_qmp_assert_success_ref(s, "{ 'execute': 'query-amd-drtm' }");
+    g_assert_false(qdict_get_bool(info, "sl-dev"));
+    qobject_unref(info);
+    assert_one_block(s, "tmr0", 0, 0x400000, true);
+
+    /* No TMR changes after a launch */
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==,
+                    AMD_PSP_DRTM_TMR_SETUP_NOT_ALLOWED);
+
+    /* Reset locks the localities again */
+    qtest_system_reset(s);
+    for (l = 1; l <= 4; l++) {
+        g_assert_cmphex(tis_access(s, l), ==, 0xffffffff);
+    }
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
+/*
+ * Every failure is one status and a guest error: no TMR around the SLB,
+ * a measured length other than the header's, a broken signature header.
+ * Each caps PCRs 18 to 20 with the all-ones digest, the value the board
+ * shows after a failed launch, and unlocks locality 4.
+ */
+static void test_launch_fails(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t launch = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH, 0);
+    uint8_t slb[AMD_PSP_SLB_SIZE];
+    uint8_t ones[SHA256_LEN];
+    uint8_t pcr17[SHA256_LEN], cap[3][SHA256_LEN];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    unsigned i;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    memset(ones, 0xff, sizeof(ones));
+    s = tpm_start(tpm_path, PSP ",verify=off", &swtpm_pid, &addr);
+    build_slb(slb);
+    qtest_memwrite(s, SLB_BASE, slb, sizeof(slb));
+    mbox_kick(s);
+
+    /* No TMR covers the SLB */
+    skinit(s, SLB_MEASURED);
+    pcr_read(s, 17, pcr17);
+    for (i = 0; i < 3; i++) {
+        pcr_read(s, 18 + i, cap[i]);
+        extend_digest(cap[i], ones);
+    }
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    assert_pcr(s, 17, pcr17);
+    for (i = 0; i < 3; i++) {
+        assert_pcr(s, 18 + i, cap[i]);
+    }
+    g_assert_cmphex(tis_access(s, 4), !=, 0xffffffff);
+    g_assert_cmphex(tis_access(s, 2), ==, 0xffffffff);
+    g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(
+                                     AMD_PSP_DRTM_CMD_EXTEND_OSSL_DIGEST, 0)),
+                    ==, AMD_PSP_DRTM_NOT_SUPPORTED);
+
+    /* A TMR now, but SKINIT measured more than the header says */
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+    skinit(s, SLB_MEASURED + 0x10);
+    pcr_read(s, 17, pcr17);
+    for (i = 0; i < 3; i++) {
+        pcr_read(s, 18 + i, cap[i]);
+        extend_digest(cap[i], ones);
+    }
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    assert_pcr(s, 17, pcr17);
+    for (i = 0; i < 3; i++) {
+        assert_pcr(s, 18 + i, cap[i]);
+    }
+
+    /* The signature header's tag is wrong */
+    qtest_memwrite(s, SLB_BASE + SIG_HDR_OFF + 0x10, "$AS2", 4);
+    skinit(s, SLB_MEASURED);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    qtest_memwrite(s, SLB_BASE + SIG_HDR_OFF + 0x10, "$AS1", 4);
+
+    /* And the same image passes once the header is whole again */
+    skinit(s, SLB_MEASURED);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_NO_ERROR);
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
+/* locality-locks=off leaves the TIS as it is without a PSP */
+static void test_locks_off(const void *data)
+{
+    const char *tpm_path = data;
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    unsigned l;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, PSP ",locality-locks=off", &swtpm_pid, &addr);
+    for (l = 0; l <= 4; l++) {
+        g_assert_cmphex(tis_access(s, l), !=, 0xffffffff);
+    }
+    tpm_stop(s, swtpm_pid, addr);
+}
+
 int main(int argc, char **argv)
 {
+    g_autofree char *tpm_path = g_dir_make_tmp("qemu-amd-psp-drtm.XXXXXX",
+                                               NULL);
+    int ret;
+
     g_test_init(&argc, &argv, NULL);
 
     if (!qtest_has_machine("q35") || !qtest_has_device("amd-psp")) {
         g_test_skip("q35 or amd-psp not available");
-        return g_test_run();
+        ret = g_test_run();
+        tpm_util_rmdir(tpm_path);
+        return ret;
     }
 
     qtest_add_func("/amd-psp/drtm/service-off", test_service_off);
@@ -409,6 +775,12 @@ int main(int argc, char **argv)
     qtest_add_func("/amd-psp/drtm/tmr", test_tmr);
     qtest_add_func("/amd-psp/drtm/busy-and-delay", test_busy_and_delay);
     qtest_add_func("/amd-psp/drtm/reset", test_reset);
+    qtest_add_data_func("/amd-psp/drtm/launch", tpm_path, test_launch);
+    qtest_add_data_func("/amd-psp/drtm/launch-fails", tpm_path,
+                        test_launch_fails);
+    qtest_add_data_func("/amd-psp/drtm/locks-off", tpm_path, test_locks_off);
 
-    return g_test_run();
+    ret = g_test_run();
+    tpm_util_rmdir(tpm_path);
+    return ret;
 }

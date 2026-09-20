@@ -12,6 +12,8 @@
 #include "qemu/osdep.h"
 #include "hw/i386/amd_drtm.h"
 #include "amd_iommu.h"
+#include "hw/core/cpu.h"
+#include "target/i386/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -252,6 +254,11 @@ void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
     object_unparent(OBJECT(&b->mr));
     QLIST_REMOVE(b, next);
     call_rcu1(&b->rcu, amd_drtm_free_block);
+}
+
+uint32_t amd_drtm_cpu_signature(void)
+{
+    return X86_CPU(first_cpu)->env.cpuid_version;
 }
 
 static void amd_drtm_clear_blocks(AmdDrtmPlatform *p)

@@ -1,5 +1,6 @@
 /*
- * QTest testcase for the AMD northbridge stub and the MCH's function bit
+ * QTest testcase for the AMD northbridge stub, the MCH's function bit and
+ * its SMN access pair
  *
  * Copyright (c) 2026 iwanicki92 <iwanicki92@gmail.com>
  *
@@ -14,6 +15,7 @@
 #include "hw/pci/pci_ids.h"
 #include "hw/pci-host/amd_nb.h"
 #include "hw/pci-host/q35.h"
+#include "hw/misc/amd_psp.h"
 #include "qobject/qdict.h"
 
 /*
@@ -206,11 +208,111 @@ static void test_mch_multifunction(void)
     qtest_quit(qts);
 }
 
+/* Where firmware put the Secure Processor's register block on one board */
+#define PSP_BAR 0xcc200000
+#define PSP_DEVFN PCI_DEVFN(8, 0)
+
+/* GRUB's smn_register_read(): the address to 0xb8, the data from 0xbc */
+static uint32_t smn_read(QPCIDevice *mch, uint32_t addr)
+{
+    qpci_config_writel(mch, MCH_HOST_BRIDGE_SMN_ADDR, addr);
+    return qpci_config_readl(mch, MCH_HOST_BRIDGE_SMN_DATA);
+}
+
+static void test_mch_smn(void)
+{
+    QTestState *qts;
+    QPCIBus *bus;
+    QPCIDevice *mch;
+    QPCIDevice *psp;
+
+    /* Off by default, so the data register answers nothing */
+    qts = qtest_init("-M q35 -device amd-psp,addr=8.0");
+    bus = qpci_new_pc(qts, NULL);
+    mch = qpci_device_find(bus, PCI_DEVFN(0, 0));
+    psp = qpci_device_find(bus, PSP_DEVFN);
+    g_assert_nonnull(mch);
+    g_assert_nonnull(psp);
+    qpci_config_writel(psp, PCI_BASE_ADDRESS_0 + 4 * AMD_PSP_BAR_INDEX,
+                       PSP_BAR);
+    g_assert_cmphex(smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_LO), ==, 0);
+    g_free(psp);
+    g_free(mch);
+    qpci_free_pc(bus);
+    qtest_quit(qts);
+
+    /*
+     * On, PSP_BASE_ADDR_LO is the BAR as firmware assigned it, decode
+     * enabled or not, and PSP_BASE_ADDR_HI and every other address zero.
+     */
+    qts = qtest_init("-M q35 -global mch.smn=on -device amd-psp,addr=8.0");
+    bus = qpci_new_pc(qts, NULL);
+    mch = qpci_device_find(bus, PCI_DEVFN(0, 0));
+    psp = qpci_device_find(bus, PSP_DEVFN);
+    g_assert_nonnull(mch);
+    g_assert_nonnull(psp);
+    qpci_config_writel(psp, PCI_BASE_ADDRESS_0 + 4 * AMD_PSP_BAR_INDEX,
+                       PSP_BAR);
+    g_assert_cmphex(qpci_config_readw(psp, PCI_COMMAND) & PCI_COMMAND_MEMORY,
+                    ==, 0);
+    g_assert_cmphex(smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_LO), ==,
+                    PSP_BAR);
+    g_assert_cmphex(smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_HI), ==, 0);
+    g_assert_cmphex(smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_LO - 4), ==,
+                    0);
+
+    /* The data register is read-only */
+    smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_LO);
+    qpci_config_writel(mch, MCH_HOST_BRIDGE_SMN_DATA, 0xdeadbeef);
+    g_assert_cmphex(qpci_config_readl(mch, MCH_HOST_BRIDGE_SMN_DATA), ==,
+                    PSP_BAR);
+
+    /* Moving the BAR moves the answer */
+    qpci_config_writel(psp, PCI_BASE_ADDRESS_0 + 4 * AMD_PSP_BAR_INDEX,
+                       PSP_BAR + 0x100000);
+    g_assert_cmphex(smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_LO), ==,
+                    PSP_BAR + 0x100000);
+    g_free(psp);
+    g_free(mch);
+    qpci_free_pc(bus);
+    qtest_quit(qts);
+
+    /* Without a Secure Processor the address answers zero, as no PSP */
+    qts = qtest_init("-M q35 -global mch.smn=on");
+    bus = qpci_new_pc(qts, NULL);
+    mch = qpci_device_find(bus, PCI_DEVFN(0, 0));
+    g_assert_nonnull(mch);
+    g_assert_cmphex(smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_LO), ==, 0);
+    g_free(mch);
+    qpci_free_pc(bus);
+    qtest_quit(qts);
+
+    /* amd-drtm=on turns it on */
+    if (!qtest_has_device("AMDVI-PCI")) {
+        return;
+    }
+    qts = qtest_init("-M q35,amd-drtm=on -device amd-psp,addr=8.0");
+    bus = qpci_new_pc(qts, NULL);
+    mch = qpci_device_find(bus, PCI_DEVFN(0, 0));
+    psp = qpci_device_find(bus, PSP_DEVFN);
+    g_assert_nonnull(mch);
+    g_assert_nonnull(psp);
+    qpci_config_writel(psp, PCI_BASE_ADDRESS_0 + 4 * AMD_PSP_BAR_INDEX,
+                       PSP_BAR);
+    g_assert_cmphex(smn_read(mch, MCH_HOST_BRIDGE_SMN_PSP_BASE_LO), ==,
+                    PSP_BAR);
+    g_free(psp);
+    g_free(mch);
+    qpci_free_pc(bus);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/q35/amd-nb/memprot", test_memprot);
     qtest_add_func("/q35/cf8-extended-config", test_cf8_extended_config);
     qtest_add_func("/q35/mch-multifunction", test_mch_multifunction);
+    qtest_add_func("/q35/mch-smn", test_mch_smn);
     return g_test_run();
 }

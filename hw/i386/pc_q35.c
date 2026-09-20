@@ -276,6 +276,8 @@ static void pc_q35_init(MachineState *machine)
         object_property_set_bool(phb, "mch-multifunction", true, &error_abort);
         object_property_set_bool(phb, PCI_HOST_CF8_EXTENDED_CONFIG, true,
                                  &error_abort);
+        object_property_set_bool(OBJECT(&Q35_HOST_DEVICE(phb)->mch), "smn",
+                                 true, &error_abort);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(phb), &error_fatal);
     Q35_HOST_DEVICE(phb)->mmio_conf_notifier.notify = pc_q35_mmio_conf_base;
@@ -454,7 +456,8 @@ static void pc_q35_machine_options(MachineClass *m)
     object_class_property_set_description(oc, "amd-drtm",
         "Add what an AMD dynamic launch needs: the skinit feature, the "
         "amd-drtm-platform, amd-nb at 00:18.0, an enabled amd-iommu at "
-        "00:00.2 and the AMD routes to their registers. Default: off");
+        "00:00.2, the AMD routes to their registers and the SMN pair "
+        "that finds an amd-psp. Default: off");
 
     compat_props_add(m->compat_props,
                      pc_q35_compat_defaults, pc_q35_compat_defaults_len);

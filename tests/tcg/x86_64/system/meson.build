@@ -65,6 +65,11 @@ tests += {
     'cflags': cflags,
     'qemu_args': ['-machine', 'q35'] + qemu_def_args,
   },
+  # SVM for the MSR to exist, and the value firmware that disables SVM leaves
+  'vm-cr-preset.c': {
+    'cflags': cflags,
+    'qemu_args': ['-cpu', 'max,vm-cr=0x18'] + qemu_def_args,
+  },
 }
 
 if 'qemu-system-x86_64' in emulators

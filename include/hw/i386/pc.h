@@ -48,6 +48,7 @@ typedef struct PCMachineState {
     bool wdat_enabled;
     bool txt_enabled;
     bool txt_vmx_compat;
+    bool amd_drtm_enabled;
     bool smbus_enabled;
     bool sata_enabled;
     bool hpet_enabled;

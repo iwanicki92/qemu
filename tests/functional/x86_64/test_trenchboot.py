@@ -78,6 +78,7 @@ class TrenchBootXen(QemuSystemTest):
         self.set_machine('q35')
         self.require_accelerator('tcg')
         self.require_device('amd-drtm-platform')
+        self.require_device('amd-iommu')
 
         firmware = self.scratch_file('firmware.rom')
         shutil.copy(self.ASSET_FIRMWARE.fetch(), firmware)
@@ -86,14 +87,8 @@ class TrenchBootXen(QemuSystemTest):
 
         self.vm.set_console()
         self.vm.add_args('-accel', 'tcg', '-smp', '2', '-m', '4G',
-                         '-cpu', 'EPYC-Genoa,+skinit',
-                         '-global', 'q35-pcihost.mch-multifunction=on',
-                         '-global', 'q35-pcihost.cf8-extended-config=on',
-                         '-device', 'amd-drtm-platform',
-                         '-device', 'amd-nb',
-                         '-device', 'AMDVI-PCI,id=iommu0,addr=0.2',
-                         '-device', 'amd-iommu,pci-id=iommu0,'
-                                    'firmware-enabled=on',
+                         '-machine', 'amd-drtm=on',
+                         '-cpu', 'EPYC-Genoa',
                          '-chardev', f'socket,id=chrtpm,path={tpm_sock}',
                          '-tpmdev', 'emulator,id=tpm0,chardev=chrtpm',
                          '-device', 'tpm-tis,tpmdev=tpm0',

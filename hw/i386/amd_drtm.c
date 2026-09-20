@@ -150,20 +150,80 @@ static AmdDrtmBlock *amd_drtm_find_block(AmdDrtmPlatform *p, const char *name)
     return NULL;
 }
 
-/* Recorded only. Nothing keeps DMA out of the range yet. */
+/* The link property when set, else the one amd-iommu the machine has */
+static AMDVIState *amd_drtm_iommu(AmdDrtmPlatform *p)
+{
+    Object *obj = OBJECT(p->iommu);
+    bool ambiguous;
+
+    if (!obj) {
+        obj = object_resolve_path_type("", TYPE_AMD_IOMMU_DEVICE, &ambiguous);
+        if (ambiguous) {
+            obj = NULL;
+        }
+    }
+    return obj ? AMD_IOMMU_DEVICE(obj) : NULL;
+}
+
+/* What a device gets from a blocked range: a target abort, no data */
+static MemTxResult amd_drtm_block_read(void *opaque, hwaddr addr,
+                                       uint64_t *data, unsigned size,
+                                       MemTxAttrs attrs)
+{
+    AmdDrtmBlock *b = opaque;
+
+    trace_amd_drtm_dma_blocked(b->name, b->base + addr, size, false);
+    *data = 0;
+    return MEMTX_DECODE_ERROR;
+}
+
+static MemTxResult amd_drtm_block_write(void *opaque, hwaddr addr,
+                                        uint64_t data, unsigned size,
+                                        MemTxAttrs attrs)
+{
+    AmdDrtmBlock *b = opaque;
+
+    trace_amd_drtm_dma_blocked(b->name, b->base + addr, size, true);
+    return MEMTX_DECODE_ERROR;
+}
+
+static const MemoryRegionOps amd_drtm_block_ops = {
+    .read_with_attrs = amd_drtm_block_read,
+    .write_with_attrs = amd_drtm_block_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+static void amd_drtm_free_block(struct rcu_head *rcu)
+{
+    AmdDrtmBlock *b = container_of(rcu, AmdDrtmBlock, rcu);
+
+    g_free(b->name);
+    g_free(b);
+}
+
 void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
                         const char *name)
 {
-    AmdDrtmBlock *b = amd_drtm_find_block(p, name);
+    AMDVIState *iommu = amd_drtm_iommu(p);
+    AmdDrtmBlock *b;
 
-    trace_amd_drtm_block_dma(name, base, len);
-    if (!b) {
-        b = g_new0(AmdDrtmBlock, 1);
-        b->name = g_strdup(name);
-        QLIST_INSERT_HEAD(&p->blocks, b, next);
-    }
+    /* A block placed again moves, so the old region goes first */
+    amd_drtm_unblock_dma(p, name);
+
+    b = g_new0(AmdDrtmBlock, 1);
+    b->name = g_strdup(name);
     b->base = base;
     b->len = len;
+    memory_region_init_io(&b->mr, OBJECT(p), &amd_drtm_block_ops, b, name,
+                          len);
+    if (iommu) {
+        amdvi_add_dma_block(iommu, &b->mr, base);
+        b->enforced = true;
+    }
+    QLIST_INSERT_HEAD(&p->blocks, b, next);
+    trace_amd_drtm_block_dma(name, base, len, b->enforced);
 }
 
 void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
@@ -171,11 +231,15 @@ void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
     AmdDrtmBlock *b = amd_drtm_find_block(p, name);
 
     trace_amd_drtm_unblock_dma(name, b != NULL);
-    if (b) {
-        QLIST_REMOVE(b, next);
-        g_free(b->name);
-        g_free(b);
+    if (!b) {
+        return;
     }
+    if (b->enforced) {
+        amdvi_del_dma_block(amd_drtm_iommu(p), &b->mr);
+    }
+    object_unparent(OBJECT(&b->mr));
+    QLIST_REMOVE(b, next);
+    call_rcu1(&b->rcu, amd_drtm_free_block);
 }
 
 static void amd_drtm_clear_blocks(AmdDrtmPlatform *p)
@@ -209,6 +273,7 @@ AmdDrtmInfo *qmp_query_amd_drtm(Error **errp)
         block->name = g_strdup(b->name);
         block->base = b->base;
         block->len = b->len;
+        block->enforced = b->enforced;
         QAPI_LIST_APPEND(tail, block);
     }
     return info;
@@ -262,7 +327,7 @@ static const VMStateDescription vmstate_amd_drtm_platform = {
 };
 
 static const Property amd_drtm_platform_properties[] = {
-    /* Where SL_DEV and the TMR will be enforced. Nothing reads it yet. */
+    /* The IOMMU that enforces the blocks. Found by type when unset. */
     DEFINE_PROP_LINK("iommu", AmdDrtmPlatform, iommu, TYPE_AMD_IOMMU_DEVICE,
                      DeviceState *),
     /* Every guest error the launch logs also stops the VM as a panic */

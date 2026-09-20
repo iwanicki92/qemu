@@ -12,7 +12,9 @@
 #include "hw/core/sysbus.h"
 #include "qapi/qapi-types-misc-i386.h"
 #include "qemu/queue.h"
+#include "qemu/rcu.h"
 #include "qom/object.h"
+#include "system/memory.h"
 
 #define TYPE_AMD_DRTM_PLATFORM "amd-drtm-platform"
 OBJECT_DECLARE_SIMPLE_TYPE(AmdDrtmPlatform, AMD_DRTM_PLATFORM)
@@ -23,12 +25,19 @@ typedef struct TPMIf TPMIf;
 #define AMD_DRTM_SL_DEV_BLOCK "sl_dev"
 #define AMD_DRTM_SLB_SIZE 0x10000
 
-/* One named range that device DMA is kept out of. */
+/*
+ * One named range that device DMA is kept out of. The region answers every
+ * access with a decode error, and sits in the IOMMU's view when there is
+ * one. Freed after a grace period, as a stale flat view may still name it.
+ */
 typedef struct AmdDrtmBlock {
     char *name;
     hwaddr base;
     uint64_t len;
+    MemoryRegion mr;
+    bool enforced;
     QLIST_ENTRY(AmdDrtmBlock) next;
+    struct rcu_head rcu;
 } AmdDrtmBlock;
 
 /*
@@ -74,6 +83,7 @@ void amd_drtm_sl_dev_release(AmdDrtmPlatform *p);
 /*
  * The one seam for every DMA protection the AMD path has: SL_DEV, the
  * IOMMU exclusion range, later a PSP TMR. A name identifies each block.
+ * Enforced through amd-iommu when the machine has one, recorded otherwise.
  */
 void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
                         const char *name);

@@ -503,10 +503,14 @@
 #
 # @len: the length of the block in bytes
 #
+# @enforced: whether an amd-iommu keeps DMA out of the range, or the
+#     block is only recorded because the machine has none
+#
 # Since: 11.2
 ##
 { 'struct': 'AmdDrtmDmaBlock',
-  'data': { 'name': 'str', 'base': 'uint64', 'len': 'uint64' } }
+  'data': { 'name': 'str', 'base': 'uint64', 'len': 'uint64',
+            'enforced': 'bool' } }
 
 ##
 # @AmdDrtmInfo:

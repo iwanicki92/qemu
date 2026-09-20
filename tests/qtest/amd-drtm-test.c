@@ -11,6 +11,7 @@
 #include "libqos/pci.h"
 #include "libqos/pci-pc.h"
 #include "hw/i386/amd_iommu.h"
+#include "hw/misc/amd_psp.h"
 #include "hw/pci-host/amd_nb.h"
 #include "hw/pci-host/q35.h"
 #include "qobject/qdict.h"
@@ -220,6 +221,52 @@ static void test_sl_dev(void)
 }
 
 /*
+ * A PSP TMR keeps device DMA out but not the IOMMU's own accesses: the
+ * board's Xen programmed and enabled its IOMMUs with the TMR still over
+ * their tables. The same command sequence as under SL_DEV completes.
+ */
+static void test_tmr_fetch(void)
+{
+    const uint32_t mbox = AMD_PSP_ASPT_BASE + AMD_PSP_C2PMSG_BASE -
+                          AMD_PSP_ASPT_WINDOW;
+    QTestState *s;
+    uint32_t done, val;
+    int i;
+
+    if (!qtest_has_device("amd-iommu") || !qtest_has_device("amd-psp")) {
+        g_test_skip("amd-iommu or amd-psp not available");
+        return;
+    }
+
+    s = qtest_init("-M q35 -device amd-drtm-platform -device amd-iommu "
+                   "-device amd-psp,drtm-service=on");
+
+    /* The kick, then one TMR over the SLB the tables sit in */
+    qtest_writel(s, mbox + 4 * AMD_PSP_C2PMSG_DRTM, 0);
+    qtest_writel(s, mbox + 4 * AMD_PSP_C2PMSG_DRTM_ARG0, 1);
+    qtest_writel(s, mbox + 4 * AMD_PSP_C2PMSG_DRTM_ARG1, SLB_BASE);
+    qtest_writel(s, mbox + 4 * AMD_PSP_C2PMSG_DRTM_ARG2, 0);
+    qtest_writel(s, mbox + 4 * AMD_PSP_C2PMSG_DRTM,
+                 AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_TMR_SETUP, 0));
+    for (i = 0; i < 100; i++) {
+        val = qtest_readl(s, mbox + 4 * AMD_PSP_C2PMSG_DRTM);
+        if (val & AMD_PSP_DRTM_READY) {
+            break;
+        }
+    }
+    g_assert_cmphex(val, ==, AMD_PSP_DRTM_READY | AMD_PSP_DRTM_NO_ERROR);
+
+    iommu_program(s);
+    iommu_completion_wait(s, 0);
+    g_assert_cmphex(amdvi_readq(s, AMDVI_MMIO_STATUS) &
+                    AMDVI_MMIO_STATUS_EVENT_INT, ==, 0);
+    qtest_memread(s, DONE_ADDR, &done, sizeof(done));
+    g_assert_cmphex(le32_to_cpu(done), ==, DONE_DATA);
+
+    qtest_quit(s);
+}
+
+/*
  * strict=on turns the guest error a launch without a TPM logs into a
  * guest panic carrying the rule, and the VM stops. Off, it runs on.
  */
@@ -365,6 +412,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("/q35/amd-drtm/launch", test_launch);
     qtest_add_func("/q35/amd-drtm/sl-dev", test_sl_dev);
+    qtest_add_func("/q35/amd-drtm/tmr-fetch", test_tmr_fetch);
     qtest_add_func("/q35/amd-drtm/strict", test_strict);
     qtest_add_func("/q35/amd-drtm/second-instance-rejected",
                    test_second_instance_rejected);

@@ -9403,6 +9403,7 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
     cpu_x86_update_cr0(env, 0x60000010);
     env->a20_mask = ~0x0;
     env->a20_gate = true;
+    env->init_pending = false;
     env->smbase = 0x30000;
     env->msr_smi_count = 0;
 

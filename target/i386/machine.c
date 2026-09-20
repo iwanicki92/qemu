@@ -1645,6 +1645,24 @@ static const VMStateDescription vmstate_vm_cr = {
     }
 };
 
+static bool init_pending_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+
+    return cpu->env.init_pending;
+}
+
+static const VMStateDescription vmstate_init_pending = {
+    .name = "cpu/init_pending",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = init_pending_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.init_pending, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 #ifdef TARGET_X86_64
 static bool intel_fred_msrs_needed(void *opaque)
 {
@@ -2004,6 +2022,7 @@ const VMStateDescription vmstate_x86_cpu = {
         &vmstate_msr_xfd,
         &vmstate_msr_hwcr,
         &vmstate_vm_cr,
+        &vmstate_init_pending,
 #ifdef TARGET_X86_64
         &vmstate_msr_fred,
         &vmstate_amx_xtile,

@@ -7,8 +7,9 @@
  * parks the second CPU, leaves an interrupt pending, and executes SKINIT
  * on a 64 KiB SLB whose 32-bit stub records the entry state and jumps back
  * to boot.S, which re-enters main in long mode for the checks: the entry
- * state, the interrupt held back until STGI, and the AP arriving from its
- * SIPI with the VM_CR bits set.
+ * state, the interrupt and an INIT held back until STGI, the INIT then
+ * arriving as #SX while R_INIT is set, and the AP arriving from its SIPI
+ * with the VM_CR bits set.
  *
  * The kernel runs at 1 MiB, which an A20 mask aliases away, so the probe
  * that runs with A20 masked is copied to 0x210000 and walks page tables at
@@ -54,6 +55,7 @@
 #define APIC_ICR_SELF           (1 << 18)
 #define APIC_ICR_ALL_BUT_SELF   (3 << 18)
 #define IRQ_VECTOR              0x20
+#define SX_VECTOR               30
 
 /* The AP trampoline, at a page below 1 MiB a SIPI vector can name */
 #define AP_CODE                 0x8000
@@ -192,12 +194,14 @@ static void copy(void *to, const void *from, unsigned len)
 /*
  * Exceptions: a #GP or #UD handler counts the fault and resumes at
  * gp_resume, which the faulting sequence sets to its own end. The
- * interrupt handler only counts.
+ * interrupt handler only counts, the #SX handler also keeps its error code.
  */
 uint64_t gp_resume;
 vu32 gp_count;
 vu32 ud_count;
 vu32 irq_count;
+vu32 sx_count;
+uint64_t sx_error;
 
 static void __attribute__((naked)) gp_handler(void)
 {
@@ -227,6 +231,13 @@ static void __attribute__((naked)) irq_handler(void)
                  "movq $" STR(APIC_BASE + APIC_EOI) ", %rax\n\t"
                  "movl $0, (%rax)\n\t"
                  "popq %rax\n\t"
+                 "iretq");
+}
+
+static void __attribute__((naked)) sx_handler(void)
+{
+    asm volatile("incl sx_count(%rip)\n\t"
+                 "popq sx_error(%rip)\n\t"
                  "iretq");
 }
 
@@ -263,6 +274,7 @@ static void setup_idt(void)
 
     set_gate(6, ud_handler);
     set_gate(13, gp_handler);
+    set_gate(SX_VECTOR, sx_handler);
     set_gate(IRQ_VECTOR, irq_handler);
     asm volatile("lidt %0" : : "m"(idtr));
 }
@@ -538,20 +550,36 @@ static void check_entry_state(void)
           "VM_CR 0x%llx", vm_cr);
 }
 
-/* The self-IPI sent before the launch waits for STGI, not for IF */
+/*
+ * The self-IPI sent before the launch and an INIT sent now both wait for
+ * STGI, not for IF. R_INIT stays set across the STGI, so the INIT arrives
+ * as #SX with error code 1 instead of resetting the core, and again once
+ * GIF is set.
+ */
 static void check_gif(void)
 {
     uint64_t vm_cr = rdmsr(MSR_VM_CR);
 
+    apic_write(APIC_ICR, APIC_ICR_SELF | APIC_ICR_INIT);
     asm volatile("sti" : : : "memory");
     spin(100000);
     check(irq_count == 0, "no interrupt with GIF clear: %d", irq_count);
+    check(sx_count == 0, "the INIT is held with GIF clear: %d", sx_count);
 
-    wrmsr(MSR_VM_CR, vm_cr & ~MSR_VM_CR_SL_ENTRY);
+    wrmsr(MSR_VM_CR, vm_cr & ~(MSR_VM_CR_DPD | MSR_VM_CR_DIS_A20M));
     asm volatile(".byte 0x0f, 0x01, 0xdc" : : : "memory");   /* stgi */
     spin(100000);
-    asm volatile("cli" : : : "memory");
     check(irq_count == 1, "the interrupt arrives after STGI: %d", irq_count);
+    check(sx_count == 1 && sx_error == 1,
+          "the held INIT arrives as #SX after STGI: %d, error code %llx",
+          sx_count, sx_error);
+
+    apic_write(APIC_ICR, APIC_ICR_SELF | APIC_ICR_INIT);
+    spin(100000);
+    check(sx_count == 2, "an INIT with GIF set is #SX at once: %d", sx_count);
+    asm volatile("cli" : : : "memory");
+
+    wrmsr(MSR_VM_CR, rdmsr(MSR_VM_CR) & ~MSR_VM_CR_R_INIT);
 }
 
 static void check_ap(void)

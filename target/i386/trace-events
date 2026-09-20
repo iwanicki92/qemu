@@ -28,6 +28,10 @@ getsec_ap_joined(int cpu_index, uint32_t entry) "GETSEC[WAKEUP]: RLP %d joined a
 # helper.c
 x86_sipi_after_launch(int cpu_index) "cpu %d starts with GIF clear and VM_CR DPD, R_INIT and DIS_A20M set"
 
+# tcg/tcg-cpu.c
+x86_init_held(int cpu_index) "cpu %d holds INIT until GIF is set"
+x86_init_redirected(int cpu_index) "cpu %d takes INIT as #SX, VM_CR.R_INIT set"
+
 # tcg/system/misc_helper.c
 x86_vm_cr_write(int cpu_index, uint64_t old, uint64_t val) "cpu %d 0x%" PRIx64 " -> 0x%" PRIx64
 

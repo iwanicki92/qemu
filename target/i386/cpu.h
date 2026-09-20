@@ -1530,6 +1530,7 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define EXCP10_COPR     16
 #define EXCP11_ALGN     17
 #define EXCP12_MCHK     18
+#define EXCP1E_SX       30
 
 #define EXCP_VMEXIT     0x100 /* only for system emulation */
 #define EXCP_SYSCALL    0x101 /* only for user emulation */
@@ -2093,6 +2094,8 @@ typedef struct CPUArchState {
     uint64_t vm_cr;
     /* The A20 gate as the chipset set it, reapplied when DIS_A20M clears */
     bool a20_gate;
+    /* An INIT that arrived with GIF clear, raised again by STGI */
+    bool init_pending;
 
 #ifdef TARGET_X86_64
     uint64_t lstar;

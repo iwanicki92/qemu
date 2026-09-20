@@ -28,13 +28,17 @@ typedef struct TPMIf TPMIf;
 /*
  * One named range that device DMA is kept out of. The region answers every
  * access with a decode error, and sits in the IOMMU's view when there is
- * one. Freed after a grace period, as a stale flat view may still name it.
+ * one. With @fetch an alias of it sits in the view of the IOMMU's own
+ * accesses too. Freed after a grace period, as a stale flat view may
+ * still name it.
  */
 typedef struct AmdDrtmBlock {
     char *name;
     hwaddr base;
     uint64_t len;
     MemoryRegion mr;
+    MemoryRegion fetch_mr;
+    bool fetch;
     bool enforced;
     QLIST_ENTRY(AmdDrtmBlock) next;
     struct rcu_head rcu;
@@ -82,11 +86,13 @@ void amd_drtm_sl_dev_release(AmdDrtmPlatform *p);
 
 /*
  * The one seam for every DMA protection the AMD path has: SL_DEV, the
- * IOMMU exclusion range, later a PSP TMR. A name identifies each block.
- * Enforced through amd-iommu when the machine has one, recorded otherwise.
+ * IOMMU exclusion range, a PSP TMR. A name identifies each block. @fetch
+ * says whether it also stops the IOMMU's own table, command and log
+ * accesses, as SL_DEV does and a TMR does not. Enforced through amd-iommu
+ * when the machine has one, recorded otherwise.
  */
 void amd_drtm_block_dma(AmdDrtmPlatform *p, hwaddr base, uint64_t len,
-                        const char *name);
+                        const char *name, bool fetch);
 void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name);
 
 #endif

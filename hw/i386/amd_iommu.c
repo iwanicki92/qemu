@@ -305,7 +305,7 @@ static void amdvi_log_event(AMDVIState *s, uint64_t *evt)
     le_evt[0] = cpu_to_le64(evt[0]);
     le_evt[1] = cpu_to_le64(evt[1]);
 
-    if (dma_memory_write(&s->as_sys, s->evtlog + s->evtlog_tail,
+    if (dma_memory_write(&s->as_fetch, s->evtlog + s->evtlog_tail,
                          le_evt, AMDVI_EVENT_LEN, MEMTXATTRS_UNSPECIFIED)) {
         trace_amdvi_evntlog_fail(s->evtlog, s->evtlog_tail);
     }
@@ -564,7 +564,7 @@ static void amdvi_completion_wait(AMDVIState *s, uint64_t *cmd)
                                    s->cmdbuf + s->cmdbuf_head);
     }
     if (extract64(cmd[0], 0, 1)) {
-        if (dma_memory_write(&s->as_sys, addr, &le_data,
+        if (dma_memory_write(&s->as_fetch, addr, &le_data,
                              AMDVI_COMPLETION_DATA_SIZE,
                              MEMTXATTRS_UNSPECIFIED)) {
             trace_amdvi_completion_wait_fail(addr);
@@ -623,7 +623,7 @@ static bool amdvi_get_dte(AMDVIState *s, int devid, uint64_t *entry)
 {
     uint32_t offset = devid * AMDVI_DEVTAB_ENTRY_SIZE;
 
-    if (dma_memory_read(&s->as_sys, s->devtab + offset, entry,
+    if (dma_memory_read(&s->as_fetch, s->devtab + offset, entry,
                         AMDVI_DEVTAB_ENTRY_SIZE, MEMTXATTRS_UNSPECIFIED)) {
         trace_amdvi_dte_get_fail(s->devtab, offset);
         /* log error accessing dte */
@@ -651,7 +651,7 @@ static inline uint64_t amdvi_get_pte_entry(AMDVIState *s, uint64_t pte_addr,
 {
     uint64_t pte;
 
-    if (dma_memory_read(&s->as_sys, pte_addr,
+    if (dma_memory_read(&s->as_fetch, pte_addr,
                         &pte, sizeof(pte), MEMTXATTRS_UNSPECIFIED)) {
         trace_amdvi_get_pte_hwerror(pte_addr);
         amdvi_log_pagetab_error(s, devid, pte_addr, 0);
@@ -1531,7 +1531,7 @@ static void amdvi_cmdbuf_exec(AMDVIState *s)
 {
     uint64_t cmd[2];
 
-    if (dma_memory_read(&s->as_sys, s->cmdbuf + s->cmdbuf_head,
+    if (dma_memory_read(&s->as_fetch, s->cmdbuf + s->cmdbuf_head,
                         cmd, AMDVI_COMMAND_SIZE, MEMTXATTRS_UNSPECIFIED)) {
         trace_amdvi_command_read_fail(s->cmdbuf, s->cmdbuf_head);
         amdvi_log_command_error(s, s->cmdbuf + s->cmdbuf_head);
@@ -2048,7 +2048,7 @@ static int amdvi_get_irte(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
 
     trace_amdvi_ir_irte(irte_root, offset);
 
-    if (dma_memory_read(&s->as_sys, irte_root + offset,
+    if (dma_memory_read(&s->as_fetch, irte_root + offset,
                         irte, sizeof(*irte), MEMTXATTRS_UNSPECIFIED)) {
         trace_amdvi_ir_err("failed to get irte");
         return -AMDVI_IR_GET_IRTE;
@@ -2111,7 +2111,7 @@ static int amdvi_get_irte_ga(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
     offset = (origin->data & AMDVI_IRTE_OFFSET) << 4;
     trace_amdvi_ir_irte(irte_root, offset);
 
-    if (dma_memory_read(&s->as_sys, irte_root + offset,
+    if (dma_memory_read(&s->as_fetch, irte_root + offset,
                         irte, sizeof(*irte), MEMTXATTRS_UNSPECIFIED)) {
         trace_amdvi_ir_err("failed to get irte_ga");
         return -AMDVI_IR_GET_IRTE;
@@ -2479,16 +2479,27 @@ static const PCIIOMMUOps amdvi_iommu_ops = {
 
 /* Above the memory alias at 0 and the interrupt window at 1 */
 #define AMDVI_DMA_BLOCK_PRIORITY 2
+/* Above the memory alias at 0 */
+#define AMDVI_FETCH_BLOCK_PRIORITY 1
 
-void amdvi_add_dma_block(AMDVIState *s, MemoryRegion *mr, hwaddr base)
+void amdvi_add_dma_block(AMDVIState *s, MemoryRegion *mr,
+                         MemoryRegion *fetch_mr, hwaddr base)
 {
     memory_region_add_subregion_overlap(&s->mr_sys, base, mr,
                                         AMDVI_DMA_BLOCK_PRIORITY);
+    if (fetch_mr) {
+        memory_region_add_subregion_overlap(&s->mr_fetch, base, fetch_mr,
+                                            AMDVI_FETCH_BLOCK_PRIORITY);
+    }
 }
 
-void amdvi_del_dma_block(AMDVIState *s, MemoryRegion *mr)
+void amdvi_del_dma_block(AMDVIState *s, MemoryRegion *mr,
+                         MemoryRegion *fetch_mr)
 {
     memory_region_del_subregion(&s->mr_sys, mr);
+    if (fetch_mr) {
+        memory_region_del_subregion(&s->mr_fetch, fetch_mr);
+    }
 }
 
 static const MemoryRegionOps mmio_mem_ops = {
@@ -2761,11 +2772,20 @@ static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(&s->mr_sys, AMDVI_INT_ADDR_FIRST,
                                         &s->mr_ir, 1);
 
-    /*
-     * The IOMMU fetches its tables, commands and log entries through the
-     * same view, so a DMA block placed there stops them as it stops devices.
-     */
+    /* Translated device DMA lands in the same view as untranslated */
     address_space_init(&s->as_sys, &s->mr_sys, "amdvi-sys");
+
+    /*
+     * The IOMMU's own accesses to its tables, commands and logs go through
+     * a view of their own: memory, plus only the DMA blocks that say they
+     * stop those accesses too.
+     */
+    memory_region_init(&s->mr_fetch, OBJECT(s), "amdvi-fetch", UINT64_MAX);
+    memory_region_init_alias(&s->mr_fetch_mem, OBJECT(s), "amdvi-fetch-mem",
+                             get_system_memory(), 0,
+                             memory_region_size(get_system_memory()));
+    memory_region_add_subregion_overlap(&s->mr_fetch, 0, &s->mr_fetch_mem, 0);
+    address_space_init(&s->as_fetch, &s->mr_fetch, "amdvi-fetch");
 
     /* Pseudo address space under root PCI bus. */
     x86ms->ioapic_as = amdvi_host_dma_iommu(bus, s, AMDVI_IOAPIC_SB_DEVID);

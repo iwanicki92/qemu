@@ -466,6 +466,57 @@ uint16_t tpm_tis_get_checksum(TPMState *s)
     return bswap16(crc_ccitt(0, s->buffer, s->rw_offset));
 }
 
+static void tpm_tis_hash_flush(TPMState *s)
+{
+    if (s->hash_len) {
+        tpm_backend_hash_data(s->be_driver, s->hash_buf, s->hash_len);
+        s->hash_len = 0;
+    }
+}
+
+/*
+ * The locality 4 registers (PC Client PTP, FIFO register table). The
+ * value written to HASH_START and HASH_END carries nothing, HASH_DATA
+ * takes the image a write at a time, and data outside a sequence is
+ * dropped.
+ */
+static void tpm_tis_hash_write(TPMState *s, uint16_t off, uint64_t val,
+                               unsigned size)
+{
+    int ret;
+
+    switch (off) {
+    case TPM_TIS_REG_HASH_START:
+        ret = tpm_backend_hash_start(s->be_driver);
+        trace_tpm_tis_hash_start(ret);
+        s->hash_active = ret == 0;
+        s->hash_len = 0;
+        break;
+    case TPM_TIS_REG_HASH_DATA:
+        if (!s->hash_active) {
+            break;
+        }
+        for (unsigned i = 0; i < size; i++) {
+            s->hash_buf[s->hash_len++] = val >> (8 * i);
+            if (s->hash_len == sizeof(s->hash_buf)) {
+                tpm_tis_hash_flush(s);
+            }
+        }
+        break;
+    case TPM_TIS_REG_HASH_END:
+        if (!s->hash_active) {
+            break;
+        }
+        tpm_tis_hash_flush(s);
+        ret = tpm_backend_hash_end(s->be_driver);
+        trace_tpm_tis_hash_end(ret);
+        s->hash_active = false;
+        break;
+    default:
+        trace_tpm_tis_mmio_write_locty4();
+    }
+}
+
 /*
  * Write a value to a register of the TIS interface
  * See specs pages 33-63 for description of the registers
@@ -484,12 +535,16 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
 
     trace_tpm_tis_mmio_write(size, addr, val);
 
-    if (locty == 4) {
-        trace_tpm_tis_mmio_write_locty4();
+    if (tpm_backend_had_startup_error(s->be_driver)) {
         return;
     }
 
-    if (tpm_backend_had_startup_error(s->be_driver)) {
+    if (locty == 4) {
+        if (s->locality4) {
+            tpm_tis_hash_write(s, off, val, size);
+        } else {
+            trace_tpm_tis_mmio_write_locty4();
+        }
         return;
     }
 
@@ -843,6 +898,8 @@ void tpm_tis_reset(TPMState *s, bool ppi_enabled)
     s->active_locty = TPM_TIS_NO_LOCALITY;
     s->next_locty = TPM_TIS_NO_LOCALITY;
     s->aborting_locty = TPM_TIS_NO_LOCALITY;
+    s->hash_active = false;
+    s->hash_len = 0;
 
     for (c = 0; c < TPM_TIS_NUM_LOCALITIES; c++) {
         s->loc[c].access = TPM_TIS_ACCESS_TPM_REG_VALID_STS;

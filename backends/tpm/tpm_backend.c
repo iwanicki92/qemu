@@ -175,10 +175,9 @@ TPMInfo *tpm_backend_query_tpm(TPMBackend *s)
     return info;
 }
 
-int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len)
+int tpm_backend_hash_start(TPMBackend *s)
 {
     TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
-    size_t off = 0;
     int ret;
 
     if (!k->hash_start || !k->hash_data || !k->hash_end) {
@@ -193,6 +192,41 @@ int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len)
 
     ret = k->hash_start(s);
     trace_tpm_backend_hash_start(ret);
+    return ret;
+}
+
+int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+    int ret;
+
+    if (!k->hash_data) {
+        return -ENOTSUP;
+    }
+    ret = k->hash_data(s, data, len);
+    trace_tpm_backend_hash_data(len, ret);
+    return ret;
+}
+
+int tpm_backend_hash_end(TPMBackend *s)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+    int ret;
+
+    if (!k->hash_end) {
+        return -ENOTSUP;
+    }
+    ret = k->hash_end(s);
+    trace_tpm_backend_hash_end(ret);
+    return ret;
+}
+
+int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len)
+{
+    size_t off = 0;
+    int ret;
+
+    ret = tpm_backend_hash_start(s);
     if (ret < 0) {
         return ret;
     }
@@ -200,17 +234,14 @@ int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len)
     while (off < len) {
         size_t n = MIN(len - off, TPM_BACKEND_HASH_CHUNK);
 
-        ret = k->hash_data(s, data + off, n);
-        trace_tpm_backend_hash_data(n, ret);
+        ret = tpm_backend_hash_data(s, data + off, n);
         if (ret < 0) {
             return ret;
         }
         off += n;
     }
 
-    ret = k->hash_end(s);
-    trace_tpm_backend_hash_end(ret);
-    return ret;
+    return tpm_backend_hash_end(s);
 }
 
 static void tpm_backend_instance_finalize(Object *obj)

@@ -173,6 +173,12 @@ static void pc_q35_amd_drtm_init(PCMachineState *pcms)
     iommu = qdev_new(TYPE_AMD_IOMMU_DEVICE);
     qdev_prop_set_string(iommu, "pci-id", "amd-drtm-iommu");
     qdev_prop_set_bit(iommu, "firmware-enabled", true);
+    /*
+     * Translate rather than pass DMA through: an OS that builds a
+     * translated domain for its disk, as Linux does, gets nothing back
+     * from it otherwise.
+     */
+    qdev_prop_set_bit(iommu, "dma-remap", true);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(iommu), &error_fatal);
 }
 

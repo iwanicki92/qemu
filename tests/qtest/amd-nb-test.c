@@ -17,8 +17,8 @@
 #include "qobject/qdict.h"
 
 /*
- * SKL reaches MEMPROT_CR through MMCONFIG, which q35 maps from PCIEXBAR.
- * The port 0xcf8 route only carries the low byte of the offset.
+ * SKL reaches MEMPROT_CR through MMCONFIG when the MSR maps it, and
+ * through port 0xcf8 with AMD's extended register bits otherwise.
  */
 #define MMCFG_BASE MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT
 #define MMCFG_ADDR(devfn, offset) \
@@ -102,6 +102,61 @@ static void test_memprot(void)
     qtest_quit(qts);
 }
 
+/* SKL's PCI_CONF1_ADDRESS(): offset bits 8 to 11 in address bits 24 to 27 */
+#define CF8_EXT_ADDR(devfn, offset) \
+    (0x80000000 | (((offset) & 0xf00) << 16) | ((devfn) << 8) | \
+     ((offset) & 0xfc))
+
+static uint32_t cf8_readl(QTestState *qts, uint32_t addr)
+{
+    qtest_outl(qts, 0xcf8, addr);
+    return qtest_inl(qts, 0xcfc);
+}
+
+static void cf8_writel(QTestState *qts, uint32_t addr, uint32_t val)
+{
+    qtest_outl(qts, 0xcf8, addr);
+    qtest_outl(qts, 0xcfc, val);
+}
+
+static void test_cf8_extended_config(void)
+{
+    const uint32_t memprot = CF8_EXT_ADDR(AMD_NB_DEVFN, AMD_NB_MEMPROT_CR);
+    const uint32_t vendor = CF8_EXT_ADDR(AMD_NB_DEVFN, PCI_VENDOR_ID);
+    QTestState *qts;
+
+    /* Off by default, so the extended bits are ignored and 0x84 is hit. */
+    qts = qtest_init("-M q35 -device amd-drtm-platform -device amd-nb");
+    qtest_qmp_assert_success(qts, "{ 'execute': 'x-amd-drtm-launch',"
+                             " 'arguments': { 'base': 1048576,"
+                             " 'length': 4096 } }");
+    g_assert_true(sl_dev_armed(qts));
+    g_assert_cmphex(cf8_readl(qts, memprot), ==, 0);
+    cf8_writel(qts, memprot, 0);
+    g_assert_true(sl_dev_armed(qts));
+    qtest_quit(qts);
+
+    /* On, SKL's release of SL_DEV lands, and the low space still works. */
+    qts = qtest_init("-M q35 -global q35-pcihost.cf8-extended-config=on"
+                     " -device amd-drtm-platform -device amd-nb");
+    g_assert_cmphex(cf8_readl(qts, vendor) & 0xffff, ==, PCI_VENDOR_ID_AMD);
+    qtest_qmp_assert_success(qts, "{ 'execute': 'x-amd-drtm-launch',"
+                             " 'arguments': { 'base': 1048576,"
+                             " 'length': 4096 } }");
+    g_assert_true(sl_dev_armed(qts));
+    cf8_writel(qts, memprot, cf8_readl(qts, memprot) & ~AMD_NB_MEMPROT_EN);
+    g_assert_false(sl_dev_armed(qts));
+    cf8_writel(qts, memprot, 0xffffffff);
+    g_assert_cmphex(cf8_readl(qts, memprot), ==, AMD_NB_MEMPROT_EN);
+    cf8_writel(qts, memprot, 0);
+
+    /* An empty slot answers all ones through the extended route too. */
+    g_assert_cmphex(cf8_readl(qts, CF8_EXT_ADDR(PCI_DEVFN(0x19, 0),
+                                                AMD_NB_MEMPROT_CR)),
+                    ==, 0xffffffff);
+    qtest_quit(qts);
+}
+
 static void test_mch_multifunction(void)
 {
     QTestState *qts;
@@ -155,6 +210,7 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/q35/amd-nb/memprot", test_memprot);
+    qtest_add_func("/q35/cf8-extended-config", test_cf8_extended_config);
     qtest_add_func("/q35/mch-multifunction", test_mch_multifunction);
     return g_test_run();
 }

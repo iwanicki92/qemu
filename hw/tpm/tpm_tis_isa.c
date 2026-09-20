@@ -91,6 +91,23 @@ static int tpm_tis_isa_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
     return tpm_tis_hash_image(s, data, len);
 }
 
+static int tpm_tis_isa_run_command(TPMIf *ti, uint8_t locty, const uint8_t *in,
+                          size_t in_len, uint8_t *out, size_t out_len)
+{
+    TPMStateISA *isadev = TPM_TIS_ISA(ti);
+    TPMState *s = &isadev->state;
+
+    return tpm_tis_run_command(s, locty, in, in_len, out, out_len);
+}
+
+static void tpm_tis_isa_set_locality_locks(TPMIf *ti, uint8_t locked)
+{
+    TPMStateISA *isadev = TPM_TIS_ISA(ti);
+    TPMState *s = &isadev->state;
+
+    tpm_tis_set_locality_locks(s, locked);
+}
+
 static void tpm_tis_isa_reset(DeviceState *dev)
 {
     TPMStateISA *isadev = TPM_TIS_ISA(dev);
@@ -188,6 +205,8 @@ static void tpm_tis_isa_class_init(ObjectClass *klass, const void *data)
     tc->request_completed = tpm_tis_isa_request_completed;
     tc->get_version = tpm_tis_isa_get_tpm_version;
     tc->hash_image = tpm_tis_isa_hash_image;
+    tc->run_command = tpm_tis_isa_run_command;
+    tc->set_locality_locks = tpm_tis_isa_set_locality_locks;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     adevc->build_dev_aml = build_tpm_tis_isa_aml;
 }

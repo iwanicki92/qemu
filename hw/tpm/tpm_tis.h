@@ -86,6 +86,13 @@ typedef struct TPMState {
     bool hash_active;
     uint16_t hash_len;
     uint8_t hash_buf[TPM_BACKEND_HASH_CHUNK];
+
+    /*
+     * The localities a firmware agent keeps the processor out of, one
+     * bit each. Only that agent changes it, at its own reset, so the
+     * interface's reset leaves it alone and it does not migrate.
+     */
+    uint8_t locked;
 } TPMState;
 
 extern const VMStateDescription vmstate_locty;
@@ -99,5 +106,8 @@ uint32_t tpm_tis_read_data(TPMState *s, hwaddr addr, unsigned size);
 void tpm_tis_write_data(TPMState *s, hwaddr addr, uint64_t val, uint32_t size);
 uint16_t tpm_tis_get_checksum(TPMState *s);
 int tpm_tis_hash_image(TPMState *s, const uint8_t *data, size_t len);
+int tpm_tis_run_command(TPMState *s, uint8_t locty, const uint8_t *in,
+                        size_t in_len, uint8_t *out, size_t out_len);
+void tpm_tis_set_locality_locks(TPMState *s, uint8_t locked);
 
 #endif /* TPM_TPM_TIS_H */

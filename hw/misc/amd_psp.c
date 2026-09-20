@@ -57,6 +57,15 @@
 #define PSS_SALT_LEN                SHA384_LEN
 #define PSS_TRAILER                 0xbc
 
+/*
+ * The marker EXTEND_OSSL_DIGEST records after the range's digest, the
+ * guide's sentence taken literally. The board's own form is still open:
+ * see the spec's "EXTEND_OSSL_DIGEST" section.
+ */
+#define OSSL_MARKER                 "SKL"
+#define OSSL_MARKER_LEN             3
+#define OSSL_CHUNK                  0x10000
+
 /* The stepping is masked when the SOC flag list is compared */
 #define CPUID_STEPPING_MASK         0xf
 
@@ -592,6 +601,93 @@ static void amd_psp_tmr_release(AmdPspState *s, unsigned index)
     tmr->set = false;
 }
 
+/* The SHA-256 of a range of guest memory, read a chunk at a time */
+static bool amd_psp_hash_range(uint64_t base, uint64_t len, uint8_t *digest)
+{
+    g_autoptr(QCryptoHash) hash = qcrypto_hash_new(QCRYPTO_HASH_ALGO_SHA256,
+                                                   &error_abort);
+    g_autofree uint8_t *buf = g_malloc(OSSL_CHUNK);
+    size_t digest_len = SHA256_LEN;
+    uint64_t n;
+
+    while (len) {
+        n = MIN(len, OSSL_CHUNK);
+        if (address_space_read(&address_space_memory, base,
+                               MEMTXATTRS_UNSPECIFIED, buf, n) != MEMTX_OK) {
+            return false;
+        }
+        if (qcrypto_hash_update(hash, buf, n, &error_abort) < 0) {
+            g_assert_not_reached();
+        }
+        base += n;
+        len -= n;
+    }
+    if (qcrypto_hash_finalize_bytes(hash, &digest, &digest_len,
+                                    &error_abort) < 0) {
+        g_assert_not_reached();
+    }
+    return true;
+}
+
+/*
+ * The guide's section 3: C2PMSG_93 the size, _94 and _95 the base of the
+ * DLME copy inside a TMR. Its digest goes into PCR 17 and PCR 18, then
+ * the marker into both.
+ */
+static uint16_t amd_psp_cmd_extend_ossl_digest(AmdPspState *s)
+{
+    uint64_t size = s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG0];
+    uint64_t base = s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG1] |
+                    (uint64_t)s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG2] << 32;
+    uint8_t digest[SHA256_LEN];
+    char hex[2 * SHA256_LEN + 1];
+
+    if (s->launch != AMD_PSP_LAUNCH_OK) {
+        return AMD_PSP_DRTM_NOT_SUPPORTED;
+    }
+    if (!size || base + size < base) {
+        amd_drtm_guest_error(s->platform, "amd-psp: EXTEND_OSSL_DIGEST of "
+                             "0x%" PRIx64 " bytes at 0x%" PRIx64 " is empty "
+                             "or wraps", size, base);
+        return AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED;
+    }
+    if (!amd_psp_in_tmr(s, base, size)) {
+        amd_drtm_guest_error(s->platform, "amd-psp: EXTEND_OSSL_DIGEST of "
+                             "0x%" PRIx64 " bytes at 0x%" PRIx64 " lies in "
+                             "no TMR", size, base);
+        return AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED;
+    }
+    if (!amd_psp_hash_range(base, size, digest)) {
+        amd_drtm_guest_error(s->platform, "amd-psp: EXTEND_OSSL_DIGEST of "
+                             "0x%" PRIx64 " bytes at 0x%" PRIx64 " is not "
+                             "readable memory", size, base);
+        return AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED;
+    }
+    trace_amd_psp_drtm_extend_ossl_digest(base, size,
+                                          amd_psp_hex(digest, hex));
+    if (amd_psp_pcr_extend(s, 17, digest) < 0 ||
+        amd_psp_pcr_extend(s, 18, digest) < 0 ||
+        amd_psp_extend(s, 17, OSSL_MARKER, OSSL_MARKER_LEN) < 0 ||
+        amd_psp_extend(s, 18, OSSL_MARKER, OSSL_MARKER_LEN) < 0) {
+        amd_drtm_guest_error(s->platform, "amd-psp: EXTEND_OSSL_DIGEST could "
+                             "not extend PCR 17 and PCR 18");
+        return AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED;
+    }
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
+/* Locality 2 back to the PSP, locality 4 to the OS, as Xen asks on exit */
+static uint16_t amd_psp_cmd_tpm_locality_access(AmdPspState *s)
+{
+    if (s->launch != AMD_PSP_LAUNCH_OK) {
+        return AMD_PSP_DRTM_NOT_SUPPORTED;
+    }
+    trace_amd_psp_drtm_tpm_locality_access();
+    s->locks |= BIT(2);
+    amd_psp_unlock(s, BIT(4));
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
 static uint16_t amd_psp_cmd_get_capability(AmdPspState *s)
 {
     /* The board's values: DRTM enabled, TSME off, anti-rollback set */
@@ -670,9 +766,9 @@ static uint16_t amd_psp_dispatch(AmdPspState *s, uint8_t cmd, unsigned index)
     case AMD_PSP_DRTM_CMD_LAUNCH:
         return amd_psp_cmd_launch(s);
     case AMD_PSP_DRTM_CMD_EXTEND_OSSL_DIGEST:
+        return amd_psp_cmd_extend_ossl_digest(s);
     case AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS:
-        /* The guide's "DRTM has not launched yet" row, appendix A */
-        return AMD_PSP_DRTM_NOT_SUPPORTED;
+        return amd_psp_cmd_tpm_locality_access(s);
     case AMD_PSP_DRTM_CMD_GET_TCG_LOGS:
     case AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS:
     case AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY:

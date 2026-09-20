@@ -50,6 +50,11 @@ void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
 {
 }
 
+uint32_t amd_drtm_cpu_signature(void)
+{
+    return 0;
+}
+
 AmdDrtmInfo *qmp_query_amd_drtm(Error **errp)
 {
     error_setg(errp, "%s is not built in", TYPE_AMD_DRTM_PLATFORM);

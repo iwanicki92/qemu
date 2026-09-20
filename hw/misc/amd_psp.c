@@ -14,13 +14,356 @@
 
 #include "qemu/osdep.h"
 #include "hw/misc/amd_psp.h"
+#include "crypto/hash.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/i386/amd_drtm.h"
 #include "qapi/error.h"
+#include "qemu/bswap.h"
+#include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "system/address-spaces.h"
+#include "system/tpm.h"
 #include "trace.h"
+
+/*
+ * The SL header (SKL's head.S) and the signature block behind the
+ * measured part (58453, appendix B): the FW_SIG_HEADER, whose header
+ * version field holds the tag, the signature and the key token.
+ */
+#define SL_HDR_MEASURED_LENGTH      0x02
+#define SL_HDR_SOC_FLAG             0x1c
+#define SIG_HDR_LEN                 0x100
+#define SIG_HDR_TAG                 0x10
+#define SIG_HDR_SIZE_FW_SIGNED      0x14
+#define SIG_HDR_SEC_PATCH_LEVEL     0x4c
+#define SIG_LEN                     0x200
+#define TOKEN_LEN                   0x440
+#define SIG_TAG                     "$AS1"
+
+/* The stepping is masked when the SOC flag list is compared */
+#define CPUID_STEPPING_MASK         0xf
+
+#define SHA256_LEN                  32
+
+/* What the service says to the TPM, at locality 3 */
+#define PSP_TPM_LOCALITY            3
+#define TPM2_ST_NO_SESSIONS         0x8001
+#define TPM2_ST_SESSIONS            0x8002
+#define TPM2_CC_PCR_EXTEND          0x182
+#define TPM2_CC_PCR_READ            0x17e
+#define TPM2_RS_PW                  0x40000009
+#define TPM2_ALG_SHA256             0x000b
+#define TPM2_RSP_CODE_OFF           6
+#define TPM2_PCR_READ_RSP_LEN       62
+#define TPM2_PCR_READ_DIGEST_OFF    30
+
+static void amd_psp_sha256(const void *data, size_t len, uint8_t *digest)
+{
+    size_t digest_len = SHA256_LEN;
+
+    /* SHA-256 is always there, through glib when no library is */
+    if (qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256, data, len, &digest,
+                           &digest_len, &error_abort) < 0) {
+        g_assert_not_reached();
+    }
+}
+
+static const char *amd_psp_hex(const uint8_t *digest, char *out)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned i;
+
+    for (i = 0; i < SHA256_LEN; i++) {
+        out[2 * i] = hex[digest[i] >> 4];
+        out[2 * i + 1] = hex[digest[i] & 0xf];
+    }
+    out[2 * SHA256_LEN] = 0;
+    return out;
+}
+
+/* A command to the TPM and its response code, -1 when nothing came back */
+static int amd_psp_tpm_run(AmdPspState *s, uint8_t *cmd, size_t len,
+                           uint8_t *rsp, size_t rsp_len)
+{
+    int ret;
+
+    stw_be_p(cmd + 2, 0);
+    stl_be_p(cmd + 2, len);
+    ret = tpm_run_command(s->tpm, PSP_TPM_LOCALITY, cmd, len, rsp, rsp_len);
+    if (ret < 0) {
+        return ret;
+    }
+    if (ldl_be_p(rsp + 2) < TPM2_RSP_CODE_OFF + 4 ||
+        ldl_be_p(rsp + TPM2_RSP_CODE_OFF) != 0) {
+        return -EIO;
+    }
+    return 0;
+}
+
+static int amd_psp_pcr_read(AmdPspState *s, unsigned pcr, uint8_t *digest)
+{
+    uint8_t cmd[20] = { 0 };
+    uint8_t rsp[TPM2_PCR_READ_RSP_LEN + 64];
+    char hex[2 * SHA256_LEN + 1];
+    int ret;
+
+    stw_be_p(cmd, TPM2_ST_NO_SESSIONS);
+    stl_be_p(cmd + 6, TPM2_CC_PCR_READ);
+    stl_be_p(cmd + 10, 1);
+    stw_be_p(cmd + 14, TPM2_ALG_SHA256);
+    cmd[16] = 3;
+    cmd[17 + pcr / 8] = 1 << (pcr % 8);
+    ret = amd_psp_tpm_run(s, cmd, sizeof(cmd), rsp, sizeof(rsp));
+    if (ret < 0) {
+        return ret;
+    }
+    if (ldl_be_p(rsp + 2) != TPM2_PCR_READ_RSP_LEN) {
+        return -EIO;
+    }
+    memcpy(digest, rsp + TPM2_PCR_READ_DIGEST_OFF, SHA256_LEN);
+    trace_amd_psp_drtm_pcr_read(pcr, amd_psp_hex(digest, hex));
+    return 0;
+}
+
+static int amd_psp_pcr_extend(AmdPspState *s, unsigned pcr,
+                              const uint8_t *digest)
+{
+    uint8_t cmd[65] = { 0 };
+    uint8_t rsp[64];
+    char hex[2 * SHA256_LEN + 1];
+
+    stw_be_p(cmd, TPM2_ST_SESSIONS);
+    stl_be_p(cmd + 6, TPM2_CC_PCR_EXTEND);
+    stl_be_p(cmd + 10, pcr);
+    stl_be_p(cmd + 14, 9);
+    stl_be_p(cmd + 18, TPM2_RS_PW);
+    stl_be_p(cmd + 27, 1);
+    stw_be_p(cmd + 31, TPM2_ALG_SHA256);
+    memcpy(cmd + 33, digest, SHA256_LEN);
+    trace_amd_psp_drtm_pcr_extend(pcr, amd_psp_hex(digest, hex));
+    return amd_psp_tpm_run(s, cmd, sizeof(cmd), rsp, sizeof(rsp));
+}
+
+/* Extend @pcr with the SHA-256 of @data */
+static int amd_psp_extend(AmdPspState *s, unsigned pcr, const void *data,
+                          size_t len)
+{
+    uint8_t digest[SHA256_LEN];
+
+    amd_psp_sha256(data, len, digest);
+    return amd_psp_pcr_extend(s, pcr, digest);
+}
+
+static void amd_psp_apply_locks(AmdPspState *s)
+{
+    trace_amd_psp_drtm_locks(s->locks);
+    if (s->tpm && !tpm_set_locality_locks(s->tpm, s->locks) && s->locks) {
+        warn_report_once("amd-psp: the TPM frontend has no locality locks "
+                         "(tpm-tis is needed), the guest sees every "
+                         "locality");
+    }
+}
+
+static void amd_psp_unlock(AmdPspState *s, uint8_t mask)
+{
+    s->locks &= ~mask;
+    amd_psp_apply_locks(s);
+}
+
+static bool amd_psp_in_tmr(AmdPspState *s, uint64_t base, uint64_t len)
+{
+    unsigned i;
+
+    for (i = 0; i < AMD_PSP_DRTM_TMR_MAX; i++) {
+        AmdPspTmr *tmr = &s->tmr[i];
+
+        if (tmr->set && tmr->len && base >= tmr->base &&
+            base + len <= tmr->base + tmr->len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Hardware collapses every reason into one status, so each is named here
+ * as a guest error. PCRs 18 to 20 are capped with all-ones, locality 4 is
+ * unlocked, and the post-launch commands stay refused.
+ */
+static uint16_t G_GNUC_PRINTF(2, 3)
+amd_psp_launch_failed(AmdPspState *s, const char *fmt, ...)
+{
+    uint8_t ones[SHA256_LEN];
+    g_autofree char *why = NULL;
+    va_list ap;
+    unsigned pcr;
+
+    va_start(ap, fmt);
+    why = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    trace_amd_psp_drtm_launch_failed(why);
+    amd_drtm_guest_error(s->platform, "amd-psp: LAUNCH failed: %s", why);
+
+    memset(ones, 0xff, sizeof(ones));
+    for (pcr = 18; pcr <= 20; pcr++) {
+        amd_psp_pcr_extend(s, pcr, ones);
+    }
+    s->launch = AMD_PSP_LAUNCH_FAILED;
+    amd_psp_unlock(s, BIT(4));
+    return AMD_PSP_DRTM_LAUNCH_ERROR;
+}
+
+/*
+ * The SL header points at a count and CPUID leaf 1 EAX values with the
+ * stepping masked. A miss only traces: on hardware, adding the running
+ * family to the list changed nothing.
+ */
+static void amd_psp_check_soc_flags(AmdPspState *s, const uint8_t *slb)
+{
+    uint32_t cpu = amd_drtm_cpu_signature() & ~CPUID_STEPPING_MASK;
+    unsigned off = lduw_le_p(slb + SL_HDR_SOC_FLAG);
+    uint32_t count, i;
+    bool match = false;
+
+    if (off + 4 > AMD_PSP_SLB_SIZE) {
+        return;
+    }
+    count = ldl_le_p(slb + off);
+    if (count > (AMD_PSP_SLB_SIZE - off - 4) / 4) {
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        if ((ldl_le_p(slb + off + 4 + 4 * i) & ~CPUID_STEPPING_MASK) == cpu) {
+            match = true;
+        }
+    }
+    trace_amd_psp_drtm_soc_flags(cpu, count, match);
+}
+
+/* The signature check, to come: nothing verifies yet */
+static AmdPspSignatureResult amd_psp_verify_signature(AmdPspState *s,
+                                                      const uint8_t *slb,
+                                                      uint32_t signed_len,
+                                                      const uint8_t *sig,
+                                                      const uint8_t *token)
+{
+    return AMD_PSP_SIGNATURE_UNSUPPORTED;
+}
+
+/*
+ * The guide's section 2: the SLB SKINIT recorded, inside a TMR, with the
+ * signature block behind the measured part, the signature over it, and
+ * PCR 17 holding what SKINIT measured. Then the chain the board leaves in
+ * PCR 17 and PCR 18, the unlocks and the SL_DEV release.
+ */
+static uint16_t amd_psp_cmd_launch(AmdPspState *s)
+{
+    AmdDrtmPlatform *p = s->platform;
+    g_autofree uint8_t *slb = NULL;
+    uint8_t pcr17[SHA256_LEN], expected[2 * SHA256_LEN];
+    uint32_t words[2];
+    uint32_t length, hdr_off, signed_len, sec_patch_level;
+    const uint8_t *sig, *token;
+    hwaddr base;
+
+    s->tpm = tpm_find();
+    s->signature = AMD_PSP_SIGNATURE_NONE;
+
+    if (!amd_drtm_launched(p)) {
+        return amd_psp_launch_failed(s, "no SKINIT recorded, no SKL address "
+                                     "to read");
+    }
+    base = p->slb_base;
+    length = p->slb_length;
+    if (!amd_psp_in_tmr(s, base, AMD_PSP_SLB_SIZE)) {
+        return amd_psp_launch_failed(s, "the SLB at 0x%" HWADDR_PRIx
+                                     " lies in no TMR", base);
+    }
+
+    slb = g_malloc(AMD_PSP_SLB_SIZE);
+    if (address_space_read(&address_space_memory, base, MEMTXATTRS_UNSPECIFIED,
+                           slb, AMD_PSP_SLB_SIZE) != MEMTX_OK) {
+        return amd_psp_launch_failed(s, "the SLB at 0x%" HWADDR_PRIx
+                                     " is not readable memory", base);
+    }
+
+    hdr_off = ROUND_UP(length, 16);
+    if (hdr_off + SIG_HDR_LEN + SIG_LEN + TOKEN_LEN > AMD_PSP_SLB_SIZE) {
+        return amd_psp_launch_failed(s, "measured length 0x%x leaves no room "
+                                     "for the signature block", length);
+    }
+    if (memcmp(slb + hdr_off + SIG_HDR_TAG, SIG_TAG, strlen(SIG_TAG))) {
+        return amd_psp_launch_failed(s, "no " SIG_TAG " signature header at "
+                                     "0x%x", hdr_off + SIG_HDR_TAG);
+    }
+    signed_len = ldl_le_p(slb + hdr_off + SIG_HDR_SIZE_FW_SIGNED);
+    if (signed_len < hdr_off + SIG_HDR_LEN ||
+        signed_len > AMD_PSP_SLB_SIZE - SIG_LEN - TOKEN_LEN) {
+        return amd_psp_launch_failed(s, "SizeFWSigned 0x%x does not fit the "
+                                     "SLB", signed_len);
+    }
+    sig = slb + signed_len;
+    token = sig + SIG_LEN;
+    sec_patch_level = ldl_le_p(slb + hdr_off + SIG_HDR_SEC_PATCH_LEVEL);
+
+    if (s->verify) {
+        s->signature = amd_psp_verify_signature(s, slb, signed_len, sig, token);
+        if (s->signature == AMD_PSP_SIGNATURE_FAILED) {
+            return amd_psp_launch_failed(s, "the signature does not verify");
+        }
+    } else {
+        s->signature = AMD_PSP_SIGNATURE_SKIPPED;
+    }
+    trace_amd_psp_drtm_signature(s->signature);
+
+    amd_psp_check_soc_flags(s, slb);
+
+    if (!s->tpm) {
+        return amd_psp_launch_failed(s, "no TPM to read PCR 17 from");
+    }
+    if (amd_psp_pcr_read(s, 17, pcr17) < 0) {
+        return amd_psp_launch_failed(s, "PCR 17 could not be read");
+    }
+    /* The SKINIT measurement: the reset value extended with the digest */
+    memset(expected, 0, SHA256_LEN);
+    amd_psp_sha256(slb, length, expected + SHA256_LEN);
+    amd_psp_sha256(expected, sizeof(expected), expected);
+    if (memcmp(pcr17, expected, SHA256_LEN)) {
+        return amd_psp_launch_failed(s, "PCR 17 does not hold the measurement "
+                                     "of the SLB's first 0x%x bytes", length);
+    }
+
+    words[0] = cpu_to_le32(s->splt_version);
+    if (amd_psp_extend(s, 17, words, 4) < 0) {
+        return amd_psp_launch_failed(s, "PCR 17 extend with the SPLT version "
+                                     "failed");
+    }
+    /* TSME off, anti-rollback set: the board's fuse words, in this order */
+    words[0] = 0;
+    words[1] = cpu_to_le32(1);
+    if (amd_psp_extend(s, 17, words, 8) < 0) {
+        return amd_psp_launch_failed(s, "PCR 17 extend with the fuse state "
+                                     "failed");
+    }
+    if (amd_psp_extend(s, 18, token, TOKEN_LEN) < 0) {
+        return amd_psp_launch_failed(s, "PCR 18 extend with the key token "
+                                     "failed");
+    }
+    words[0] = cpu_to_le32(sec_patch_level);
+    if (amd_psp_extend(s, 18, words, 4) < 0) {
+        return amd_psp_launch_failed(s, "PCR 18 extend with the patch level "
+                                     "failed");
+    }
+
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG0] = 1;
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG1] = 0;
+    s->launch = AMD_PSP_LAUNCH_OK;
+    amd_psp_unlock(s, BIT(1) | BIT(2));
+    amd_drtm_sl_dev_release(p);
+    trace_amd_psp_drtm_launch_ok(base, length, sec_patch_level);
+    return AMD_PSP_DRTM_NO_ERROR;
+}
 
 static const char *amd_psp_tmr_name(unsigned index)
 {
@@ -107,16 +450,6 @@ static uint16_t amd_psp_cmd_tmr_release(AmdPspState *s)
         amd_psp_tmr_release(s, i);
     }
     return AMD_PSP_DRTM_NO_ERROR;
-}
-
-static uint16_t amd_psp_cmd_launch(AmdPspState *s)
-{
-    if (!amd_drtm_launched(s->platform)) {
-        amd_drtm_guest_error(s->platform, "amd-psp: LAUNCH with no SKINIT "
-                             "recorded, no SKL address to read");
-        return AMD_PSP_DRTM_LAUNCH_ERROR;
-    }
-    return AMD_PSP_DRTM_LAUNCH_ERROR;
 }
 
 static uint16_t amd_psp_dispatch(AmdPspState *s, uint8_t cmd, unsigned index)
@@ -289,7 +622,18 @@ static void amd_psp_reset(DeviceState *dev)
     s->command = 0;
     s->status = 0;
     s->launch = AMD_PSP_LAUNCH_NONE;
+    s->signature = AMD_PSP_SIGNATURE_NONE;
     memset(s->c2pmsg, 0, sizeof(s->c2pmsg));
+    /*
+     * The board's TPM_ACCESS before any launch: localities 1 to 4 locked,
+     * a successful launch opens 1 and 2, a failed one 4. The TPM is looked
+     * up at each use, since it may be created after this device.
+     */
+    if (s->drtm_service) {
+        s->tpm = tpm_find();
+        s->locks = s->locality_locks ? BIT(1) | BIT(2) | BIT(3) | BIT(4) : 0;
+        amd_psp_apply_locks(s);
+    }
     /*
      * Whether real firmware leaves the register ready before SKINIT is
      * not known, which is what the property is for.

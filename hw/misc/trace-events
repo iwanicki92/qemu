@@ -469,3 +469,10 @@ amd_psp_drtm_ready_held(uint32_t ms) "ready bit held for %u ms"
 amd_psp_drtm_tmr_setup(uint8_t index, uint64_t base, uint64_t len) "TMR %u base 0x%" PRIx64 " len 0x%" PRIx64
 amd_psp_drtm_tmr_release(uint8_t index, uint64_t base, uint64_t len) "TMR %u base 0x%" PRIx64 " len 0x%" PRIx64
 amd_psp_drtm_reset(void) ""
+amd_psp_drtm_launch_failed(const char *why) "%s"
+amd_psp_drtm_launch_ok(uint64_t base, uint32_t length, uint32_t sec_patch_level) "SLB 0x%" PRIx64 " measured 0x%x SecPatchLevel %u"
+amd_psp_drtm_signature(int result) "result %d"
+amd_psp_drtm_soc_flags(uint32_t cpu, uint32_t count, bool match) "cpu 0x%x in a list of %u: %d"
+amd_psp_drtm_pcr_read(unsigned pcr, const char *digest) "PCR %u = %s"
+amd_psp_drtm_pcr_extend(unsigned pcr, const char *digest) "PCR %u extended with %s"
+amd_psp_drtm_locks(uint8_t locked) "locked localities mask 0x%x"

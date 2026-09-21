@@ -5,8 +5,8 @@ Intel TXT / SMX (DRTM) emulation for QEMU
 :Status: proposal / work in progress (M0)
 :Target: TCG only, q35 machine (``-machine txt=on``)
 :Reference documents: Intel TXT Software Development Guide
-(Doc 315168), Intel TXT MLE Software Development Guide (315168-01),
-Intel SDM Vol. 2 (GETSEC), TCG PC Client TPM Profile (PTP)
+    (Doc 315168), Intel TXT MLE Software Development Guide (315168-01),
+    Intel SDM Vol. 2 (GETSEC), TCG PC Client TPM Profile (PTP)
 
 This document specifies an emulated Intel TXT (Trusted Execution
 Technology) platform for QEMU, sufficient to boot and develop the
@@ -72,68 +72,64 @@ TXT public config register map
 All registers are 64-bit unless noted. Offsets from
 ``0xFED30000`` (public) and ``0xFED20000`` (private).
 
-=== ======== =============== =============================================
-Off Name     Access          Semantics (QEMU)
-=== ======== =============== =============================================
-0x000 TXT.STS RO              Status. See *STS bits* below.
-0x008 TXT.ESTS RO/W1C         Error status. bit0 ``TXT_RESET_STS``
-                              (TXT forced reset occurred);
-                              bit6 ``WAKE_ERROR_STS`` (modern).
-0x030 TXT.ERRORCODE RO/RW     ACM error code (details below).
-0x038 TXT.CMD_RESET WO         Write 1: perform a full platform
-                              reset (machine reset, like SINIT
-                              ``ACMINPUT_RESET``).
-0x048 TXT.CMD_CLOSE_PRIVATE WO Write: close private config space
-                              (sets ``STS.private_open`` = 0).
-0x0A0 TXT.SPAD RO/RW          Scratchpad / ACM status (modern
-                              platforms; see ACMSTS bits below).
-0x100 TXT.VER.FSBIF RO        Bit31 ``PRODUCTION_FUSED``. Always 1
-                              (production) on QEMU.
-0x110 TXT.DIDVID RO           Chipset VID/DID/revision. Must match
-                              what coreboot/GRUB/tboot expect for a
-                              TXT-capable chipset (value pinned in
-                              M1; expose as device property).
-0x200 TXT.VER.QPIIF RO        QPI-era interface version; on
-                              FSB-era chipsets this offset reads
-                              reserved. QEMU reports a modern
-                              (server-style) value; alternatively
-                              0x200 is TXT.CAPABILITIES on newer
-                              client parts (bit26 DPR support) —
-                              QEMU implements TXT.CAPABILITIES here.
-0x218 TXT.CMD_UNLOCK_MEM_CONFIG WO (server) unlock memory config.
-0x270 TXT.SINIT.BASE RW       Physical address of SINIT ACM (below
-                              4 GiB).
-0x278 TXT.SINIT.SIZE RW       Size in bytes; plain RW in M1. The
-                              base+size vs DPR bounds check is
-                              enforced from M3 (SENTER
-                              preconditions).
-0x290 TXT.MLE_JOIN RW         RLP join structure: ``gdt_limit``,
-                              ``gdt_base``, ``seg_sel``,
-                              ``entry_point`` (4 x u32).
-0x300 TXT.HEAP_BASE RW        Physical address of TXT heap.
-0x308 TXT.HEAP_SIZE RW        Heap size in bytes.
-0x310 TXT.MSEG_BASE RW        MSEG (SMM monitor) base.
-0x318 TXT.MSEG_SIZE RW        MSEG size.
-0x328 TXT.BIOSACM_ERRORCODE RO (modern) BIOS ACM error code.
-0x330 TXT.DPR RW (lock bit)   DMA Protected Range; layout in
-                              *DPR* below. Also mirrored in MCH
-                              PCI config space.
-0x380 TXT.CMD_OPEN_LOCALITY1 WO  Open locality 1 for OS use.
-0x388 TXT.CMD_CLOSE_LOCALITY1 WO Close locality 1.
-0x390 TXT.CMD_OPEN_LOCALITY2 WO  Open locality 2.
-0x398 TXT.CMD_CLOSE_LOCALITY2 WO Close locality 2.
-0x400 TXT.PUBLIC_KEY RO       Hash of Intel's ACM public key
-                              (4 x 64-bit, SHA-384-sized). QEMU
-                              reports a fixed non-zero placeholder
-                              (marker "QEMUTXT",
-                              ``TXT_PUBLIC_KEY_PLACEHOLDER``) —
-                              semantically "the key the semantic
-                              SENTER trusts".
-0x8E0 TXT.CMD_SECRETS WO      Declare memory contains secrets.
-0x8E8 TXT.CMD_NO_SECRETS WO   Declare memory has no secrets
-                              (clears ``E2STS.SECRET_STS``).
-0x8F0 TXT.E2STS RO            Extended status. bit1 ``SECRET_STS``.
-=== ======== =============== =============================================
+===== ========================= ============= ===========================================
+Off   Name                      Access        Semantics (QEMU)
+===== ========================= ============= ===========================================
+0x000 TXT.STS                   RO            Status. See *STS bits* below.
+0x008 TXT.ESTS                  RO/W1C        Error status. bit0 ``TXT_RESET_STS`` (TXT
+                                              forced reset occurred); bit6
+                                              ``WAKE_ERROR_STS`` (modern).
+0x030 TXT.ERRORCODE             RO/RW         ACM error code (details below).
+0x038 TXT.CMD_RESET             WO            Write 1: perform a full platform reset
+                                              (machine reset, like SINIT
+                                              ``ACMINPUT_RESET``).
+0x048 TXT.CMD_CLOSE_PRIVATE     WO            Write: close private config space (sets
+                                              ``STS.private_open`` = 0).
+0x0A0 TXT.SPAD                  RO/RW         Scratchpad / ACM status (modern platforms;
+                                              see ACMSTS bits below).
+0x100 TXT.VER.FSBIF             RO            Bit31 ``PRODUCTION_FUSED``. Always 1
+                                              (production) on QEMU.
+0x110 TXT.DIDVID                RO            Chipset VID/DID/revision. Must match what
+                                              coreboot/GRUB/tboot expect for a
+                                              TXT-capable chipset (value pinned in M1;
+                                              expose as device property).
+0x200 TXT.VER.QPIIF             RO            QPI-era interface version; on FSB-era
+                                              chipsets this offset reads reserved. QEMU
+                                              reports a modern (server-style) value;
+                                              alternatively 0x200 is TXT.CAPABILITIES on
+                                              newer client parts (bit26 DPR support) —
+                                              QEMU implements TXT.CAPABILITIES here.
+0x218 TXT.CMD_UNLOCK_MEM_CONFIG WO            (server) unlock memory config.
+0x270 TXT.SINIT.BASE            RW            Physical address of SINIT ACM (below 4
+                                              GiB).
+0x278 TXT.SINIT.SIZE            RW            Size in bytes; plain RW in M1. The
+                                              base+size vs DPR bounds check is enforced
+                                              from M3 (SENTER preconditions).
+0x290 TXT.MLE_JOIN              RW            RLP join structure: ``gdt_limit``,
+                                              ``gdt_base``, ``seg_sel``, ``entry_point``
+                                              (4 x u32).
+0x300 TXT.HEAP_BASE             RW            Physical address of TXT heap.
+0x308 TXT.HEAP_SIZE             RW            Heap size in bytes.
+0x310 TXT.MSEG_BASE             RW            MSEG (SMM monitor) base.
+0x318 TXT.MSEG_SIZE             RW            MSEG size.
+0x328 TXT.BIOSACM_ERRORCODE     RO            (modern) BIOS ACM error code.
+0x330 TXT.DPR                   RW (lock bit) DMA Protected Range; layout in *DPR* below.
+                                              Also mirrored in MCH PCI config space.
+0x380 TXT.CMD_OPEN_LOCALITY1    WO            Open locality 1 for OS use.
+0x388 TXT.CMD_CLOSE_LOCALITY1   WO            Close locality 1.
+0x390 TXT.CMD_OPEN_LOCALITY2    WO            Open locality 2.
+0x398 TXT.CMD_CLOSE_LOCALITY2   WO            Close locality 2.
+0x400 TXT.PUBLIC_KEY            RO            Hash of Intel's ACM public key (4 x 64-bit,
+                                              SHA-384-sized). QEMU reports a fixed
+                                              non-zero placeholder (marker "QEMUTXT",
+                                              ``TXT_PUBLIC_KEY_PLACEHOLDER``) —
+                                              semantically "the key the semantic SENTER
+                                              trusts".
+0x8E0 TXT.CMD_SECRETS           WO            Declare memory contains secrets.
+0x8E8 TXT.CMD_NO_SECRETS        WO            Declare memory has no secrets (clears
+                                              ``E2STS.SECRET_STS``).
+0x8F0 TXT.E2STS                 RO            Extended status. bit1 ``SECRET_STS``.
+===== ========================= ============= ===========================================
 
 STS bits (tboot ``txt_sts_t``)::
 

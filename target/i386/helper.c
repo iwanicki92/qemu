@@ -212,6 +212,13 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
     if (!(env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_SMAP)) {
         new_cr4 &= ~CR4_SMAP_MASK;
     }
+    /* CR4.SMXE is only writable when the CPU reports the SMX feature
+     * (CPUID.1.ECX bit 6).  Without this, a non-SMX CPU would silently
+     * accept CR4.SMXE and the guest could then run GETSEC even though
+     * CPUID reports no SMX -- real hardware #GPs on the CR4 write. */
+    if (!(env->features[FEAT_1_ECX] & CPUID_EXT_SMX)) {
+        new_cr4 &= ~CR4_SMXE_MASK;
+    }
     if (new_cr4 & CR4_SMAP_MASK) {
         hflags |= HF_SMAP_MASK;
     }

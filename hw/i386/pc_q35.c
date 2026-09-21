@@ -324,6 +324,17 @@ static void pc_q35_init(MachineState *machine)
     }
 
     if (pcms->txt_enabled) {
+        /*
+         * GETSEC/SMX is emulated in TCG only; the KVM backend has no
+         * SMX support, so reject txt=on up front (x86_machine_is_smm_enabled
+         * uses the same TCG-vs-KVM gating for smm).
+         */
+        if (kvm_enabled()) {
+            error_report("-machine txt=on is supported only with TCG; "
+                         "the KVM backend cannot emulate GETSEC/SMX");
+            exit(1);
+        }
+
 #ifdef CONFIG_TPM
         /*
          * Intel TXT requires a TPM for the DRTM measurements; the
@@ -338,8 +349,21 @@ static void pc_q35_init(MachineState *machine)
                          "-device tpm-tis,tpmdev=...");
             exit(1);
         }
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(qdev_new(TYPE_INTEL_TXT)),
-                                  &error_fatal);
+
+        {
+            DeviceState *txt = qdev_new(TYPE_INTEL_TXT);
+            CPUState *cs;
+
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(txt), &error_fatal);
+
+            /*
+             * Give every vCPU a pointer to the chipset device so that
+             * the GETSEC helper can report chipset presence.
+             */
+            CPU_FOREACH(cs) {
+                X86_CPU(cs)->txt_state = INTEL_TXT(txt);
+            }
+        }
 #else
         error_report("txt=on requires TPM support, which is not "
                      "built into this QEMU binary");

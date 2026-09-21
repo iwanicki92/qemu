@@ -1300,6 +1300,7 @@ static const X86OpEntry opcodes_0F[256] = {
     [0x33] = X86_OP_ENTRY0(RDPMC),
     [0x34] = X86_OP_ENTRY0(SYSENTER,                          chk2(i64_amd, prot_or_vm86)),
     [0x35] = X86_OP_ENTRY0(SYSEXIT,                           chk3(i64_amd, prot, cpl0)),
+    [0x37] = X86_OP_ENTRY0(GETSEC),
 
     [0x40] = X86_OP_ENTRY2(CMOVcc,     G,v, E,v, cpuid(CMOV)),
     [0x41] = X86_OP_ENTRY2(CMOVcc,     G,v, E,v, cpuid(CMOV)),

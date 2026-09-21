@@ -221,7 +221,7 @@ Leaf numbering (SDM / tboot ``smx.h``)::
   0 CAPABILITIES   2 ENTERACCS    3 EXITAC       4 SENTER
   5 SEXIT          6 PARAMETERS   7 SMCTRL       8 WAKEUP
 
-GETSEC[CAPABILITIES] (EAX=0, ECX=index)
+GETSEC[CAPABILITIES] (EAX=0, EBX=index)
   index 0 returns the available-leaf bitmap, consultable with the
   TXT device for chipset presence::
 
@@ -235,8 +235,10 @@ GETSEC[CAPABILITIES] (EAX=0, ECX=index)
     bit 8  WAKEUP            1
     bit 31 EXTENDED_LEAFS    0
 
-GETSEC[PARAMETERS] (EAX=6, ECX=index)
-  Returns the parameter table in EBX/ECX; terminated by entry type 0.
+GETSEC[PARAMETERS] (EAX=6, EBX=index)
+  Returns the parameter table in EAX/EBX/ECX; terminated by entry type 0.
+  (The index register is EBX per the SDM, matching tboot and GRUB; an
+  earlier revision of this spec incorrectly said ECX.)
   QEMU reports (GRUB defaults are a compatible baseline):
   - ACM version mask 0xFFFFFFFF, version 0
   - max ACM size 32 KiB (encoded), acquirable memory UC

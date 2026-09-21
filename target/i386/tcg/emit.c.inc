@@ -2047,6 +2047,12 @@ static void gen_FXSAVE(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+static void gen_GETSEC(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_update_eip_cur(s);
+    gen_helper_getsec(tcg_env);
+}
+
 static void gen_HLT(DisasContext *s, X86DecodedInsn *decode)
 {
 #ifdef CONFIG_SYSTEM_ONLY

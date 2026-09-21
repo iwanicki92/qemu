@@ -35,6 +35,18 @@ foreach t: tcg_tests['multiarch-softmmu']['tests']
 endforeach
 
 if 'qemu-system-i386' in emulators
+  # GETSEC/SMX test; smx is not part of any default CPU model.
+  # -fno-pie/-Wl,-no-pie: the #UD gate is naked and must keep its
+  # entry point on hosts with default-PIE compilers; -fno-stack-protector
+  # keeps the freestanding binary free of __stack_chk_fail.
+  tests += {
+    'test-smx-getsec.c': {
+      'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                          '-fno-stack-protector'],
+      'qemu_args': qemu_def_args + ['-cpu', 'qemu32,smx'],
+    },
+  }
+
   tcg_tests += {
     'i386-softmmu': {
       'cc': cc,

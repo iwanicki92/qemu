@@ -295,6 +295,7 @@ typedef enum X86Seg {
                 | CR4_DE_MASK | CR4_PSE_MASK | CR4_PAE_MASK \
                 | CR4_MCE_MASK | CR4_PGE_MASK | CR4_PCE_MASK \
                 | CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK | CR4_UMIP_MASK \
+                | CR4_SMXE_MASK \
                 | CR4_LA57_MASK \
                 | CR4_FSGSBASE_MASK | CR4_PCIDE_MASK | CR4_OSXSAVE_MASK \
                 | CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_PKE_MASK | CR4_CET_MASK \
@@ -2344,6 +2345,10 @@ typedef struct CPUArchState {
     DECLARE_BITMAP(avail_cpu_topo, CPU_TOPOLOGY_LEVEL__MAX);
 } CPUX86State;
 
+/* Forward declaration of the Intel TXT chipset device state (defined
+   in include/hw/i386/intel_txt.h); only the pointer is used here. */
+typedef struct IntelTxtState IntelTxtState;
+
 /**
  * X86CPU:
  * @env: #CPUX86State
@@ -2524,6 +2529,11 @@ struct ArchCPU {
     /* in order to simplify APIC support, we leave this pointer to the
        user */
     APICCommonState *apic_state;
+
+    /* Intel TXT chipset device, set by the machine when txt=on; NULL
+       on machines without the device.  Pointer only: target/i386
+       stays decoupled from hw/i386 (see intel_txt.h). */
+    IntelTxtState *txt_state;
     struct MemoryRegion *cpu_as_root, *cpu_as_mem, *smram;
     Notifier machine_done;
 
@@ -3066,6 +3076,14 @@ static inline uint64_t cr4_reserved_bits(CPUX86State *env)
     uint64_t reserved_bits = CR4_RESERVED_MASK;
     if (!env->features[FEAT_XSAVE]) {
         reserved_bits |= CR4_OSXSAVE_MASK;
+    }
+    /*
+     * CR4.SMXE is only writable when the CPU reports the SMX feature
+     * (CPUID.1.ECX bit 6).  GETSEC gates execution on CR4.SMXE
+     * at runtime; the feature flag only controls the CR4 write.
+     */
+    if (!(env->features[FEAT_1_ECX] & CPUID_EXT_SMX)) {
+        reserved_bits |= CR4_SMXE_MASK;
     }
     if (!(env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_SMEP)) {
         reserved_bits |= CR4_SMEP_MASK;

@@ -330,9 +330,34 @@ TXT.ERRORCODE + machine reset (as on HW):
 1. CR4.SMXE, CPL0, chipset present (CAPABILITIES bit0).
 2. EBX/ECX: SINIT ACM in guest RAM, below 4 GiB, within DPR cover,
    ``size`` consistent with the ACM header (header.size*4).
-3. ACM header sanity (module_type=SINIT, module_sub_type=1,
-   chipset_id matches DIDVID or its chipset ID list; **no signature
-   check**).
+3. ACM header sanity, following tboot's ``is_acmod()`` /
+   ``verify_acmod()`` / ``does_acmod_match_platform()``
+   (``tboot/txt/acmod.c``):
+
+   - ``module_type`` = ``ACM_TYPE_CHIPSET`` (0x02) and
+     ``module_vendor`` = 0x8086. Note 0x02 is used by *both* SINIT
+     and BIOS ACMs — there is no "module_type = SINIT" value.
+   - ``module_subtype`` = 0. The only defined subtype,
+     ``ACM_SUBTYPE_RESET`` (0x01), marks a *reset* ACM, not a SINIT.
+   - ACM info table (at ``(header_len + scratch_size) * 4``): UUID =
+     ``ACM_UUID_V3``, ``version`` >= 3, and ``chipset_acm_type`` =
+     ``ACM_CHIPSET_TYPE_SINIT`` (0x01). **The SINIT-vs-BIOS
+     distinction lives in the info table, not the header.**
+   - ``entry_point`` < size; ``seg_sel`` non-zero, not LDT/PL!=0,
+     ``seg_sel`` + 8 <= ``gdt_limit``.
+   - base 4 KiB aligned; size a multiple of 64 and <= the max ACM
+     size reported by GETSEC[PARAMETERS].
+   - TXT.DIDVID (vendor/device/revision) appears in the info
+     table's ``chipset_id_list``. The list is what loaders match
+     against; the header's own ``chipset_id`` field is not used for
+     this.
+
+   **No signature check**: ``rsa2048_pubkey``, ``pub_exp`` and
+   ``rsa2048_sig`` are ignored. On real hardware the CPU verifies
+   them before executing the ACM; that is precisely the step QEMU
+   omits (see Deviations 1 and 2). Loaders do not verify the
+   signature either, so an unsigned ACM that satisfies the
+   structural checks above is accepted by tboot and GRUB.
 4. Heap: HEAP_BASE/SIZE set; bios_data and os_sinit_data parse,
    versions in range; MLE header at ``mle_hdr_base`` inside
    ``[mle_ptab, mle_ptab + mle_size)``.

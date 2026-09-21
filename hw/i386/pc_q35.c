@@ -43,6 +43,8 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
+#include "hw/i386/intel_txt.h"
+#include "hw/core/sysbus.h"
 #include "hw/i386/amd_iommu.h"
 #include "hw/i386/intel_iommu.h"
 #include "hw/vfio/types.h"
@@ -58,6 +60,7 @@
 #include "qemu/error-report.h"
 #include "qom/compat-properties.h"
 #include "system/numa.h"
+#include "system/tpm_backend.h"
 #include "hw/hyperv/vmbus-bridge.h"
 #include "hw/mem/nvdimm.h"
 #include "hw/uefi/var-service-api.h"
@@ -320,6 +323,30 @@ static void pc_q35_init(MachineState *machine)
         smbus_eeprom_init(pcms->smbus, 8, NULL, 0);
     }
 
+    if (pcms->txt_enabled) {
+#ifdef CONFIG_TPM
+        /*
+         * Intel TXT requires a TPM for the DRTM measurements; the
+         * TPM decode area itself is the standard tpm-tis device the
+         * user adds with -device tpm-tis (0xFED40000), which the TXT
+         * flow reuses for locality-3/4 access.  See
+         * docs/specs/intel-txt.rst.
+         */
+        if (!qemu_find_tpm_be_any()) {
+            error_report("txt=on requires a TPM backend: "
+                         "add -tpmdev emulator,... and "
+                         "-device tpm-tis,tpmdev=...");
+            exit(1);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(qdev_new(TYPE_INTEL_TXT)),
+                                  &error_fatal);
+#else
+        error_report("txt=on requires TPM support, which is not "
+                     "built into this QEMU binary");
+        exit(1);
+#endif
+    }
+
     /* the rest devices to which pci devfn is automatically assigned */
     pc_vga_init(isa_bus, pcms->pcibus);
     pc_nic_init(pcmc, isa_bus, pcms->pcibus);
@@ -329,6 +356,18 @@ static void pc_q35_init(MachineState *machine)
                                x86_nvdimm_acpi_dsmio,
                                x86ms->fw_cfg, OBJECT(pcms));
     }
+}
+
+static bool pc_q35_machine_get_txt(Object *o, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(o);
+    return pcms->txt_enabled;
+}
+
+static void pc_q35_machine_set_txt(Object *o, bool value, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(o);
+    pcms->txt_enabled = value;
 }
 
 static bool pc_q35_machine_get_wdat(Object *o, Error **errp)
@@ -378,6 +417,11 @@ static void pc_q35_machine_options(MachineClass *m)
         pc_q35_machine_get_wdat, pc_q35_machine_set_wdat);
     object_class_property_set_description(oc, "wdat",
         "Enable WDAT watchdog support. Default: off");
+    object_class_property_add_bool(oc, "txt",
+        pc_q35_machine_get_txt, pc_q35_machine_set_txt);
+    object_class_property_set_description(oc, "txt",
+        "Enable Intel TXT (Trusted Execution Technology) support. "
+        "Default: off");
 
     compat_props_add(m->compat_props,
                      pc_q35_compat_defaults, pc_q35_compat_defaults_len);

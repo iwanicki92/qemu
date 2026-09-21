@@ -210,6 +210,7 @@ void tpm_backend_finish_sync(TPMBackend *s);
 TPMInfo *tpm_backend_query_tpm(TPMBackend *s);
 
 TPMBackend *qemu_find_tpm_be(const char *id);
+TPMBackend *qemu_find_tpm_be_any(void);
 
 #endif /* CONFIG_TPM */
 

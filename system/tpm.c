@@ -85,6 +85,15 @@ TPMBackend *qemu_find_tpm_be(const char *id)
     return NULL;
 }
 
+/*
+ * Return the configured TPM backend, if any.  Only one TPM backend
+ * may be configured, so no id is needed here.
+ */
+TPMBackend *qemu_find_tpm_be_any(void)
+{
+    return QLIST_FIRST(&tpm_backends);
+}
+
 static int tpm_init_tpmdev(void *dummy, QemuOpts *opts, Error **errp)
 {
     /*

@@ -141,3 +141,14 @@ vmmouse_request_relative(void) ""
 vmmouse_request_absolute(void) ""
 vmmouse_disable(void) ""
 vmmouse_data(uint32_t size) "data: size=%" PRIu32
+
+# intel_txt.c
+txt_reg_read(const char *space, uint64_t addr, uint64_t val) "%s: read @0x%04"PRIx64" -> 0x%016"PRIx64
+txt_reg_write(const char *space, uint64_t addr, uint64_t val) "%s: write @0x%04"PRIx64" = 0x%016"PRIx64
+txt_reg_write_ignored(const char *space, uint64_t addr, uint64_t val) "%s: ignored write @0x%04"PRIx64" = 0x%016"PRIx64
+txt_reset_request(void) "TXT.CMD_RESET: requesting platform reset"
+txt_close_private(void) "TXT.CMD_CLOSE_PRIVATE: private space closed"
+txt_locality_open(int locality) "TXT.CMD_OPEN_LOCALITY%d: locality opened"
+txt_locality_close(int locality) "TXT.CMD_CLOSE_LOCALITY%d: locality closed"
+txt_secrets(bool present) "TXT.CMD_SECRETS/NO_SECRETS: secrets present=%d"
+txt_dpr_locked(uint64_t dpr) "TXT.DPR locked: 0x%"PRIx64

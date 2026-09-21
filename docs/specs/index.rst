@@ -16,6 +16,7 @@ guest hardware that is specific to QEMU.
    ppc-spapr-numa
    acpi_hw_reduced_hotplug
    tpm
+   intel-txt
    acpi_hest_ghes
    acpi_cpu_hotplug
    acpi_mem_hotplug

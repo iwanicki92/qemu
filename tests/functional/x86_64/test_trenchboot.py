@@ -10,27 +10,20 @@ import shutil
 import subprocess
 import time
 
-from unittest import skipUnless
-
 from qemu_test import QemuSystemTest, Asset
 from qemu_test import exec_command_and_wait_for_pattern
 from qemu_test import wait_for_console_pattern
 from qemu_test import skipBigDataTest, skipIfMissingCommands
 
 
-# A meta-trenchboot image with the AMDSL SKL and the PSP drivers, which no
-# release carries yet, for the PSP-assisted case. Unset, the case is
-# skipped.
-PSP_IMAGE = os.getenv('QEMU_TEST_TRENCHBOOT_PSP_IMAGE')
-
-
 class TrenchBootXen(QemuSystemTest):
     """
-    Boots the meta-trenchboot release image under Dasharo's coreboot+UEFI
-    build with the AMD dynamic launch devices, picks the "Boot Xen with
-    TrenchBoot (EFI)" GRUB entry and checks that the launch reached dom0
-    with PCR 17 extended. A second case boots a build with the AMDSL SKL
-    through the emulated PSP DRTM service.
+    Boots a meta-trenchboot image under Dasharo's coreboot+UEFI build with
+    the AMD dynamic launch devices, picks the "Boot Xen with TrenchBoot
+    (EFI)" GRUB entry and checks that the launch reached dom0 with PCR 17
+    extended. A second case boots the same image through the emulated PSP
+    DRTM service: the image ships the classic and the AMDSL SKL and its
+    GRUB picks by probing for the PSP.
     """
 
     ASSET_FIRMWARE = Asset(
@@ -38,16 +31,24 @@ class TrenchBootXen(QemuSystemTest):
          'qemu_q35_v0.2.1/qemu_q35_all_menus.rom'),
         'c6be232bc9884888b4b9dbe0fa85aa2a48042bdda456e3608c3f1d93e519d95d')
 
+    # A build of the meta-trenchboot fork's amd-drtm branch. The upstream
+    # releases lack the AMDSL SKL and the PSP drivers, and their GRUB
+    # enters the kernel wrongly on the EFI Linux launch.
     ASSET_IMAGE = Asset(
-        ('https://github.com/zarhus/meta-trenchboot/releases/download/'
-         'v0.5.2/tb-full-image-genericx86-64.rootfs.wic.gz'),
-        '702276d64f8aa9633a6aef1c88767716311d733a1dcbede2ed9e4d7a1cb380ca')
+        ('https://github.com/iwanicki92/meta-trenchboot/releases/download/'
+         'amd-drtm-test-image/tb-full-image-genericx86-64.rootfs.wic.gz'),
+        '1440fa6548b419ba99dde5de4b262f2e3e3ebb0f6addbea62f0e68b96bca7a13')
 
     # GRUB prints this under the finished menu and boots the first entry
     # five seconds later unless a key arrives.
     GRUB_MENU_READY = 'The highlighted entry will be executed automatically'
     GRUB_ENTRY = 'Boot Xen with TrenchBoot (EFI)'
-    GRUB_ENTRY_INDEX = 5
+    # An entry as GRUB draws it over serial: the cursor put at the third
+    # column of the entry's row, the highlight marker or a space, the
+    # title, then the padding to the box's edge. The firmware's boot
+    # manager prints a "Boot ..." line of its own before GRUB, without
+    # the cursor move.
+    GRUB_TITLE = re.compile(rb'\x1b\[\d+;0?3H[ *](Boot [A-Za-z0-9 ()]+?)\s{2,}')
     KEY_DOWN = b'\x1b[B'
 
     PROMPT = 'root@tb:~#'
@@ -117,10 +118,22 @@ class TrenchBootXen(QemuSystemTest):
             self.vm.add_args('-device', device)
         self.vm.launch()
 
-        wait_for_console_pattern(self, self.GRUB_ENTRY)
-        wait_for_console_pattern(self, self.GRUB_MENU_READY)
-        self.vm.console_socket.sendall(
-            self.KEY_DOWN * self.GRUB_ENTRY_INDEX + b'\r')
+        # The entry's place comes from the menu GRUB draws, so an image
+        # with more entries moves nothing here.
+        menu = wait_for_console_pattern(self, self.GRUB_MENU_READY)
+        titles = []
+        for title in self.GRUB_TITLE.findall(menu):
+            if title not in titles:
+                titles.append(title)
+        self.assertIn(self.GRUB_ENTRY.encode(), titles, f'GRUB menu {titles}')
+        index = titles.index(self.GRUB_ENTRY.encode())
+        self.log.info('GRUB menu %s, entry %d', titles, index)
+        # One key at a time, each answered by GRUB highlighting the next
+        # entry, so the selection is known before Enter.
+        for i in range(index):
+            self.vm.console_socket.sendall(self.KEY_DOWN)
+            wait_for_console_pattern(self, '*' + titles[i + 1].decode())
+        self.vm.console_socket.sendall(b'\r')
         wait_for_console_pattern(self, 'Enabling slaunch')
         wait_for_console_pattern(self, '(XEN) Xen version', 'Panic on CPU')
 
@@ -150,7 +163,7 @@ class TrenchBootXen(QemuSystemTest):
         self.assert_launched()
 
     @skipIfMissingCommands('swtpm')
-    @skipUnless(PSP_IMAGE, 'QEMU_TEST_TRENCHBOOT_PSP_IMAGE not set')
+    @skipBigDataTest()
     def test_x86_64_trenchboot_xen_efi_psp(self):
         '''
         The PSP path: GRUB sets a TMR up and SKL has the service launch,
@@ -158,7 +171,8 @@ class TrenchBootXen(QemuSystemTest):
         is up. PCR 18 carries the key token, so it is extended too.
         '''
         self.require_device('amd-psp')
-        self.boot_xen_efi(PSP_IMAGE, 'amd-psp,drtm-service=on')
+        image = self.uncompress(self.ASSET_IMAGE, target='tb-full-image.wic')
+        self.boot_xen_efi(image, 'amd-psp,drtm-service=on')
         wait_for_console_pattern(self, 'SLAUNCH: PSP-assisted launch',
                                  'Panic on CPU')
         wait_for_console_pattern(self, 'SLAUNCH: released TMR 0',

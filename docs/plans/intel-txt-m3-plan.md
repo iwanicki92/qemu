@@ -11,6 +11,12 @@ separately; M3 delivers steps **a** and **d** plus the plumbing they need.
 
 ## 1. Decision: QEMU synthesizes the measurement; no `hw/tpm/` changes
 
+> **Partly superseded by §3.7 and §3.8.** The `TPM2_PCR_Extend` half of this
+> section still holds. The `TPM2_PCR_Reset` half does not: that command cannot
+> reset PCRs 17-22 at any locality, and the DRTM is established with the TIS
+> `_TPM_Hash_*` signals instead, which also means three files under the TPM
+> subsystem did have to change. Read §3.7 before this section.
+
 `_TPM_Hash_Start` / `_TPM_Hash_Data` / `_TPM_Hash_End` are **not** implemented
 anywhere in QEMU's TPM stack, and M3 does not add them.
 
@@ -78,6 +84,10 @@ Keep these `static` and TXT-local. If a second consumer ever appears, promote
 to `tpm_util.h` then, not now.
 
 ### 3.3 Submission discipline (the part that needs care)
+
+> Applies to the `TPM2_PCR_Extend` path only. The hash sequence of §3.7 runs
+> on the backend's control channel, carries no `TPMBackendCmd`, and so is not
+> subject to the single-slot constraint described here.
 `tpm_backend_deliver_request()` (`backends/tpm/tpm_backend.c`) has a **single**
 `s->cmd` slot and bails with `"There is a TPM request pending"` when busy. So:
 
@@ -93,6 +103,11 @@ to `tpm_util.h` then, not now.
   in-flight commands.
 
 ### 3.4 Resolved: inline in the helper, under the BQL
+
+> Applies to the `TPM2_PCR_Extend` path only. The hash sequence of §3.7 makes
+> synchronous control-channel calls and never reaches `aio_poll()`, so the
+> liveness question below does not arise for it. The BQL is still taken,
+> because the control channel is a chardev.
 
 `tpm_backend_finish_sync()` spins `aio_poll(qemu_get_aio_context(), true)`,
 and SENTER runs in **vCPU context** inside a TCG helper, so the question was

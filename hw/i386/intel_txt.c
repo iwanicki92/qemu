@@ -338,8 +338,7 @@ enum {
  *
  * 4096 is the buffer size the TPM 2.0 spec guarantees, and the value
  * the emulator backend itself falls back to.  The commands built here
- * are far smaller (27 bytes for PCR_Reset, 87 for a two-bank
- * PCR_Extend) and their responses are a few dozen bytes.
+ * are far smaller (65 bytes for a one-bank PCR_Extend, 87 for two banks) and their responses are a few dozen bytes.
  */
 #define INTEL_TXT_TPM_BUF_SIZE 4096
 
@@ -348,7 +347,6 @@ enum {
 
 /* The DRTM PCR extended with the SINIT ACM hashes (spec step d,
    first component). */
-#define INTEL_TXT_DRTM_PCR_SINIT 17
 
 /*
  * The launch inputs must address guest RAM below 4 GiB; this also
@@ -593,16 +591,23 @@ static int intel_txt_drtm_hash_measure(IntelTxtState *s, const uint8_t *data,
         error_setg(errp, "Intel TXT device has no TPM backend");
         return -1;
     }
+    /*
+     * The hash signals travel on the control channel rather than as a
+     * TPMBackendCmd, so they cannot collide with the backend's single
+     * command slot.  They can still interleave with a guest TIS
+     * command already in flight on the data channel: swtpm serialises
+     * the two, but the ordering of that guest command against the PCR
+     * reset would be undefined.  SENTER is a quiescence point on
+     * hardware, so refuse rather than measure into an unclear order.
+     */
+    if (s->tpm->cmd != NULL) {
+        error_setg(errp, "a TPM request is already in flight");
+        return -1;
+    }
 
     trace_txt_drtm_hash_start(INTEL_TXT_DRTM_LOCTY, len);
 
-    if (tpm_backend_hash_start(s->tpm, INTEL_TXT_DRTM_LOCTY, errp) < 0) {
-        return -1;
-    }
-    if (tpm_backend_hash_data(s->tpm, data, len, errp) < 0) {
-        return -1;
-    }
-    if (tpm_backend_hash_end(s->tpm, errp) < 0) {
+    if (tpm_backend_hash_sequence(s->tpm, data, len, errp) < 0) {
         return -1;
     }
 

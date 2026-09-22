@@ -238,39 +238,28 @@ void tpm_backend_finish_sync(TPMBackend *s);
 TPMInfo *tpm_backend_query_tpm(TPMBackend *s);
 
 /**
- * tpm_backend_hash_start:
+ * tpm_backend_hash_sequence:
  * @s: the backend
- * @locty: the locality to run the sequence at; must be 4 for a DRTM
- * @errp: a pointer to return the #Error object if an error occurs.
- *
- * Assert the TIS _TPM_Hash_Start signal, resetting the DRTM PCRs.
- * Returns 0 on success, -1 on error (including a backend that does
- * not implement the hash sequence).
- */
-int tpm_backend_hash_start(TPMBackend *s, uint8_t locty, Error **errp);
-
-/**
- * tpm_backend_hash_data:
- * @s: the backend
- * @data: the bytes to feed into the running hash
+ * @data: the bytes to measure
  * @len: length of @data; the backend chunks it as needed
  * @errp: a pointer to return the #Error object if an error occurs.
  *
- * Feed data into the sequence started by tpm_backend_hash_start().
- * Returns 0 on success, -1 on error.
- */
-int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len,
-                          Error **errp);
-
-/**
- * tpm_backend_hash_end:
- * @s: the backend
- * @errp: a pointer to return the #Error object if an error occurs.
+ * Run a complete TIS _TPM_Hash_Start / _TPM_Hash_Data / _TPM_Hash_End
+ * sequence over @data, establishing a DRTM.
  *
- * Assert _TPM_Hash_End, completing the sequence and extending PCR 17
- * with the hash of the data fed in. Returns 0 on success, -1 on error.
+ * The sequence is transactional and is exposed as a single call on
+ * purpose: there is no abort signal, so a caller that could stop
+ * between phases would be able to leave the TPM in a
+ * hash-in-progress state with no way out.  The DRTM locality is
+ * likewise fixed internally rather than being a parameter, because
+ * only locality 4 is meaningful and the wrong value turns the whole
+ * sequence into a silent no-op on at least swtpm.
+ *
+ * Returns 0 on success, -1 on error (including a backend that does
+ * not implement the sequence).
  */
-int tpm_backend_hash_end(TPMBackend *s, Error **errp);
+int tpm_backend_hash_sequence(TPMBackend *s, const uint8_t *data, size_t len,
+                              Error **errp);
 
 /**
  * tpm_backend_has_hash_sequence:

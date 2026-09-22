@@ -165,12 +165,6 @@ typedef struct TPMDigestValue {
     size_t len;          /* 20 or 32 bytes, matching alg */
 } TPMDigestValue;
 
-/*
- * Reset the DRTM PCRs (17-22) at TIS locality 4, standing in for
- * the SINIT ACM (see docs/specs/intel-txt.rst, "Steps performed by
- * QEMU" step a).  Returns 0 on success, -1 with @errp set
- * otherwise.
- */
 
 /*
  * Extend PCR @pcr with the @n digests in @digests at TIS locality

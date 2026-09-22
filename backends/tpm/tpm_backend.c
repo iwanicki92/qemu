@@ -165,38 +165,28 @@ bool tpm_backend_has_hash_sequence(TPMBackend *s)
     return k->hash_start && k->hash_data && k->hash_end;
 }
 
-int tpm_backend_hash_start(TPMBackend *s, uint8_t locty, Error **errp)
+/*
+ * The DRTM locality.  Fixed here rather than taken from the caller:
+ * only locality 4 establishes a DRTM, and swtpm turns the whole
+ * sequence into a silent no-op at any other locality.
+ */
+#define TPM_BACKEND_DRTM_LOCTY 4
+
+int tpm_backend_hash_sequence(TPMBackend *s, const uint8_t *data, size_t len,
+                              Error **errp)
 {
     TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
 
-    if (!k->hash_start) {
+    if (!tpm_backend_has_hash_sequence(s)) {
         error_setg(errp, "this TPM backend does not implement the "
-                   "_TPM_Hash_Start signal");
+                   "_TPM_Hash_* signal sequence");
         return -1;
     }
-    return k->hash_start(s, locty, errp);
-}
 
-int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len,
-                          Error **errp)
-{
-    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
-
-    if (!k->hash_data) {
-        error_setg(errp, "this TPM backend does not implement the "
-                   "_TPM_Hash_Data signal");
+    if (k->hash_start(s, TPM_BACKEND_DRTM_LOCTY, errp) < 0) {
         return -1;
     }
-    return k->hash_data(s, data, len, errp);
-}
-
-int tpm_backend_hash_end(TPMBackend *s, Error **errp)
-{
-    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
-
-    if (!k->hash_end) {
-        error_setg(errp, "this TPM backend does not implement the "
-                   "_TPM_Hash_End signal");
+    if (k->hash_data(s, data, len, errp) < 0) {
         return -1;
     }
     return k->hash_end(s, errp);

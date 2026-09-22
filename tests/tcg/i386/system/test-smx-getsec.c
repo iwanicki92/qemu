@@ -108,13 +108,13 @@
 #define TXT_ERR_LAUNCH_INCOMPLETE    0x80040001ULL
 
 /*
- * Launch inputs for the SENTER cases: a 4 KiB SINIT ACM region at
- * 0xE10000 and a 4 KiB heap at 0xE11000, both inside the DPR range
+ * Launch inputs for the SENTER cases: an 8 KiB SINIT ACM region at
+ * 0xE10000 and a 4 KiB heap at 0xE20000, both inside the DPR range
  * [0xE00000, 0x1000000) selected below.
  */
 #define TEST_SINIT_BASE        0xE10000ULL
-#define TEST_SINIT_SIZE        0x1000ULL
-#define TEST_HEAP_BASE         0xE11000ULL
+#define TEST_SINIT_SIZE        0x2000ULL
+#define TEST_HEAP_BASE         0xE20000ULL
 #define TEST_HEAP_SIZE         0x1000ULL
 #define TEST_DPR               (TXT_DPR_TOP(0x1000000) | TXT_DPR_SIZE(2) | \
                                  TXT_DPR_LOCK)
@@ -478,6 +478,9 @@ static const uint8_t tpm2_pcrread17_cmd[20] = {
 /*
  * Expected PCR 17 (SHA-256 bank) once the DRTM has been established
  * over the SINIT region, which main() fills with acm[i] = (uint8_t)i.
+ * The region is deliberately 8 KiB so the measurement spans more than
+ * one PTM_HASH_DATA chunk (the control message carries at most 4096
+ * bytes), exercising the backend's chunk loop.
  *
  * _TPM_Hash_Start resets the PCR to zero and _TPM_Hash_End extends it
  * with the hash of the data, so the value is
@@ -485,14 +488,14 @@ static const uint8_t tpm2_pcrread17_cmd[20] = {
  *   SHA256( 0x00 * 32 || SHA256(region) )
  *
  * Reproduce with:
- *   python3 -c 'import hashlib;p=bytes(i&0xff for i in range(0x1000));\
+ *   python3 -c 'import hashlib;p=bytes(i&0xff for i in range(0x2000));\
  *     print(hashlib.sha256(bytes(32)+hashlib.sha256(p).digest()).hexdigest())'
  */
 static const uint8_t pcr17_expected[32] = {
-    0x03, 0xb2, 0x4e, 0x90, 0x3f, 0x40, 0x95, 0xc8,
-    0xdf, 0x8d, 0xa0, 0xba, 0x15, 0xd6, 0x5a, 0x99,
-    0x3a, 0x1f, 0xdf, 0xcb, 0x10, 0x51, 0x59, 0x14,
-    0x63, 0x78, 0x85, 0x61, 0xfd, 0xf0, 0x7e, 0xb7,
+    0x1e, 0x8a, 0xc4, 0x3b, 0xa2, 0x02, 0xd1, 0x11,
+    0x99, 0xcf, 0x22, 0xa2, 0x8c, 0xc7, 0x6b, 0xa7,
+    0x90, 0xef, 0xa3, 0xa2, 0xe0, 0x5e, 0xfe, 0xe7,
+    0x3b, 0x5e, 0x6c, 0xc4, 0xd7, 0x89, 0xc7, 0x41,
 };
 
 /*
@@ -792,14 +795,12 @@ int main(void)
     ml_printf("smx: SINIT/HEAP/DPR programmed\n");
 
     /*
-     * 8. SENTER with valid launch inputs: the preconditions pass,
-     *    the DRTM measurement is issued (reset the DRTM PCRs, extend
-     *    PCR 17 with the SHA-1 and SHA-256 hashes of the SINIT
-     *    region), and the staged launch stops short of the MLE
-     *    transfer with TXT_ERR_LAUNCH_INCOMPLETE.  STS.SENTER_DONE
-     *    must still be clear.  Verifying the PCR *values* needs a
-     *    guest-side TPM2 driver over the TIS, which is the next
-     *    slice -- do not attempt it here.
+     * 8. SENTER with valid launch inputs: the preconditions pass, the
+     *    DRTM is established over the SINIT region with the TIS hash
+     *    signals (which reset PCRs 17-22 and extend PCR 17 with the
+     *    region's hash), and the staged launch stops short of the MLE
+     *    transfer with LAUNCH_INCOMPLETE.  STS.SENTER_DONE must still
+     *    be clear.  The PCR 17 value itself is checked in step 9.
      */
     txt_write64(TXT_OFF_ERRORCODE, 0);
     ml_printf("smx: SENTER, launch inputs set ...\n");
@@ -822,9 +823,10 @@ int main(void)
                       "0x%llx (launch incomplete, staged)\n",
                       (unsigned long long)ec);
         }
+    }
 
     /*
-     * 8. The measurement itself: PCR 17 must have moved off its
+     * 9. The measurement itself: PCR 17 must have moved off its
      *    power-on all-ones value to exactly the extend-from-zero of
      *    the region's hash.  This is the assertion that proves a DRTM
      *    actually happened -- the ERRORCODE checks above only show
@@ -855,7 +857,6 @@ int main(void)
             ml_printf("PASS: PCR 17 holds the expected DRTM "
                       "measurement\n");
         }
-    }
     }
 
     if (!main_fail) {

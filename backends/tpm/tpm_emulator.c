@@ -517,6 +517,118 @@ static bool tpm_emulator_get_tpm_established_flag(TPMBackend *tb)
     return tpm_emu->established_flag;
 }
 
+/*
+ * The TIS _TPM_Hash_Start / _TPM_Hash_Data / _TPM_Hash_End signals.
+ *
+ * These establish a DRTM: _TPM_Hash_Start resets PCRs 17-22 and
+ * _TPM_Hash_End extends PCR 17 with the hash of the data in between.
+ * TPM2_PCR_Reset cannot do this -- it answers TPM_RC_LOCALITY for the
+ * DRTM PCRs even at locality 4 -- so this sequence is the only way to
+ * model a measured launch.
+ *
+ * The locality must be set to 4 first.  Without it swtpm accepts all
+ * three signals and returns success while changing nothing, so the
+ * locality is set here rather than trusted to the caller.
+ */
+static int tpm_emulator_hash_start(TPMBackend *tb, uint8_t locty,
+                                   Error **errp)
+{
+    TPMEmulator *tpm_emu = TPM_EMULATOR(tb);
+    ptm_res res;
+
+    if (!TPM_EMULATOR_IMPLEMENTS_ALL_CAPS(tpm_emu, PTM_CAP_HASHING)) {
+        error_setg(errp, "tpm-emulator: TPM does not support hashing "
+                   "(PTM_CAP_HASHING)");
+        return -1;
+    }
+
+    if (tpm_emulator_set_locality(tpm_emu, locty, errp) < 0) {
+        return -1;
+    }
+
+    if (tpm_emulator_ctrlcmd(tpm_emu, CMD_HASH_START, &res, 0,
+                             sizeof(res), sizeof(res)) < 0) {
+        error_setg(errp, "tpm-emulator: could not send CMD_HASH_START");
+        return -1;
+    }
+
+    res = be32_to_cpu(res);
+    if (res) {
+        error_setg(errp, "tpm-emulator: TPM result for CMD_HASH_START: "
+                   "0x%x %s", res, tpm_emulator_strerror(res));
+        return -1;
+    }
+
+    trace_tpm_emulator_hash_start(locty);
+
+    return 0;
+}
+
+static int tpm_emulator_hash_data(TPMBackend *tb, const uint8_t *data,
+                                  size_t len, Error **errp)
+{
+    TPMEmulator *tpm_emu = TPM_EMULATOR(tb);
+    size_t off = 0;
+
+    /*
+     * ptm_hdata carries at most sizeof(hdata.u.req.data) bytes per
+     * control command, so longer regions are fed in chunks.  The
+     * hash is cumulative across calls, so chunking is transparent.
+     */
+    while (off < len) {
+        ptm_hdata hdata;
+        size_t chunk = MIN(len - off, sizeof(hdata.u.req.data));
+        ptm_res res;
+
+        hdata.u.req.length = cpu_to_be32(chunk);
+        memcpy(hdata.u.req.data, data + off, chunk);
+
+        if (tpm_emulator_ctrlcmd(tpm_emu, CMD_HASH_DATA, &hdata,
+                                 sizeof(hdata.u.req.length) + chunk,
+                                 sizeof(hdata.u.resp.tpm_result),
+                                 sizeof(hdata.u.resp)) < 0) {
+            error_setg(errp, "tpm-emulator: could not send CMD_HASH_DATA");
+            return -1;
+        }
+
+        res = be32_to_cpu(hdata.u.resp.tpm_result);
+        if (res) {
+            error_setg(errp, "tpm-emulator: TPM result for CMD_HASH_DATA: "
+                       "0x%x %s", res, tpm_emulator_strerror(res));
+            return -1;
+        }
+
+        off += chunk;
+    }
+
+    trace_tpm_emulator_hash_data(len);
+
+    return 0;
+}
+
+static int tpm_emulator_hash_end(TPMBackend *tb, Error **errp)
+{
+    TPMEmulator *tpm_emu = TPM_EMULATOR(tb);
+    ptm_res res;
+
+    if (tpm_emulator_ctrlcmd(tpm_emu, CMD_HASH_END, &res, 0,
+                             sizeof(res), sizeof(res)) < 0) {
+        error_setg(errp, "tpm-emulator: could not send CMD_HASH_END");
+        return -1;
+    }
+
+    res = be32_to_cpu(res);
+    if (res) {
+        error_setg(errp, "tpm-emulator: TPM result for CMD_HASH_END: "
+                   "0x%x %s", res, tpm_emulator_strerror(res));
+        return -1;
+    }
+
+    trace_tpm_emulator_hash_end();
+
+    return 0;
+}
+
 static int tpm_emulator_reset_tpm_established_flag(TPMBackend *tb,
                                                    uint8_t locty)
 {
@@ -1103,6 +1215,9 @@ static void tpm_emulator_class_init(ObjectClass *klass, const void *data)
     tbc->get_tpm_options = tpm_emulator_get_tpm_options;
 
     tbc->handle_request = tpm_emulator_handle_request;
+    tbc->hash_start = tpm_emulator_hash_start;
+    tbc->hash_data = tpm_emulator_hash_data;
+    tbc->hash_end = tpm_emulator_hash_end;
 }
 
 static const TypeInfo tpm_emulator_info = {

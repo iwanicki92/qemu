@@ -243,6 +243,92 @@ Two smaller items deferred with it:
   intent rather than success. Fine for tracing; do not read them as proof a
   measurement landed.
 
+### 3.7 DECIDED: reset+extend the DRTM PCRs via the swtpm hash sequence
+
+**Supersedes the `TPM2_PCR_Reset` half of §1.** That part of §1 was wrong.
+
+#### What was wrong
+
+§1 claimed QEMU could synthesise spec step a with `TPM2_PCR_Reset` at
+locality 4. It cannot. Measured against swtpm 0.10.2 through the real device
+path, `TPM2_PCR_Reset(17)` with `.locty = 4` returns **TPM_RC_LOCALITY
+(0x907)**. This is not a transport fault: had `CMD_SET_LOCALITY` failed,
+`tpm_emulator_handle_request()` would have written a `TPM_FAIL` (9) fatal
+response instead. Locality 4 was applied and the TPM still refused, because on
+real hardware PCRs 17-22 are not command-resettable at all.
+
+The original M0/M3 spike had already established this ("semantic SENTER cannot
+zero PCRs 17-22 via TPM2_PCR_Reset"). The §1 text mis-summarised it as
+"extend + reset verified at L4", conflating extend (which does work) with
+reset (which does not), and the implementation faithfully built the wrong
+thing.
+
+#### The mechanism that does work
+
+swtpm's control channel implements the TIS hash signals, and QEMU already
+vendors the protocol definitions in `backends/tpm/tpm_ioctl.h` without ever
+using them:
+
+    CMD_HASH_START  (0x06)      PTM_CAP_HASHING (1 << 4)
+    CMD_HASH_DATA   (0x07)      struct ptm_hdata { u32 length; u8 data[4096]; }
+    CMD_HASH_END    (0x08)
+
+Measured directly against swtpm 0.10.2 (`caps=0x1ffff`, so
+`PTM_CAP_HASHING` is present):
+
+| step | PCR 17 (SHA-256 bank) |
+|---|---|
+| after `TPM2_Startup(CLEAR)` | `ffff…ff` (power-on DRTM value) |
+| `CMD_SET_LOCALITY(4)` → `HASH_START` → `HASH_DATA` → `HASH_END` | `71120181fce97de7…` |
+
+and that final value equals `SHA256(0x00*32 ‖ SHA256(data))` — i.e.
+**HASH_START reset the PCR to zero and HASH_END extended it with the hash of
+the data.** Exactly the hardware DRTM semantics, in one sequence, covering
+spec step a and the PCR 17 part of step d together.
+
+Two conditions matter:
+
+- **`CMD_SET_LOCALITY(4)` must precede `CMD_HASH_START`.** Without it all
+  three commands still return success but are silent no-ops — PCR 17 stays
+  `ffff…ff`. A caller that only checks return codes would believe it had
+  measured. This is the single most dangerous property of the interface.
+- **`--locality allow-set-locality` is not required.** Tested both ways with
+  identical results. (An earlier note claiming it mandatory was wrong for this
+  path; that flag governs the TPM2 `SetLocality` *command*, not the control
+  channel.)
+
+#### Why this is not the rejected "Path 1"
+
+§1 rejected adding guest-visible locality-4 hash MMIO to
+`tpm_tis_common.c`, on the grounds that real hardware never exposes locality
+4 to software. That reasoning stands and is untouched. This is the opposite
+shape: the sequence is driven **out-of-band by the TXT device over the backend
+control channel**, exactly as `CMD_SET_LOCALITY` already is, because QEMU is
+standing in for the chipset that asserts those signals. No TIS change, no
+guest-visible interface.
+
+#### Work required
+
+1. `TPMBackendClass` gains optional `hash_start` / `hash_data` /
+   `hash_end` methods, with public wrappers in `tpm_backend.c`.
+2. `tpm_emulator.c` implements them via
+   `tpm_emulator_ctrlcmd(CMD_HASH_*)`, and must set locality 4 first.
+   Do **not** add `PTM_CAP_HASHING` to the required-capability set in
+   `tpm_emulator_probe_caps()` — that would reject backends that work fine
+   for every non-TXT user. Check it only where TXT needs it.
+3. `intel_txt_senter()` replaces the `PCR_Extend`-only measurement with
+   the hash sequence over the measured region, and drops
+   `intel_txt_drtm_reset_pcrs()`.
+4. The guest test gains a PCR 17 readback asserting the value is no longer
+   `ffff…ff` and equals the expected extend-from-zero — the first assertion
+   in this project that actually proves a measurement landed.
+
+This widens the TPM-subsystem footprint from two files to three
+(`include/system/tpm_backend.h`, `backends/tpm/tpm_backend.c`,
+`backends/tpm/tpm_emulator.c`). That is the "no TPM-subsystem changes"
+property bending, as §3.6 predicted it would have to; it bends for the
+mechanism the hardware actually uses, which is the right reason.
+
 ## 4. Deliberate fidelity gap to document
 QEMU does not gate locality-4 MMIO the way a real chipset does, so a guest can
 reach locality 4 through the existing TIS and extend PCR 17/18 itself. This is

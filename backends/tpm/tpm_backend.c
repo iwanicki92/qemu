@@ -25,9 +25,20 @@
 static void tpm_backend_request_completed(void *opaque, int ret)
 {
     TPMBackend *s = TPM_BACKEND(opaque);
-    TPMIfClass *tic = TPM_IF_GET_CLASS(s->tpmif);
 
-    tic->request_completed(s->tpmif, ret);
+    /*
+     * Device-originated commands (TPMBackendCmd::no_frontend_notify)
+     * must not notify the frontend: the response went to the device's
+     * own buffer, and running the frontend's request_completed would
+     * corrupt its state machine and raise an interrupt for a command
+     * the guest never sent.  Skipping the lookup also leaves a NULL
+     * tpmif (backend initialised without a frontend) untouched.
+     */
+    if (!s->cmd->no_frontend_notify) {
+        TPMIfClass *tic = TPM_IF_GET_CLASS(s->tpmif);
+
+        tic->request_completed(s->tpmif, ret);
+    }
 
     /* no need for atomic, as long the BQL is taken */
     s->cmd = NULL;
@@ -145,6 +156,50 @@ int tpm_backend_reset_tpm_established_flag(TPMBackend *s, uint8_t locty)
 
     return k->reset_tpm_established_flag ?
            k->reset_tpm_established_flag(s, locty) : 0;
+}
+
+bool tpm_backend_has_hash_sequence(TPMBackend *s)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+
+    return k->hash_start && k->hash_data && k->hash_end;
+}
+
+int tpm_backend_hash_start(TPMBackend *s, uint8_t locty, Error **errp)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+
+    if (!k->hash_start) {
+        error_setg(errp, "this TPM backend does not implement the "
+                   "_TPM_Hash_Start signal");
+        return -1;
+    }
+    return k->hash_start(s, locty, errp);
+}
+
+int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len,
+                          Error **errp)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+
+    if (!k->hash_data) {
+        error_setg(errp, "this TPM backend does not implement the "
+                   "_TPM_Hash_Data signal");
+        return -1;
+    }
+    return k->hash_data(s, data, len, errp);
+}
+
+int tpm_backend_hash_end(TPMBackend *s, Error **errp)
+{
+    TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);
+
+    if (!k->hash_end) {
+        error_setg(errp, "this TPM backend does not implement the "
+                   "_TPM_Hash_End signal");
+        return -1;
+    }
+    return k->hash_end(s, errp);
 }
 
 TPMVersion tpm_backend_get_tpm_version(TPMBackend *s)

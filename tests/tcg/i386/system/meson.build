@@ -39,11 +39,29 @@ if 'qemu-system-i386' in emulators
   # -fno-pie/-Wl,-no-pie: the #UD gate is naked and must keep its
   # entry point on hosts with default-PIE compilers; -fno-stack-protector
   # keeps the freestanding binary free of __stack_chk_fail.
+  # -msse: the TXT register space only accepts 8-byte accesses, which
+  # 32-bit code issues by staging the value through an XMM register
+  # (see txt_read64/txt_write64); -msse enables XMM register
+  # clobbers in the freestanding build.  The +sse CPU feature is the
+  # matching guest side: without it the SSE staging instructions
+  # raise #UD (qemu32's baseline PPRO feature set has no SSE).
+  # The staged GETSEC[SENTER] coverage needs the intel-txt chipset
+  # and a TPM, so the test runs on q35 with txt=on and a swtpm-backed
+  # emulator backend; the wrapper starts swtpm and substitutes its
+  # control socket path (SWTPM_SOCKET_PLACEHOLDER) before exec'ing
+  # QEMU.
+  run_swtpm_test = find_program('run-swtpm-test.sh')
   tests += {
     'test-smx-getsec.c': {
       'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
-                          '-fno-stack-protector'],
-      'qemu_args': qemu_def_args + ['-cpu', 'qemu32,smx'],
+                          '-fno-stack-protector', '-msse'],
+      'qemu_args': ['-machine', 'q35,txt=on',
+                    '-cpu', 'qemu32,smx,sse',
+                    '-chardev',
+                    'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                    '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                    '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+      'wrapper': [run_swtpm_test],
     },
   }
 

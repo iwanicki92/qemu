@@ -1,20 +1,28 @@
 /*
  * QEMU Intel TXT (Trusted Execution Technology)
  *
- * TCG guest test for the GETSEC (SMX) CPU interface (milestone M2:
- * decode + static semantics).
+ * TCG guest test for the GETSEC (SMX) CPU interface: M2 decode +
+ * static semantics, and the M3 staged GETSEC[SENTER] measured launch
+ * (see docs/specs/intel-txt.rst, "Semantic measured launch").
  *
  * Required QEMU command line (see meson.build in this directory):
  *
- *   qemu-system-i386 -cpu qemu32,smx \
+ *   qemu-system-i386 -machine q35,txt=on -cpu qemu32,smx \
  *       -display none -device isa-debugcon,chardev=stdio \
+ *       -chardev stdio,id=stdio \
  *       -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+ *       -chardev socket,id=tpm0,path=<swtpm socket> \
+ *       -tpmdev emulator,id=tpm0,chardev=tpm0 \
+ *       -device tpm-tis,tpmdev=tpm0 \
  *       -kernel <this test binary>
  *
- * The test runs on the plain machine (no -machine txt=on, no TPM
- * backend), at CPL0 in 32-bit protected mode (see boot.S).  Without
- * the intel-txt chipset device the chipset-present capability bit
- * (bit 0) must be clear; the other leaf capability bits are static.
+ * The test needs the intel-txt chipset device and a TPM backend, so
+ * it runs on q35 with txt=on and a swtpm-backed emulator backend.
+ * The meson wrapper run-swtpm-test.sh starts swtpm and substitutes
+ * the socket path before exec'ing QEMU.
+ *
+ * The test runs at CPL0 in 32-bit protected mode, unpaged (see
+ * boot.S), so all physical addresses are directly addressable.
  *
  * Copyright (c) 2026 Michał Kopeć <michal@nozomi.space>
  *
@@ -26,6 +34,17 @@
 #include <minilib.h>
 
 #define CR4_SMXE_MASK            (1U << 14)
+/*
+ * The TXT register space only answers 8-byte accesses, which 32-bit
+ * code issues by staging through an XMM register (txt_read64 /
+ * txt_write64).  Executing any SSE instruction needs CR4.OSFXSR set:
+ * advertising SSE in CPUID is not enough, enabling it is the OS's job.
+ * Without this the first movq raises #UD, and the #UD gate below --
+ * which hardcodes the 2-byte length of GETSEC (0F 37) -- would step
+ * EIP into the middle of the 4-byte movq and derail the test.
+ */
+#define CR4_OSFXSR_MASK          (1U << 9)
+#define CR4_OSXMMEXCPT_MASK      (1U << 10)
 
 #define GETSEC_LEAF_CAPABILITIES 0
 #define GETSEC_LEAF_SENTER       4
@@ -50,6 +69,128 @@
 #define GETSEC_PARAM_ACM_MEM_TYPES 3
 #define GETSEC_PARAM_SENTER_CTRL   4
 #define GETSEC_PARAM_TXT_EXT       5
+
+/*
+ * TXT public configuration space (see docs/specs/intel-txt.rst,
+ * "TXT public config space").  All registers are 64-bit and must be
+ * accessed with aligned quadword moves.
+ */
+#define TXT_PUBLIC_BASE        0xFED30000U
+#define TXT_OFF_STS            0x000
+#define TXT_OFF_ERRORCODE      0x030
+#define TXT_OFF_SINIT_BASE     0x270
+#define TXT_OFF_SINIT_SIZE     0x278
+#define TXT_OFF_HEAP_BASE      0x300
+#define TXT_OFF_HEAP_SIZE      0x308
+#define TXT_OFF_DPR            0x330
+
+#define TXT_STS_SENTER_DONE    (1ULL << 0)
+
+/* TXT.DPR layout: bit 0 LOCK, bits [11:4] SIZE in 1 MiB blocks,
+   bits [31:20] TOP. */
+#define TXT_DPR_LOCK           (1ULL << 0)
+#define TXT_DPR_SIZE(n)        (((uint64_t)(n) & 0xff) << 4)
+/*
+ * TOP is address bits [31:20], so the argument is a full address and
+ * the field is extracted from it.  Masking the address with 0xfff
+ * before the shift would silently truncate anything >= 1 MiB -- e.g.
+ * a 16 MiB top (0x1000000) would become 0, yielding an empty range.
+ */
+#define TXT_DPR_TOP(top)       ((((uint64_t)(top) >> 20) & 0xfff) << 20)
+
+/*
+ * TXT.ERRORCODE values for the staged SENTER path (ACMERROR layout:
+ * bit 31 VALID, bit 30 EXTERNAL = 0, [23:16] PROGRESS_CODE, TYPE_CODE
+ * = 1 (SINIT); see include/hw/i386/intel_txt.h and the table in
+ * docs/specs/intel-txt.rst).
+ */
+#define TXT_ERR_SINIT_REGION_INVALID 0x80010001ULL
+#define TXT_ERR_LAUNCH_INCOMPLETE    0x80040001ULL
+
+/*
+ * Launch inputs for the SENTER cases: a 4 KiB SINIT ACM region at
+ * 0xE10000 and a 4 KiB heap at 0xE11000, both inside the DPR range
+ * [0xE00000, 0x1000000) selected below.
+ */
+#define TEST_SINIT_BASE        0xE10000ULL
+#define TEST_SINIT_SIZE        0x1000ULL
+#define TEST_HEAP_BASE         0xE11000ULL
+#define TEST_HEAP_SIZE         0x1000ULL
+#define TEST_DPR               (TXT_DPR_TOP(0x1000000) | TXT_DPR_SIZE(2) | \
+                                 TXT_DPR_LOCK)
+
+/*
+ * TPM TIS decode area (locality 0; see include/hw/acpi/tpm.h).  The
+ * emulator backend the TXT device measures through reuses this same
+ * frontend for its locality-4 DRTM commands.
+ */
+#define TPM_TIS_BASE           0xFED40000U
+#define TIS_OFF_ACCESS         0x00
+#define TIS_OFF_STS            0x18
+#define TIS_OFF_DATA_FIFO      0x24
+
+#define TIS_ACCESS_REQUEST_USE     (1U << 1)
+#define TIS_ACCESS_ACTIVE_LOCALITY (1U << 5)
+
+#define TIS_STS_COMMAND_READY      (1U << 6)
+#define TIS_STS_TPM_GO             (1U << 5)
+#define TIS_STS_DATA_AVAILABLE     (1U << 4)
+
+static uint64_t txt_read64(uint32_t off)
+{
+    volatile uint64_t *p = (volatile uint64_t *)(TXT_PUBLIC_BASE + off);
+    uint64_t v;
+
+    /*
+     * One 8-byte MMIO access: 32-bit mode has no 64-bit general-purpose
+     * registers, so the value is staged through an XMM register, which
+     * keeps the MMIO access a single aligned 8-byte read as the TXT
+     * space requires.
+     */
+    asm volatile("movq %1, %%xmm0\n\t"
+                 "movq %%xmm0, %0"
+                 : "=m"(v) : "m"(*p) : "xmm0");
+    return v;
+}
+
+static void txt_write64(uint32_t off, uint64_t v)
+{
+    volatile uint64_t *p = (volatile uint64_t *)(TXT_PUBLIC_BASE + off);
+
+    /* One 8-byte MMIO write, staged through an XMM register (see
+     * txt_read64). */
+    asm volatile("movq %0, %%xmm0\n\t"
+                 "movq %%xmm0, %1"
+                 : : "m"(v), "m"(*p) : "xmm0");
+}
+
+static uint32_t tis_readl(uint32_t off)
+{
+    volatile uint32_t *p = (volatile uint32_t *)(TPM_TIS_BASE + off);
+
+    return *p;
+}
+
+static uint8_t tis_readb(uint32_t off)
+{
+    volatile uint8_t *p = (volatile uint8_t *)(TPM_TIS_BASE + off);
+
+    return *p;
+}
+
+static void tis_writeb(uint32_t off, uint8_t v)
+{
+    volatile uint8_t *p = (volatile uint8_t *)(TPM_TIS_BASE + off);
+
+    *p = v;
+}
+
+static void tis_writel(uint32_t off, uint32_t v)
+{
+    volatile uint32_t *p = (volatile uint32_t *)(TPM_TIS_BASE + off);
+
+    *p = v;
+}
 
 static uint32_t read_cr4(void)
 {
@@ -78,6 +219,21 @@ static void getsec_parameters(uint32_t index, uint32_t *eax, uint32_t *ebx,
     asm volatile(".byte 0x0f, 0x37"
                  : "=a"(*eax), "=b"(*ebx), "=c"(*ecx)
                  : "0"(GETSEC_LEAF_PARAMETERS), "1"(index));
+}
+
+static void getsec_senter(void)
+{
+    /*
+     * SENTER is GETSEC[4]: opcode 0F 37 with the leaf index in EAX
+     * (0F 34 is SMI, not GETSEC).  At CPL0 with CR4.SMXE set and the
+     * chipset present this does not raise an exception in the staging
+     * state: the helper validates the launch inputs, issues the DRTM
+     * measurement, and returns normally with a defined TXT.ERRORCODE
+     * (see target/i386/tcg/smx_helper.c).
+     */
+    asm volatile(".byte 0x0f, 0x37"
+                 :
+                 : "a"(GETSEC_LEAF_SENTER));
 }
 
 /*
@@ -158,6 +314,295 @@ static void fail_msg(const char *msg, int bit)
     main_fail |= bit;
 }
 
+/*
+ * TPM2_Startup(CLEAR), in the QEMU TPM wire format: tag 0x8001,
+ * 4-byte size, 4-byte command code, then the 2-byte startupType.
+ * The emulator backend forwards the bytes to swtpm unchanged and the
+ * TIS frontend hands the response back through the data FIFO.  The
+ * expected response is the 10-byte header with the 16-bit response
+ * code (offset 8) equal to zero; it is the same command and
+ * response the in-tree tests/qtest tpm_util_startup() uses.
+ */
+static const uint8_t tpm2_startup_cmd[12] = {
+    0x80, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00,
+    0x01, 0x44, 0x00, 0x00,
+};
+
+/*
+ * Expected TPM2_Startup response header: tag TPM_ST_NO_SESSIONS,
+ * responseSize 10, then the response code.  Only the first six bytes
+ * are fixed -- the code itself is checked separately, because two
+ * values are both correct here:
+ *
+ *   TPM_RC_SUCCESS    (0x000) if this really is the first Startup, and
+ *   TPM_RC_INITIALIZE (0x100) if the TPM is already started.
+ *
+ * The second is what actually happens under QEMU: the tpm-tis frontend
+ * calls tpm_backend_startup_tpm() during realize, which sends CMD_INIT
+ * to swtpm and performs TPM2_Startup(CLEAR) before the guest runs.  A
+ * guest-issued Startup is therefore a *second* one and is correctly
+ * refused.  Asserting on SUCCESS alone made a healthy TPM look broken.
+ */
+#define TPM2_RESP_HDR_LEN  6
+#define TPM2_RC_SUCCESS    0x00000000U
+#define TPM2_RC_INITIALIZE 0x00000100U
+
+static const uint8_t tpm2_startup_resp[10] = {
+    0x80, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00,
+    0x00, 0x00,
+};
+
+static void tpm2_startup(void)
+{
+    uint32_t sts;
+    uint32_t bcount;
+    int i;
+
+    /* Request use of locality 0 and enter the command-ready state. */
+    tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_REQUEST_USE);
+    tis_writel(TIS_OFF_STS, TIS_STS_COMMAND_READY);
+
+    sts = tis_readl(TIS_OFF_STS);
+    bcount = (sts >> 8) & 0xffff;
+    if (bcount < sizeof(tpm2_startup_cmd)) {
+        fail_msg("TIS: command buffer too small for TPM2_Startup", 16);
+        tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+        return;
+    }
+
+    for (i = 0; i < (int)sizeof(tpm2_startup_cmd); i++) {
+        tis_writeb(TIS_OFF_DATA_FIFO, tpm2_startup_cmd[i]);
+    }
+    tis_writeb(TIS_OFF_STS, TIS_STS_TPM_GO);
+
+    /* Wait for the response (up to ~1 s of polling). */
+    for (i = 0; i < 1000000; i++) {
+        sts = tis_readl(TIS_OFF_STS);
+        if (sts & TIS_STS_DATA_AVAILABLE) {
+            break;
+        }
+    }
+    if (!(sts & TIS_STS_DATA_AVAILABLE)) {
+        fail_msg("TPM2_Startup: the TPM did not respond", 16);
+        tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+        return;
+    }
+
+    sts = tis_readl(TIS_OFF_STS);
+    bcount = (sts >> 8) & 0xffff;
+    if (bcount < sizeof(tpm2_startup_resp)) {
+        fail_msg("TPM2_Startup: truncated response", 16);
+        tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+        return;
+    }
+    if (bcount > 4096) {
+        bcount = 4096; /* bound the FIFO drain */
+    }
+
+    /*
+     * Drain the whole response first, then compare.  Reporting from a
+     * buffer (rather than from the first byte that happens to differ)
+     * keeps the diagnostic aligned with the response's real offsets --
+     * printing from the mismatch point made a failure at, say, index 5
+     * look like a bad byte 0.  minilib's printf has no width or
+     * zero-pad support, so "%x" is the only usable conversion here.
+     */
+    {
+        uint8_t r[16] = { 0 };
+        uint32_t got = 0;
+        int bad = -1;
+
+        uint32_t rc;
+
+        for (i = 0; i < (int)bcount; i++) {
+            uint8_t b = tis_readb(TIS_OFF_DATA_FIFO);
+
+            if (got < sizeof(r)) {
+                r[got] = b;
+            }
+            /* Only the fixed header is byte-compared; see above. */
+            if (bad < 0 && (uint32_t)i < TPM2_RESP_HDR_LEN &&
+                b != tpm2_startup_resp[i]) {
+                bad = i;
+            }
+            got++;
+        }
+
+        rc = ((uint32_t)r[6] << 24) | ((uint32_t)r[7] << 16) |
+             ((uint32_t)r[8] << 8) | (uint32_t)r[9];
+
+        if (bad >= 0 || bcount != sizeof(tpm2_startup_resp) ||
+            (rc != TPM2_RC_SUCCESS && rc != TPM2_RC_INITIALIZE)) {
+            uint32_t n;
+
+            ml_printf("smx: TPM2_Startup got %u bytes (want %u):",
+                      bcount, (uint32_t)sizeof(tpm2_startup_resp));
+            for (n = 0; n < got && n < sizeof(r); n++) {
+                ml_printf(" %x", r[n]);
+            }
+            ml_printf("\n");
+            if (bad >= 0) {
+                ml_printf("smx: first header mismatch at byte %d: "
+                          "got 0x%x, want 0x%x\n", bad, r[bad],
+                          tpm2_startup_resp[bad]);
+            } else {
+                ml_printf("smx: unexpected response code 0x%x\n", rc);
+            }
+            fail_msg("TPM2_Startup: unexpected response", 16);
+        } else {
+            ml_printf("smx: TPM2_Startup rc=0x%x (%s)\n", rc,
+                      rc == TPM2_RC_SUCCESS ? "success"
+                                            : "already started");
+        }
+    }
+
+    /* Release locality 0. */
+    tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+    ml_printf("smx: TPM2_Startup(CLEAR) accepted\n");
+}
+
+/*
+ * TPM2_PCR_Read of PCR 17 in the SHA-256 bank.
+ *
+ *   tag TPM_ST_NO_SESSIONS, commandSize 20, TPM_CC_PCR_Read 0x17e,
+ *   then a TPML_PCR_SELECTION of one TPMS_PCR_SELECTION:
+ *   hashAlg SHA-256 (0x000b), sizeofSelect 3, pcrSelect 00 00 02
+ *   (bit 1 of byte 2 == PCR 17).
+ */
+static const uint8_t tpm2_pcrread17_cmd[20] = {
+    0x80, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
+    0x01, 0x7e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0b,
+    0x03, 0x00, 0x00, 0x02,
+};
+
+/*
+ * Expected PCR 17 (SHA-256 bank) once the DRTM has been established
+ * over the SINIT region, which main() fills with acm[i] = (uint8_t)i.
+ *
+ * _TPM_Hash_Start resets the PCR to zero and _TPM_Hash_End extends it
+ * with the hash of the data, so the value is
+ *
+ *   SHA256( 0x00 * 32 || SHA256(region) )
+ *
+ * Reproduce with:
+ *   python3 -c 'import hashlib;p=bytes(i&0xff for i in range(0x1000));\
+ *     print(hashlib.sha256(bytes(32)+hashlib.sha256(p).digest()).hexdigest())'
+ */
+static const uint8_t pcr17_expected[32] = {
+    0x03, 0xb2, 0x4e, 0x90, 0x3f, 0x40, 0x95, 0xc8,
+    0xdf, 0x8d, 0xa0, 0xba, 0x15, 0xd6, 0x5a, 0x99,
+    0x3a, 0x1f, 0xdf, 0xcb, 0x10, 0x51, 0x59, 0x14,
+    0x63, 0x78, 0x85, 0x61, 0xfd, 0xf0, 0x7e, 0xb7,
+};
+
+/*
+ * Run one TPM command through the locality-0 TIS FIFO and copy up to
+ * @out_len response bytes into @out.  Returns the response length, or
+ * 0 on failure.  Shares the sequence tpm2_startup() uses: request the
+ * locality, go command-ready, push the command, TPM_GO, poll for
+ * dataAvailable, drain.
+ */
+static uint32_t tis_transmit(const uint8_t *cmd, uint32_t cmd_len,
+                             uint8_t *out, uint32_t out_len)
+{
+    uint32_t sts;
+    uint32_t bcount;
+    uint32_t i;
+
+    tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_REQUEST_USE);
+    tis_writel(TIS_OFF_STS, TIS_STS_COMMAND_READY);
+
+    sts = tis_readl(TIS_OFF_STS);
+    if (((sts >> 8) & 0xffff) < cmd_len) {
+        tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+        return 0;
+    }
+    for (i = 0; i < cmd_len; i++) {
+        tis_writeb(TIS_OFF_DATA_FIFO, cmd[i]);
+    }
+    tis_writeb(TIS_OFF_STS, TIS_STS_TPM_GO);
+
+    for (i = 0; i < 1000000; i++) {
+        sts = tis_readl(TIS_OFF_STS);
+        if (sts & TIS_STS_DATA_AVAILABLE) {
+            break;
+        }
+    }
+    if (!(sts & TIS_STS_DATA_AVAILABLE)) {
+        tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+        return 0;
+    }
+
+    sts = tis_readl(TIS_OFF_STS);
+    bcount = (sts >> 8) & 0xffff;
+    if (bcount > 4096) {
+        bcount = 4096;
+    }
+    for (i = 0; i < bcount; i++) {
+        uint8_t b = tis_readb(TIS_OFF_DATA_FIFO);
+
+        if (i < out_len) {
+            out[i] = b;
+        }
+    }
+    tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+
+    return bcount;
+}
+
+/*
+ * Read PCR 17 (SHA-256) into @digest.  Returns 1 on success.  The
+ * TPM2_PCR_Read response tail is the 32-byte digest, so it is taken
+ * from the end of the response rather than by walking the structure.
+ */
+static int pcr17_read(uint8_t *digest)
+{
+    uint8_t resp[128];
+    uint32_t n = tis_transmit(tpm2_pcrread17_cmd,
+                              sizeof(tpm2_pcrread17_cmd),
+                              resp, sizeof(resp));
+    uint32_t rc;
+    uint32_t i;
+
+    if (n < 10 + 32) {
+        ml_printf("smx: PCR_Read returned %u bytes\n", n);
+        return 0;
+    }
+    rc = ((uint32_t)resp[6] << 24) | ((uint32_t)resp[7] << 16) |
+         ((uint32_t)resp[8] << 8) | (uint32_t)resp[9];
+    if (rc != 0) {
+        ml_printf("smx: PCR_Read rc=0x%x\n", rc);
+        return 0;
+    }
+    for (i = 0; i < 32; i++) {
+        digest[i] = resp[n - 32 + i];
+    }
+    return 1;
+}
+
+static int pcr17_is(const uint8_t *digest, const uint8_t *want)
+{
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        if (digest[i] != want[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void pcr17_print(const char *what, const uint8_t *d)
+{
+    int i;
+
+    ml_printf("smx: PCR17 %s:", what);
+    for (i = 0; i < 32; i++) {
+        ml_printf(" %x", d[i]);
+    }
+    ml_printf("\n");
+}
+
 int main(void)
 {
     uint32_t cr4;
@@ -165,10 +610,15 @@ int main(void)
     uint32_t eax = 0, ebx = 0, ecx = 0;
     uint32_t type;
     int index;
+    int i;
 
     ml_printf("smx: start\n");
     idt_install();
     ml_printf("smx: idt installed\n");
+
+    /* Enable SSE before any txt_read64()/txt_write64() (see above). */
+    write_cr4(read_cr4() | CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK);
+    ml_printf("smx: SSE enabled, cr4=0x%x\n", read_cr4());
 
     /* 1. With CR4.SMXE clear, GETSEC raises #UD. */
     cr4 = read_cr4();
@@ -189,16 +639,17 @@ int main(void)
     ml_printf("smx: SMXE enabled, cr4=0x%x\n", read_cr4());
 
     /*
-     * 2. GETSEC[CAPABILITIES]: the static leaf bits are set; without
-     *    the intel-txt chipset device the chipset-present bit is
-     *    clear, and ENTERACCS / extended leaves are not advertised.
+     * 2. GETSEC[CAPABILITIES]: the static leaf bits are set and the
+     *    chipset-present bit is set (this test runs with
+     *    -machine txt=on).  ENTERACCS / extended leaves are not
+     *    advertised.
      */
     ml_printf("smx: GETSEC[CAPABILITIES] ...\n");
     caps = getsec_capabilities(0);
     ml_printf("smx: caps=0x%x\n", caps);
-    if (caps != GETSEC_CAP_STATIC) {
+    if (caps != (GETSEC_CAP_STATIC | GETSEC_CAP_CHIPSET_PRESENT)) {
         ml_printf("FAIL: GETSEC[CAPABILITIES] = 0x%x, expected 0x%x\n",
-                  caps, GETSEC_CAP_STATIC);
+                  caps, GETSEC_CAP_STATIC | GETSEC_CAP_CHIPSET_PRESENT);
         main_fail |= 2;
     } else {
         ml_printf("PASS: GETSEC[CAPABILITIES] = 0x%x\n", caps);
@@ -253,13 +704,158 @@ int main(void)
                   "after %d entries\n", index);
     }
 
-    /* 4. GETSEC[SENTER] is an M2 stub: #UD at CPL0 with SMXE set. */
-    ud_count = 0;
-    asm volatile(".byte 0x0f, 0x37" :: "a"(GETSEC_LEAF_SENTER));
-    if (ud_count != 1) {
-        fail_msg("GETSEC[SENTER] stub did not raise #UD", 8);
+    /*
+     * 4. Fresh chipset state: nothing is latched at boot, so STS,
+     *    ERRORCODE and the SINIT/HEAP/DPR registers all read zero.
+     */
+    if (txt_read64(TXT_OFF_STS) != 0) {
+        fail_msg("fresh STS is not zero", 32);
+    }
+    if (txt_read64(TXT_OFF_ERRORCODE) != 0) {
+        fail_msg("fresh ERRORCODE is not zero", 32);
+    }
+    if (txt_read64(TXT_OFF_SINIT_BASE) != 0 ||
+        txt_read64(TXT_OFF_SINIT_SIZE) != 0) {
+        fail_msg("fresh SINIT_BASE/SIZE are not zero", 32);
+    }
+    if (txt_read64(TXT_OFF_HEAP_BASE) != 0 ||
+        txt_read64(TXT_OFF_HEAP_SIZE) != 0) {
+        fail_msg("fresh HEAP_BASE/SIZE are not zero", 32);
+    }
+    if (txt_read64(TXT_OFF_DPR) != 0) {
+        fail_msg("fresh DPR is not zero", 32);
     } else {
-        ml_printf("PASS: GETSEC[SENTER] stub raises #UD\n");
+        ml_printf("PASS: fresh chipset state is all zero\n");
+    }
+
+    /*
+     * 5. Bring the TPM out of its "needs startup" state with a
+     *    guest-side TPM2_Startup(CLEAR) over the TIS.  This is only
+     *    a prerequisite for the DRTM commands the staged SENTER
+     *    issues: verifying the PCR *values* needs a guest-side TPM2
+     *    driver over the TIS, which is the next slice -- do not
+     *    attempt it here.
+     */
+    tpm2_startup();
+
+    /*
+     * 6. SENTER with the SINIT/HEAP launch inputs unset: the first
+     *    precondition (SINIT region) must fail and record
+     *    TXT_ERR_SINIT_REGION_INVALID without measuring anything,
+     *    and STS.SENTER_DONE must stay clear.  Zero ERRORCODE first
+     *    so the readback proves SENTER wrote the code.
+     */
+    txt_write64(TXT_OFF_ERRORCODE, 0);
+    ml_printf("smx: SENTER, SINIT/HEAP unset ...\n");
+    getsec_senter();
+    {
+        uint64_t ec = txt_read64(TXT_OFF_ERRORCODE);
+        uint64_t sts = txt_read64(TXT_OFF_STS);
+
+        ml_printf("smx: ERRORCODE=0x%llx STS=0x%llx\n",
+                  (unsigned long long)ec, (unsigned long long)sts);
+        if (ec != TXT_ERR_SINIT_REGION_INVALID) {
+            fail_msg("SENTER without launch inputs: wrong ERRORCODE", 64);
+        }
+        if (sts & TXT_STS_SENTER_DONE) {
+            fail_msg("SENTER without launch inputs: SENTER_DONE set", 64);
+        }
+        if (ec == TXT_ERR_SINIT_REGION_INVALID &&
+            !(sts & TXT_STS_SENTER_DONE)) {
+            ml_printf("PASS: SENTER without launch inputs records "
+                      "0x%llx\n", (unsigned long long)ec);
+        }
+    }
+
+    /*
+     * 7. Program the launch inputs: the DPR range [0xE00000,
+     *    0x1000000) (TOP 0x1000000, 2 MiB blocks, locked -- DPR is
+     *    write-once, so this is the one chance), the 4 KiB SINIT
+     *    ACM region at 0xE10000 (inside the DPR), and the 4 KiB heap
+     *    at 0xE11000.  Give the SINIT region deterministic content.
+     */
+    {
+        volatile uint8_t *acm = (volatile uint8_t *)TEST_SINIT_BASE;
+
+        txt_write64(TXT_OFF_DPR, TEST_DPR);
+        if (txt_read64(TXT_OFF_DPR) != TEST_DPR) {
+            fail_msg("DPR readback mismatch after programming", 64);
+        }
+        for (i = 0; i < (int)TEST_SINIT_SIZE; i++) {
+            acm[i] = (uint8_t)i;
+        }
+        txt_write64(TXT_OFF_SINIT_BASE, TEST_SINIT_BASE);
+        txt_write64(TXT_OFF_SINIT_SIZE, TEST_SINIT_SIZE);
+        txt_write64(TXT_OFF_HEAP_BASE, TEST_HEAP_BASE);
+        txt_write64(TXT_OFF_HEAP_SIZE, TEST_HEAP_SIZE);
+    }
+    ml_printf("smx: SINIT/HEAP/DPR programmed\n");
+
+    /*
+     * 8. SENTER with valid launch inputs: the preconditions pass,
+     *    the DRTM measurement is issued (reset the DRTM PCRs, extend
+     *    PCR 17 with the SHA-1 and SHA-256 hashes of the SINIT
+     *    region), and the staged launch stops short of the MLE
+     *    transfer with TXT_ERR_LAUNCH_INCOMPLETE.  STS.SENTER_DONE
+     *    must still be clear.  Verifying the PCR *values* needs a
+     *    guest-side TPM2 driver over the TIS, which is the next
+     *    slice -- do not attempt it here.
+     */
+    txt_write64(TXT_OFF_ERRORCODE, 0);
+    ml_printf("smx: SENTER, launch inputs set ...\n");
+    getsec_senter();
+    {
+        uint64_t ec = txt_read64(TXT_OFF_ERRORCODE);
+        uint64_t sts = txt_read64(TXT_OFF_STS);
+
+        ml_printf("smx: ERRORCODE=0x%llx STS=0x%llx\n",
+                  (unsigned long long)ec, (unsigned long long)sts);
+        if (ec != TXT_ERR_LAUNCH_INCOMPLETE) {
+            fail_msg("SENTER with valid inputs: wrong ERRORCODE", 128);
+        }
+        if (sts & TXT_STS_SENTER_DONE) {
+            fail_msg("SENTER with valid inputs: SENTER_DONE set", 128);
+        }
+        if (ec == TXT_ERR_LAUNCH_INCOMPLETE &&
+            !(sts & TXT_STS_SENTER_DONE)) {
+            ml_printf("PASS: SENTER with valid inputs records "
+                      "0x%llx (launch incomplete, staged)\n",
+                      (unsigned long long)ec);
+        }
+
+    /*
+     * 8. The measurement itself: PCR 17 must have moved off its
+     *    power-on all-ones value to exactly the extend-from-zero of
+     *    the region's hash.  This is the assertion that proves a DRTM
+     *    actually happened -- the ERRORCODE checks above only show
+     *    that SENTER ran.  _TPM_Hash_Start resets the PCR, so an
+     *    all-ones result means the sequence was a silent no-op (which
+     *    is what happens if locality 4 was never applied).
+     */
+    {
+        uint8_t d[32];
+        static const uint8_t all_ones[32] = {
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        };
+
+        if (!pcr17_read(d)) {
+            fail_msg("PCR 17 could not be read back", 256);
+        } else if (pcr17_is(d, all_ones)) {
+            pcr17_print("after SENTER", d);
+            fail_msg("PCR 17 still all-ones: the DRTM hash sequence "
+                     "did not take effect", 256);
+        } else if (!pcr17_is(d, pcr17_expected)) {
+            pcr17_print("after SENTER", d);
+            pcr17_print("expected    ", pcr17_expected);
+            fail_msg("PCR 17 does not match the expected DRTM value", 256);
+        } else {
+            ml_printf("PASS: PCR 17 holds the expected DRTM "
+                      "measurement\n");
+        }
+    }
     }
 
     if (!main_fail) {

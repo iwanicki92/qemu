@@ -32,6 +32,14 @@ typedef struct TPMBackendCmd {
     uint8_t *out;
     uint32_t out_len;
     bool selftest_done;
+    /*
+     * Device-originated command: do not notify the TPM frontend on
+     * completion.  The response bytes went to the device's own
+     * buffer, so running the frontend's request_completed would
+     * corrupt its state machine and raise an interrupt for a
+     * command the guest never sent (hw/i386/intel_txt.c).
+     */
+    bool no_frontend_notify;
 } TPMBackendCmd;
 
 struct TPMBackend {
@@ -80,6 +88,26 @@ struct TPMBackendClass {
     TpmTypeOptions *(*get_tpm_options)(TPMBackend *t);
 
     void (*handle_request)(TPMBackend *s, TPMBackendCmd *cmd, Error **errp);
+
+    /*
+     * Optional: the TIS _TPM_Hash_Start / _TPM_Hash_Data /
+     * _TPM_Hash_End signal sequence, used to establish a DRTM.
+     *
+     * These are *signals*, not TPM commands, so they travel on the
+     * backend's control channel rather than through a TPMBackendCmd.
+     * hash_start resets the DRTM PCRs (17-22) and hash_end extends
+     * PCR 17 with the hash of everything passed to hash_data --
+     * something TPM2_PCR_Reset cannot do at any locality.
+     *
+     * @locty must be the DRTM locality (4).  Passing anything else
+     * makes the whole sequence a silent no-op on at least swtpm: the
+     * commands still succeed but no PCR changes, so callers must not
+     * treat a zero return as proof that a measurement landed.
+     */
+    int (*hash_start)(TPMBackend *t, uint8_t locty, Error **errp);
+    int (*hash_data)(TPMBackend *t, const uint8_t *data, size_t len,
+                     Error **errp);
+    int (*hash_end)(TPMBackend *t, Error **errp);
 };
 
 /**
@@ -208,6 +236,52 @@ void tpm_backend_finish_sync(TPMBackend *s);
  * Returns newly allocated TPMInfo
  */
 TPMInfo *tpm_backend_query_tpm(TPMBackend *s);
+
+/**
+ * tpm_backend_hash_start:
+ * @s: the backend
+ * @locty: the locality to run the sequence at; must be 4 for a DRTM
+ * @errp: a pointer to return the #Error object if an error occurs.
+ *
+ * Assert the TIS _TPM_Hash_Start signal, resetting the DRTM PCRs.
+ * Returns 0 on success, -1 on error (including a backend that does
+ * not implement the hash sequence).
+ */
+int tpm_backend_hash_start(TPMBackend *s, uint8_t locty, Error **errp);
+
+/**
+ * tpm_backend_hash_data:
+ * @s: the backend
+ * @data: the bytes to feed into the running hash
+ * @len: length of @data; the backend chunks it as needed
+ * @errp: a pointer to return the #Error object if an error occurs.
+ *
+ * Feed data into the sequence started by tpm_backend_hash_start().
+ * Returns 0 on success, -1 on error.
+ */
+int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len,
+                          Error **errp);
+
+/**
+ * tpm_backend_hash_end:
+ * @s: the backend
+ * @errp: a pointer to return the #Error object if an error occurs.
+ *
+ * Assert _TPM_Hash_End, completing the sequence and extending PCR 17
+ * with the hash of the data fed in. Returns 0 on success, -1 on error.
+ */
+int tpm_backend_hash_end(TPMBackend *s, Error **errp);
+
+/**
+ * tpm_backend_has_hash_sequence:
+ * @s: the backend
+ *
+ * Whether this backend implements the _TPM_Hash_* sequence at all.
+ * Only the emulator backend does; the passthrough backend cannot,
+ * because the signals are not expressible over the host TPM's
+ * command interface.
+ */
+bool tpm_backend_has_hash_sequence(TPMBackend *s);
 
 TPMBackend *qemu_find_tpm_be(const char *id);
 TPMBackend *qemu_find_tpm_be_any(void);

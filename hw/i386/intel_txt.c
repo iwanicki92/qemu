@@ -28,6 +28,9 @@
 #include "trace.h"
 
 #ifdef CONFIG_TPM
+#include "crypto/hash.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "system/tpm_backend.h"
 #endif
 
@@ -301,7 +304,6 @@ static const MemoryRegionOps intel_txt_public_ops = {
  */
 enum {
     TPM2_ST_SESSIONS   = 0x8002,
-    TPM2_CC_PCR_Reset  = 0x0000013d,
     TPM2_CC_PCR_Extend = 0x00000182,
     TPM2_RS_PW         = 0x40000009, /* password auth session handle */
     TPM2_RC_SUCCESS    = 0x00000000,
@@ -341,12 +343,25 @@ enum {
  */
 #define INTEL_TXT_TPM_BUF_SIZE 4096
 
-/* DRTM PCR range reset by the measured launch (spec step a) */
-#define INTEL_TXT_DRTM_PCR_FIRST 17
-#define INTEL_TXT_DRTM_PCR_LAST  22
-
 /* The DRTM measurements always run at TIS locality 4 (spec step d) */
 #define INTEL_TXT_DRTM_LOCTY 4
+
+/* The DRTM PCR extended with the SINIT ACM hashes (spec step d,
+   first component). */
+#define INTEL_TXT_DRTM_PCR_SINIT 17
+
+/*
+ * The launch inputs must address guest RAM below 4 GiB; this also
+ * bounds the SINIT region read below.
+ */
+#define INTEL_TXT_GUEST_32BIT_LIMIT (1ull << 32)
+
+/*
+ * Max ACM size, in bytes: the value GETSEC[PARAMETERS] reports
+ * (0x8000 in 32-byte units).  Bounds the SINIT region read rather
+ * than allocating whatever the guest asked for.
+ */
+#define INTEL_TXT_MAX_ACM_SIZE 0x8000
 
 /*
  * Fixed password-authorization area appended to both DRTM commands:
@@ -360,15 +375,6 @@ struct tpm2_pw_auth_area {
 } QEMU_PACKED; /* 9 bytes */
 
 /* TPM2_PCR_Reset command: exactly 27 bytes on the wire */
-struct tpm2_cmd_pcr_reset {
-    uint16_t tag;
-    uint32_t cmd_size;
-    uint32_t cmd_code;
-    uint32_t pcr_handle;
-    uint32_t auth_size;
-    struct tpm2_pw_auth_area auth;
-} QEMU_PACKED;
-
 /*
  * TPM2_PCR_Extend command: the fixed header part, followed by the
  * TPML_DIGEST_VALUES entries (2-byte algorithm tag plus the digest
@@ -414,12 +420,16 @@ static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
         return -1;
     }
     /*
-     * A backend with no frontend attached never had tpm_backend_init()
-     * called on it, so TPMBackend::tpmif is NULL and the completion
-     * callback would dereference it (backends/tpm/tpm_backend.c,
-     * tpm_backend_request_completed()).  This cannot be checked at
-     * realize: the TXT device is created during machine init, before
-     * the -device tpm-tis frontend is instantiated.
+     * A backend with no frontend attached can deliver no useful
+     * measurement, so refuse to measure through it.  This is a
+     * configuration sanity check rather than crash avoidance: the
+     * completion callback no longer dereferences a NULL tpmif for
+     * device-originated commands (TPMBackendCmd::no_frontend_notify
+     * skips the frontend notify entirely, see
+     * backends/tpm/tpm_backend.c, tpm_backend_request_completed()).
+     * It cannot be checked at realize: the TXT device is created
+     * during machine init, before the -device tpm-tis frontend is
+     * instantiated.
      */
     if (tpm_find() == NULL) {
         error_setg(errp, "Intel TXT needs a TPM frontend device; "
@@ -445,6 +455,13 @@ static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
         .in_len = cmd_len,
         .out = resp,
         .out_len = resp_size,
+        /*
+         * The response goes to our own buffer, not to a TPM frontend
+         * data buffer: completing it must not run the frontend's
+         * request_completed (state machine corruption, spurious IRQ)
+         * for a command the guest never sent.
+         */
+        .no_frontend_notify = true,
     };
     tpm_backend_deliver_request(s->tpm, &tcmd);
     tpm_backend_finish_sync(s->tpm);
@@ -471,25 +488,6 @@ static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
  * Build the 27-byte TPM2_PCR_Reset command for @pcr (0-based PCR
  * index) into @cmd.
  */
-static void intel_txt_build_pcr_reset(uint8_t *cmd, uint32_t pcr)
-{
-    struct tpm2_cmd_pcr_reset t = {
-        .tag = cpu_to_be16(TPM2_ST_SESSIONS),
-        .cmd_size = cpu_to_be32(sizeof(t)),
-        .cmd_code = cpu_to_be32(TPM2_CC_PCR_Reset),
-        .pcr_handle = cpu_to_be32(pcr),
-        .auth_size = cpu_to_be32(sizeof(t.auth)),
-    };
-
-    t.auth = (struct tpm2_pw_auth_area) {
-        .session_handle = cpu_to_be32(TPM2_RS_PW),
-        .nonce_size = 0,
-        .session_attributes = 0,
-        .hmac_size = 0,
-    };
-    memcpy(cmd, &t, sizeof(t));
-}
-
 /*
  * Build the TPM2_PCR_Extend command for @pcr carrying the @n digests
  * in @digests into @cmd (exactly @cmd_len bytes, as precomputed by
@@ -522,27 +520,6 @@ static void intel_txt_build_pcr_extend(uint8_t *cmd, uint32_t cmd_len,
         memcpy(cmd + off + 2, digests[i].digest, digests[i].len);
         off += 2 + digests[i].len;
     }
-}
-
-/*
- * Reset DRTM PCRs 17-22 at locality 4, one TPM2_PCR_Reset per PCR
- * (spec step a).
- */
-int intel_txt_drtm_reset_pcrs(IntelTxtState *s, Error **errp)
-{
-    for (uint32_t pcr = INTEL_TXT_DRTM_PCR_FIRST;
-         pcr <= INTEL_TXT_DRTM_PCR_LAST; pcr++) {
-        uint8_t cmd[sizeof(struct tpm2_cmd_pcr_reset)];
-        int ret;
-
-        intel_txt_build_pcr_reset(cmd, pcr);
-        trace_txt_drtm_reset_pcr(pcr);
-        ret = intel_txt_tpm_send(s, cmd, sizeof(cmd), errp);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-    return 0;
 }
 
 /*
@@ -581,6 +558,175 @@ int intel_txt_drtm_extend_pcr(IntelTxtState *s, uint32_t pcr,
     ret = intel_txt_tpm_send(s, cmd, cmd_len, errp);
     g_free(cmd);
     return ret;
+}
+
+/*
+ * Staged GETSEC[SENTER] measured launch (see
+ * docs/specs/intel-txt.rst, "Semantic measured launch"): QEMU stands
+ * in for the SINIT ACM.  This slice validates the launch inputs,
+ * performs step a (reset the DRTM PCRs) and the first component of
+ * step d (extend PCR 17 with the SHA-1 and SHA-256 hashes of the
+ * SINIT ACM region), then stops short of the MLE transfer: no
+ * STS.SENTER_DONE, no control transfer, and a defined
+ * "launch incomplete" TXT.ERRORCODE instead of a successful launch.
+ * That staging state is sanctioned by the master plan (a loader
+ * checking ERRORCODE/STS sees a failed launch); see the numbered
+ * deviation in the spec.
+ *
+ * Called from the GETSEC helper (vCPU context, TCG only); the BQL is
+ * taken inside intel_txt_tpm_send() and must not be taken again here.
+ */
+/*
+ * Establish the DRTM over @data with the TIS hash signals at locality
+ * 4 (spec steps a and d).  Unlike the PCR_Extend path this runs
+ * entirely on the backend's control channel: there is no
+ * TPMBackendCmd, so none of the single-slot serialisation of
+ * intel_txt_tpm_send() applies and nothing blocks on aio_poll().  The
+ * BQL is still taken because the control channel is a chardev.
+ */
+static int intel_txt_drtm_hash_measure(IntelTxtState *s, const uint8_t *data,
+                                       size_t len, Error **errp)
+{
+    BQL_LOCK_GUARD();
+
+    if (s->tpm == NULL) {
+        error_setg(errp, "Intel TXT device has no TPM backend");
+        return -1;
+    }
+
+    trace_txt_drtm_hash_start(INTEL_TXT_DRTM_LOCTY, len);
+
+    if (tpm_backend_hash_start(s->tpm, INTEL_TXT_DRTM_LOCTY, errp) < 0) {
+        return -1;
+    }
+    if (tpm_backend_hash_data(s->tpm, data, len, errp) < 0) {
+        return -1;
+    }
+    if (tpm_backend_hash_end(s->tpm, errp) < 0) {
+        return -1;
+    }
+
+    trace_txt_drtm_hash_done(len);
+
+    return 0;
+}
+
+void intel_txt_senter(IntelTxtState *s)
+{
+    uint64_t dpr_size;
+    uint64_t dpr_top;
+    uint8_t *acm = NULL;
+    Error *err = NULL;
+    int ret = 0;
+
+    trace_txt_senter();
+
+    /*
+     * Precondition 2: TXT.SINIT_BASE/SIZE.  Non-zero, the region
+     * entirely below 4 GiB (which also bounds the read below), and
+     * not larger than the max ACM size GETSEC[PARAMETERS] reports.
+     */
+    if (s->sinit_base == 0 || s->sinit_size == 0 ||
+        s->sinit_base >= INTEL_TXT_GUEST_32BIT_LIMIT ||
+        s->sinit_size > INTEL_TXT_GUEST_32BIT_LIMIT - s->sinit_base ||
+        s->sinit_size > INTEL_TXT_MAX_ACM_SIZE) {
+        goto fail_sinit_region;
+    }
+
+    /*
+     * Precondition 2 (continued): the SINIT region must sit
+     * entirely inside the DMA Protected Range.  DPR layout: bit 0
+     * LOCK, bits [11:4] SIZE in 1 MiB blocks, bits [31:20] TOP; the
+     * protected range is [TOP - SIZE*1MiB, TOP).  A zero DPR size
+     * means no protected range, so the check fails.
+     */
+    dpr_size = (s->dpr >> 4) & 0xff;
+    dpr_top = (s->dpr >> 20) & 0xfff;
+    if (dpr_size == 0 ||
+        s->sinit_base < (dpr_top << 20) - dpr_size * 0x100000ull ||
+        s->sinit_base + s->sinit_size > (dpr_top << 20)) {
+        goto fail_sinit_dpr;
+    }
+
+    /*
+     * Precondition 3 (ACM header sanity) is deliberately not checked
+     * here: it needs the synthetic SINIT ACM fixture, which is a
+     * later slice (docs/plans/intel-txt-m3-plan.md section 3.5).
+     *
+     * Precondition 4: TXT.HEAP_BASE/SIZE set, the region below
+     * 4 GiB.  The heap contents are not parsed yet (spec steps c/e).
+     */
+    if (s->heap_base == 0 || s->heap_size == 0 ||
+        s->heap_base >= INTEL_TXT_GUEST_32BIT_LIMIT ||
+        s->heap_size > INTEL_TXT_GUEST_32BIT_LIMIT - s->heap_base) {
+        goto fail_heap;
+    }
+
+    /*
+     * Steps a and d, as one hardware-faithful sequence.
+     *
+     * The DRTM PCRs are established with the TIS _TPM_Hash_Start /
+     * _TPM_Hash_Data / _TPM_Hash_End signals: _TPM_Hash_Start resets
+     * PCRs 17-22 and _TPM_Hash_End extends PCR 17 with the hash of
+     * everything fed in between, in every active bank.  TPM2_PCR_Reset
+     * cannot be used for step a -- it answers TPM_RC_LOCALITY (0x907)
+     * for the DRTM PCRs even at locality 4 -- so this sequence is not
+     * merely more faithful, it is the only mechanism that works.  See
+     * docs/plans/intel-txt-m3-plan.md §3.7.
+     *
+     * The TPM does the hashing here, exactly as on real hardware where
+     * the chipset streams bytes at it rather than presenting a digest.
+     *
+     * This is still only the first component of the eventual PCR 17
+     * value: steps c/e (MLE hash, sinit_mle_data) extend more in later
+     * slices, so it is not final or attestable.  PCR 18 is untouched;
+     * its content is the MLE hash, which needs the heap parsing of
+     * step c.
+     */
+    acm = g_malloc(s->sinit_size);
+    if (address_space_read(&address_space_memory, s->sinit_base,
+                           MEMTXATTRS_UNSPECIFIED, acm,
+                           s->sinit_size) != MEMTX_OK) {
+        error_setg(&err, "cannot read the SINIT ACM region at 0x%" PRIx64,
+                   s->sinit_base);
+        goto fail_measure;
+    }
+
+    ret = intel_txt_drtm_hash_measure(s, acm, s->sinit_size, &err);
+    if (ret < 0) {
+        goto fail_measure;
+    }
+
+    g_free(acm);
+    s->errorcode = TXT_ERRORCODE_LAUNCH_INCOMPLETE;
+    trace_txt_senter_errorcode(s->errorcode);
+    return;
+
+fail_sinit_region:
+    s->errorcode = TXT_ERRORCODE_SINIT_REGION_INVALID;
+    trace_txt_senter_errorcode(s->errorcode);
+    return;
+fail_sinit_dpr:
+    s->errorcode = TXT_ERRORCODE_SINIT_NOT_IN_DPR;
+    trace_txt_senter_errorcode(s->errorcode);
+    return;
+fail_heap:
+    s->errorcode = TXT_ERRORCODE_HEAP_INVALID;
+    trace_txt_senter_errorcode(s->errorcode);
+    return;
+fail_measure:
+    /*
+     * The launch inputs validated but the measurement itself failed
+     * (TPM backend error, in-flight request, ...).  This gets its own
+     * code rather than reusing LAUNCH_INCOMPLETE: sharing one value
+     * makes a rejected measurement look identical to a staged launch
+     * that measured successfully, which is precisely how a broken
+     * PCR_Reset went unnoticed behind a passing test.
+     */
+    error_report_err(err);
+    g_free(acm);
+    s->errorcode = TXT_ERRORCODE_MEASURE_FAILED;
+    trace_txt_senter_errorcode(s->errorcode);
 }
 
 #endif /* CONFIG_TPM */
@@ -657,10 +803,11 @@ static void intel_txt_realize(DeviceState *dev, Error **errp)
      * locality 4 and defeat spec step d.  Refuse rather than measure
      * into the wrong locality.
      */
-    if (tpm_backend_get_type(s->tpm) != TPM_TYPE_EMULATOR) {
+    if (!tpm_backend_has_hash_sequence(s->tpm)) {
         error_setg(errp, "txt=on requires -tpmdev emulator: the DRTM "
-                   "measurements need TPM locality 4, which only the "
-                   "emulator backend applies per command");
+                   "measurements need the TIS _TPM_Hash_* signals and "
+                   "per-command TPM locality 4, which only the emulator "
+                   "backend provides");
         return;
     }
 #endif

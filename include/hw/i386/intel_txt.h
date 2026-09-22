@@ -84,6 +84,49 @@
 #define TXT_DPR_MASK            0xffffffffull
 
 /*
+ * QEMU-specific TXT.ERRORCODE values, in the ACMERROR layout
+ * documented in docs/specs/intel-txt.rst ("TXT.ERRORCODE
+ * (ACMERROR) layout"): bit 31 VALID, bit 30 EXTERNAL (0 = processor
+ * / SINIT), [3:0] TYPE_CODE (1 = SINIT ACM); the reason goes in the
+ * [23:16] PROGRESS_CODE field.  See the table in the spec.
+ */
+#define TXT_ERRORCODE_VALID            BIT_ULL(31)
+#define TXT_ERRORCODE_TYPE_SINIT       BIT_ULL(0)
+
+#define TXT_ERRORCODE_PROGRESS_CODE(n) \
+    (((uint64_t)(n) & 0xff) << 16)
+
+/* SENTER precondition: TXT.SINIT_BASE/SIZE zero, not below 4 GiB,
+   overflowing, or larger than the max ACM size. */
+#define TXT_ERRORCODE_SINIT_REGION_INVALID \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x01))
+/* SENTER precondition: the SINIT region is not entirely inside the
+   DPR range (which is empty when DPR SIZE is zero). */
+#define TXT_ERRORCODE_SINIT_NOT_IN_DPR \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x02))
+/* SENTER precondition: TXT.HEAP_BASE/SIZE zero or not below 4 GiB. */
+#define TXT_ERRORCODE_HEAP_INVALID \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x03))
+/* SENTER: the preconditions passed and the staged measurement was
+   issued, but the launch stopped short of the MLE transfer (see the
+   numbered deviation in docs/specs/intel-txt.rst). */
+#define TXT_ERRORCODE_LAUNCH_INCOMPLETE \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x04))
+/* SENTER: the preconditions passed but the DRTM measurement itself
+   failed (TPM backend error, request already in flight, ...).  This
+   must stay distinct from LAUNCH_INCOMPLETE: sharing one code made a
+   failed measurement indistinguishable from a staged-but-successful
+   one, and a test asserting on it passed while the measurement was
+   in fact rejected with TPM_RC_LOCALITY. */
+#define TXT_ERRORCODE_MEASURE_FAILED \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x05))
+
+/*
  * Placeholder for TXT.PUBLIC_KEY (on real hardware, a hash of
  * Intel's ACM signing public key).  QEMU performs no ACM signature
  * verification, so this is a fixed non-zero marker standing in for
@@ -128,7 +171,6 @@ typedef struct TPMDigestValue {
  * QEMU" step a).  Returns 0 on success, -1 with @errp set
  * otherwise.
  */
-int intel_txt_drtm_reset_pcrs(IntelTxtState *s, Error **errp);
 
 /*
  * Extend PCR @pcr with the @n digests in @digests at TIS locality
@@ -139,6 +181,20 @@ int intel_txt_drtm_reset_pcrs(IntelTxtState *s, Error **errp);
 int intel_txt_drtm_extend_pcr(IntelTxtState *s, uint32_t pcr,
                               const TPMDigestValue *digests, size_t n,
                               Error **errp);
+
+/*
+ * Perform the staged GETSEC[SENTER] measured launch
+ * (docs/specs/intel-txt.rst, "Semantic measured launch"): validate
+ * the launch inputs (TXT.SINIT_BASE/SIZE, DPR cover,
+ * TXT.HEAP_BASE/SIZE), then step a (reset the DRTM PCRs) and the
+ * first component of step d (extend PCR 17 with the SHA-1 and
+ * SHA-256 hashes of the SINIT ACM region).  A precondition failure
+ * records the matching precondition TXT.ERRORCODE and measures
+ * nothing.  The successful path records TXT_ERRORCODE_LAUNCH_
+ * INCOMPLETE instead of transferring to the MLE: STS.SENTER_DONE is
+ * not set in this staging state, and the helper returns normally.
+ */
+void intel_txt_senter(IntelTxtState *s);
 #endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

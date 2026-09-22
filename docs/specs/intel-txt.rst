@@ -162,6 +162,28 @@ recorded; coreboot/tboot parse 0 as "no error"). DRTM PCRs 17-22
 read all-ones before any launch; a successful SENTER resets them
 to zero and extends its measurements.
 
+QEMU-specific TXT.ERRORCODE values (all VALID = 1, EXTERNAL = 0,
+TYPE_CODE = 1 (SINIT ACM); the reason is the PROGRESS_CODE):
+
+  +-------------+------------------------+----------------------------------------------------------------+
+  | Value       | Name                   | Meaning                                                        |
+  +=============+========================+================================================================+
+  | 0x80010001  | SINIT_REGION_INVALID   | TXT.SINIT_BASE/SIZE zero, region not below 4 GiB, overflowing, |
+  |             |                        | or size > max ACM size                                         |
+  +-------------+------------------------+----------------------------------------------------------------+
+  | 0x80020001  | SINIT_NOT_IN_DPR       | SINIT region not entirely inside the (nonzero) DPR range       |
+  +-------------+------------------------+----------------------------------------------------------------+
+  | 0x80030001  | HEAP_INVALID           | TXT.HEAP_BASE/SIZE zero or region not below 4 GiB              |
+  +-------------+------------------------+----------------------------------------------------------------+
+  | 0x80040001  | LAUNCH_INCOMPLETE      | Preconditions passed and the DRTM measurement succeeded, but   |
+  |             |                        | the launch stopped short of the MLE transfer (deviation 7)     |
+  +-------------+------------------------+----------------------------------------------------------------+
+  | 0x80050001  | MEASURE_FAILED         | Preconditions passed but the DRTM measurement itself failed    |
+  |             |                        | (TPM backend error). Distinct from LAUNCH_INCOMPLETE on        |
+  |             |                        | purpose: one shared value made a rejected measurement          |
+  |             |                        | indistinguishable from a staged-but-successful one             |
+  +-------------+------------------------+----------------------------------------------------------------+
+
 TXT private config space
 ========================
 
@@ -388,6 +410,33 @@ h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``; close private
 i. Transfer BSP control to the MLE entry point (see below). APs are
    held in the TXT sleep state until GETSEC[WAKEUP] / MONITOR wake.
 
+Current staged state (deviation 7): the helper implements the
+preconditions plus steps a and d over the SINIT ACM region
+(TXT.SINIT_BASE/SIZE), using the TIS ``_TPM_Hash_Start`` /
+``_TPM_Hash_Data`` / ``_TPM_Hash_End`` signal sequence at locality 4.
+``_TPM_Hash_Start`` resets the DRTM PCRs and ``_TPM_Hash_End`` extends
+PCR 17 with the hash of the region in every active bank, so the TPM
+does the hashing exactly as it does on real hardware.
+
+Note this sequence is the *only* mechanism that works:
+``TPM2_PCR_Reset`` cannot reset PCRs 17-22 even from locality 4 (swtpm
+answers ``TPM_RC_LOCALITY``), because on HW those PCRs respond to the
+signal rather than to a command.  The sequence travels on the TPM
+backend's control channel, so it requires ``-tpmdev emulator``; the
+passthrough backend cannot express it, and ``txt=on`` refuses a
+backend that does not implement it.
+
+The resulting PCR 17 is still only the *first component* of the
+eventual composite; steps c/e extend the remainder (MLE and
+launch-context digests), so it is neither final nor attestable and
+will change when those land.  PCR 18 (the MLE hash) is not extended
+yet.  Instead of steps b-i, SENTER records TXT.ERRORCODE =
+0x80040001 (LAUNCH_INCOMPLETE) and returns normally;
+STS.SENTER_DONE is not set, so a loader seeing ERRORCODE/STS observes
+a failed launch — the staging state the master plan sanctions.  A
+precondition failure records the matching precondition ERRORCODE and
+issues no TPM commands at all.
+
 MLE entry CPU state (BSP), per MLE Dev Guide:
 
 - 32-bit protected mode, paging enabled with the MLE page tables
@@ -448,6 +497,19 @@ Deviations from real hardware
    differ from what a real SINIT would extend (exact per-generation
    digest lists, e.g. for PCR17, are normalized to the MLE guide's
    documented sequence).
+7. SENTER is staged ("semantic measured launch": preconditions +
+   steps a and d over the SINIT region): it does not transfer
+   control to the MLE, does not set STS.SENTER_DONE, and returns
+   normally instead of performing the HW TXT reset.  Both the
+   successful-measurement path and the precondition failures
+   therefore surface as defined TXT.ERRORCODE values (table above)
+   that a loader reading the registers would treat as a failed
+   launch.  This is the master plan's M2/M3 staging state, to be
+   replaced when the MLE entry/transfer slice lands.
+8. The staged SENTER takes the SINIT base/size from the pre-
+   programmed TXT.SINIT_BASE/SIZE registers; it does not latch the
+   GETSEC[SENTER] EBX/ECX operands into them (on HW the chipset
+   latches the operands).
 
 Sources
 =======

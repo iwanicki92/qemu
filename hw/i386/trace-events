@@ -152,6 +152,9 @@ txt_locality_open(int locality) "TXT.CMD_OPEN_LOCALITY%d: locality opened"
 txt_locality_close(int locality) "TXT.CMD_CLOSE_LOCALITY%d: locality closed"
 txt_secrets(bool present) "TXT.CMD_SECRETS/NO_SECRETS: secrets present=%d"
 txt_dpr_locked(uint64_t dpr) "TXT.DPR locked: 0x%"PRIx64
-txt_drtm_reset_pcr(int pcr) "DRTM: TPM2_PCR_Reset(PCR %d) issued at locality 4"
 txt_drtm_extend_pcr(int pcr, int ndigests) "DRTM: TPM2_PCR_Extend(PCR %d) issued at locality 4 with %d digests"
 txt_drtm_tpm_error(uint32_t rc) "DRTM: TPM backend response code 0x%"PRIx32
+txt_senter(void) "GETSEC[SENTER]: staged measured launch entered"
+txt_senter_errorcode(uint64_t code) "GETSEC[SENTER]: TXT.ERRORCODE = 0x%"PRIx64
+txt_drtm_hash_start(int locty, size_t len) "DRTM: _TPM_Hash_Start at locality %d over %zu bytes"
+txt_drtm_hash_done(size_t len) "DRTM: _TPM_Hash_End done, %zu bytes measured"

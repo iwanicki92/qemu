@@ -1,9 +1,11 @@
 /*
  * QEMU Intel TXT (Trusted Execution Technology)
  *
- * GETSEC (SMX) instruction emulation, M2: decode + static semantics.
- * SENTER/SEXIT/WAKEUP/SMCTRL/ENTERACCS/EXITAC are stubs that raise #UD;
- * they are filled in by M3 (semantic measured launch) and M4 (teardown).
+ * GETSEC (SMX) instruction emulation, M2: decode + static semantics;
+ * M3: SENTER is a staged semantic measured launch (see
+ * hw/i386/intel_txt.c, intel_txt_senter()).  SEXIT/WAKEUP/SMCTRL/
+ * ENTERACCS/EXITAC are still stubs that raise #UD; they are filled in
+ * by M4 (teardown).
  *
  * Copyright (c) 2026 Michał Kopeć <michal@nozomi.space>
  *
@@ -17,6 +19,7 @@
 #include "exec/helper-proto.h"
 #include "exec/translation-block.h"
 #include "helper-tcg.h"
+#include "hw/i386/intel_txt.h"
 #include "qemu/bitops.h"
 #include "trace.h"
 
@@ -24,6 +27,7 @@
  * GETSEC leaf numbers (Intel SDM vol. 2, "GETSEC"; tboot smx.h).
  */
 #define GETSEC_LEAF_CAPABILITIES    0
+#define GETSEC_LEAF_SENTER          4
 #define GETSEC_LEAF_PARAMETERS      6
 
 /*
@@ -120,9 +124,27 @@ void helper_getsec(CPUX86State *env)
         env->regs[R_ECX] = ecx;
         break;
     }
+    case GETSEC_LEAF_SENTER:
+        /*
+         * Staged measured launch: the chipset device validates the
+         * launch inputs, issues the DRTM measurement, and stops
+         * short of the MLE transfer with a defined TXT.ERRORCODE
+         * (see docs/specs/intel-txt.rst, deviations).  The
+         * chipset-present check is the CAPABILITIES bit-0 contract.
+         */
+        if (env_archcpu(env)->txt_state == NULL) {
+            trace_getsec_senter_no_chipset();
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+            break;
+        }
+#ifdef CONFIG_TPM
+        trace_getsec_senter();
+        intel_txt_senter(env_archcpu(env)->txt_state);
+#endif
+        break;
     default:
         /*
-         * ENTERACCS, EXITAC, SENTER, SEXIT, SMCTRL and WAKEUP are not
+         * ENTERACCS, EXITAC, SEXIT, SMCTRL and WAKEUP are not
          * implemented yet; report the instruction as undefined so the
          * decode path stays observable in the trace log.
          */

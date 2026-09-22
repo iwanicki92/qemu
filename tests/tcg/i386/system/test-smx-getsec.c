@@ -125,6 +125,7 @@
  */
 #define TXT_ERR_SINIT_REGION_INVALID 0x80010001ULL
 #define TXT_ERR_LAUNCH_INCOMPLETE    0x80040001ULL
+#define TXT_ERR_MEASURE_FAILED       0x80050001ULL
 #define TXT_ERR_ACM_INVALID          0x80060001ULL
 
 /*
@@ -1745,6 +1746,58 @@ int main(void)
         } else {
             ml_printf("PASS: the rebuilt ACM fixture launches and "
                       "re-measures to the same PCR 17\n");
+        }
+    }
+
+    /*
+     * The MLE entry is a linear offset in the image, not a physical
+     * pointer.  Reject both an offset outside the image and a valid
+     * offset whose page table entry is absent.  Restore the header so
+     * the rest of the test is independent of these mutations.
+     */
+    {
+        /*
+         * Guest physical RAM is observed asynchronously by SENTER;
+         * keep the test's page table and header writes observable.
+         */
+        volatile uint32_t *entry = (volatile uint32_t *)(uintptr_t)
+            (TEST_MLE_BASE + TEST_MLE_HDR_OFF + 0x18);
+        /* volatile: SENTER reads this guest page table between writes. */
+        volatile uint64_t *second_pte = (volatile uint64_t *)(uintptr_t)
+            (TEST_MLE_PTAB + 0x2000 + 8);
+        /* volatile: this is the adjacent guest page table entry. */
+        volatile uint64_t *third_pte = second_pte + 1;
+        const uint32_t bad_entries[] = { TEST_MLE_SIZE, 0x1000 };
+        uint32_t i;
+
+        for (i = 0; i < 2; i++) {
+            uint64_t ec;
+
+            if (i == 0) {
+                /*
+                 * Make the out-of-range offset mapped: only the image
+                 * bound must reject it, not a coincidental absent PTE.
+                 */
+                *third_pte = TEST_MLE_BASE | 1;
+            } else {
+                *third_pte = 0;
+                *second_pte = 0;
+            }
+            *entry = bad_entries[i];
+            txt_write64(TXT_OFF_ERRORCODE, 0);
+            getsec_senter();
+            ec = txt_read64(TXT_OFF_ERRORCODE);
+            if (ec != TXT_ERR_MEASURE_FAILED) {
+                ml_printf("smx: invalid MLE entry 0x%x gave ERRORCODE "
+                          "0x%llx\n", bad_entries[i],
+                          (unsigned long long)ec);
+                fail_msg("invalid MLE entry was not rejected", 8192);
+            }
+        }
+        *entry = 0x200;
+        *second_pte = (TEST_MLE_BASE + 0x1000) | 1;
+        if (!main_fail) {
+            ml_printf("PASS: out-of-range and unmapped MLE entries rejected\n");
         }
     }
 

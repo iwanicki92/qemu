@@ -886,8 +886,8 @@ static bool intel_txt_heap_parse(IntelTxtState *s,
 static int intel_txt_measure_mle(IntelTxtState *s, Error **errp)
 {
     uint64_t bios_sz, os_mle_sz, os_sinit_sz, os_sinit;
-    uint64_t ptab, mle_size, hdr_base, hdr_phys;
-    uint32_t version, hdr_len;
+    uint64_t ptab, mle_size, hdr_base, hdr_phys, entry_phys;
+    uint32_t version, hdr_len, entry_off;
     uint8_t uuid[sizeof(intel_txt_mle_uuid)];
     uint8_t *mle = NULL;
     uint8_t *sha1 = NULL, *sha256 = NULL;
@@ -952,7 +952,9 @@ static int intel_txt_measure_mle(IntelTxtState *s, Error **errp)
     if (!intel_txt_mle_xlate(ptab, hdr_base, &hdr_phys, errp) ||
         !intel_txt_gread(hdr_phys + MLE_HDR_OFF_UUID, uuid, sizeof(uuid),
                          errp) ||
-        !intel_txt_gread_u32(hdr_phys + MLE_HDR_OFF_LENGTH, &hdr_len, errp)) {
+        !intel_txt_gread_u32(hdr_phys + MLE_HDR_OFF_LENGTH, &hdr_len, errp) ||
+        !intel_txt_gread_u32(hdr_phys + MLE_HDR_OFF_ENTRY_POINT,
+                             &entry_off, errp)) {
         return -1;
     }
     if (memcmp(uuid, intel_txt_mle_uuid, sizeof(uuid)) != 0) {
@@ -960,9 +962,22 @@ static int intel_txt_measure_mle(IntelTxtState *s, Error **errp)
                    hdr_base);
         return -1;
     }
-    if (hdr_len < MLE_HDR_MIN_SIZE) {
-        error_setg(errp, "MLE header length %u is shorter than the %u byte "
-                   "minimum", hdr_len, MLE_HDR_MIN_SIZE);
+    if (hdr_len < MLE_HDR_MIN_SIZE || hdr_len > mle_size - hdr_base) {
+        error_setg(errp, "MLE header length %u does not fit inside the "
+                   "0x%" PRIx64 " byte image", hdr_len, mle_size);
+        return -1;
+    }
+    if (entry_off >= mle_size ||
+        !intel_txt_mle_xlate(ptab, entry_off, &entry_phys, errp)) {
+        if (entry_off >= mle_size) {
+            error_setg(errp, "MLE entry offset 0x%x is outside the "
+                       "0x%" PRIx64 " byte image", entry_off, mle_size);
+        }
+        return -1;
+    }
+    if (entry_phys >= INTEL_TXT_GUEST_32BIT_LIMIT) {
+        error_setg(errp, "MLE entry address 0x%" PRIx64 " is not below 4 GiB",
+                   entry_phys);
         return -1;
     }
 

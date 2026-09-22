@@ -190,13 +190,42 @@ recorded above. The boot is not a successful TXT launch.
   reset is inconsistent with this consumer and must be checked against the SDM
   before implementing teardown.
 
-Next: implement a firmware-owned q35 TXT initialization path (or an explicit,
-non-firmware QEMU bring-up mode for diagnostic runs): lock and enable
-IA32_FEATURE_CONTROL, reserve/program SINIT and heap regions, fill BIOS Data,
-program DPR, and provide suitable DMAR/VT-d configuration. The generic
-coreboot TXT option cannot simply be enabled for emulation/qemu-q35: it
-requires platform DRAM-clear/reset capabilities and invokes a BIOS ACM that
-QEMU does not emulate. Run the baseline ISO after each gate and record the
-next observed tboot failure. Only then add TXT-scoped VMX capability bits if
-tboot reaches that check. A TXT-enabled Linux kernel and purpose-built
-initramfs remain necessary for full acceptance.
+### q35 coreboot firmware spike (2026-09-23)
+
+The separate coreboot worktree `/home/michal/qemu-txt-work/coreboot-q35-txt`
+(branch `qemu-txt-firmware`, commit `2c1f14972b`) adds an **opt-in first slice**:
+`CONFIG_QEMU_Q35_TXT_FIRMWARE_INIT` locks `IA32_FEATURE_CONTROL` with all SENTER
+localities and the VMX-in-SMX bit, only if the CPU advertises SMX. It does not
+advertise VMX, execute a BIOS ACM, or set up SINIT, heap or DPR. The original
+coreboot checkout has unrelated local changes and was not modified.
+
+The unmodified q35 coreboot/SeaBIOS payload and the opt-in variant both built
+successfully with `coreboot/coreboot-sdk:testing` (image digest
+`sha256:9404e005efe8c29409835327cb3a03de62fee5181d80146a6adadc31ab0aea21`).
+In this isolated git worktree, pass `XGCCPATH=/opt/xgcc/bin`, initialize
+`3rdparty/vboot`, and mount the parent checkout's `.git` read-only at its host
+path in the container so worktree metadata resolves. The existing baseline
+runner accepts a `coreboot.rom` argument and hashes it in its manifest.
+
+The opt-in image printed `QEMU TXT: IA32_FEATURE_CONTROL = 0x0000ff03 (locked)`.
+With the normal `qemu32,smx,sse` CPU it stopped after SeaBIOS's `Press ESC for
+boot menu.` (even with unmodified coreboot and `txt=off`). At timeout the BSP
+was halted at `f000:b983`, IF=1, with PIC IRQ0 pending. Disabling the guest
+APIC capability with `TXT_CPU='qemu32,-apic,smx,sse'` in the local runner
+allowed GRUB and **real tboot** to run (`run-20260923-013829/`); this is an
+interrupt-routing diagnostic workaround, not a validated final platform.
+
+Tboot read back `IA32_FEATURE_CONTROL_MSR: 0000ff03`, reported SMX enabled and
+TXT chipset capabilities present, and then reported **`ERR: CPU does not
+support VMX`**. It also reported zero SINIT base/size and no SINIT ACM before
+falling back to an unmeasured Linux kernel. Thus the firmware MSR gate is
+observably passed, but the boot is **not** a measured-launch pass.
+
+Next: diagnose/fix the coreboot/SeaBIOS virtual-wire/APIC handoff so the normal
+CPU configuration boots. A TXT-scoped VMX CPUID compatibility mode is now
+justified by the actual tboot diagnostic; never enable VMX for all TCG guests.
+Then reserve/program SINIT and heap regions, fill BIOS Data, program DPR and
+verify matching DMAR/VT-d. Generic coreboot TXT cannot simply be enabled for
+q35: it expects platform DRAM-clear/reset features and a BIOS ACM that QEMU
+does not execute. A TXT-enabled Linux kernel and purpose-built initramfs
+remain necessary for full acceptance.

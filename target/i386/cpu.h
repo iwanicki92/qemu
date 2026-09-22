@@ -449,6 +449,14 @@ typedef enum X86Seg {
 #define FEATURE_CONTROL_SGX_LC                    (1ULL << 17)
 #define FEATURE_CONTROL_SGX                       (1ULL << 18)
 #define FEATURE_CONTROL_LMCE                      (1<<20)
+/*
+ * Bits 14:8 enable SENTER's individual functions and bit 15 enables
+ * SENTER globally.  Firmware programs both before setting the lock
+ * bit; tboot calls them SENTER_PARAM_CTL and ENABLE_SENTER and
+ * requires both to be set (tboot/include/msr.h, supports_smx()).
+ */
+#define FEATURE_CONTROL_SENTER_LOCAL_ENABLE       (0x7fULL << 8)
+#define FEATURE_CONTROL_SENTER_GLOBAL_ENABLE      (1ULL << 15)
 
 #define MSR_IA32_SGXLEPUBKEYHASH0       0x8c
 #define MSR_IA32_SGXLEPUBKEYHASH1       0x8d

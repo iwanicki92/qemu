@@ -295,6 +295,45 @@ void helper_wrmsr(CPUX86State *env)
         env->msr_bndcfgs = val;
         cpu_sync_bndcs_hflags(env);
         break;
+    case MSR_IA32_FEATURE_CONTROL: {
+        uint64_t supported;
+
+        /*
+         * The lock bit, the VMX-on bits and the two SENTER enable
+         * fields are what firmware programs.  Everything else is
+         * either reserved or a capability TCG does not implement
+         * (SGX, SGX-LC, LMCE), so it must not be settable: a guest
+         * that reads a bit back would conclude the feature is there.
+         *
+         * The VMX-on bits are accepted even though TCG implements no
+         * VMX.  On hardware they would #GP without CPUID.1.ECX.VMX,
+         * but an SMX-capable CPU without VMX does not exist there, so
+         * there is no faithful behaviour to copy; firmware that
+         * programs this register commonly sets them, and rejecting
+         * them would fault such firmware for a feature it is merely
+         * describing.  Setting them still advertises nothing: the
+         * capability itself is reported through CPUID, which does not
+         * claim VMX.
+         */
+        supported = FEATURE_CONTROL_LOCKED |
+                    FEATURE_CONTROL_VMXON_ENABLED_INSIDE_SMX |
+                    FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX |
+                    FEATURE_CONTROL_SENTER_LOCAL_ENABLE |
+                    FEATURE_CONTROL_SENTER_GLOBAL_ENABLE;
+
+        /*
+         * Once locked the register is read-only and any further
+         * WRMSR raises #GP(0).
+         */
+        if (env->msr_ia32_feature_control & FEATURE_CONTROL_LOCKED) {
+            goto error;
+        }
+        if (val & ~supported) {
+            goto error;
+        }
+        env->msr_ia32_feature_control = val;
+        break;
+    }
     case MSR_APIC_START ... MSR_APIC_END: {
         int ret;
         int index = (uint32_t)env->regs[R_ECX] - MSR_APIC_START;
@@ -465,6 +504,9 @@ void helper_rdmsr(CPUX86State *env)
         break;
     case MSR_IA32_BNDCFGS:
         val = env->msr_bndcfgs;
+        break;
+    case MSR_IA32_FEATURE_CONTROL:
+        val = env->msr_ia32_feature_control;
         break;
      case MSR_IA32_UCODE_REV:
         val = x86_cpu->ucode_rev;

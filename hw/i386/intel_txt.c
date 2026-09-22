@@ -539,7 +539,7 @@ static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
                    "add -device tpm-tis,tpmdev=...");
         return -1;
     }
-    if (s->tpm->cmd != NULL) {
+    if (tpm_backend_request_pending(s->tpm)) {
         error_setg(errp, "a TPM request is already in flight");
         return -1;
     }
@@ -705,7 +705,7 @@ static int intel_txt_drtm_hash_measure(IntelTxtState *s, const uint8_t *data,
      * reset would be undefined.  SENTER is a quiescence point on
      * hardware, so refuse rather than measure into an unclear order.
      */
-    if (s->tpm->cmd != NULL) {
+    if (tpm_backend_request_pending(s->tpm)) {
         error_setg(errp, "a TPM request is already in flight");
         return -1;
     }

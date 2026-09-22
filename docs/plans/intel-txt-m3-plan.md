@@ -379,14 +379,34 @@ Three consequences:
 
 #### Step c work items
 
-- Parse the TXT heap: `os_sinit_data` → `mle_ptab`, the MLE header at
-  `mle_hdr_base` (which must lie inside `[mle_ptab, mle_ptab + mle_size)`,
-  spec precondition 4), then `mle_start_off` / `mle_end_off` /
-  `first_valid_page`.
-- Hash the MLE pages in each active bank and extend PCR 18.
-- Extend the guest test with a PCR 18 assertion mirroring the PCR 17 one.
-- Precondition 4 currently only checks that HEAP_BASE/SIZE are non-zero and
-  below 4 GiB; the structural parsing checks land with this slice.
+> **Landed.** Heap parsing, MLE resolution and the PCR 18 extend are in
+> `hw/i386/intel_txt.c` (`intel_txt_measure_mle`); the guest test builds a
+> real heap, MLE page table and MLE image and asserts PCR 18 against a
+> host-computed expectation.
+
+- Parse the TXT heap: `os_sinit_data` → `mle_ptab`, `mle_size`,
+  `mle_hdr_base`. **Semantics verified against tboot/GRUB sources**
+  (`tboot/txt/txt.c` `build_mle_pagetable` + `init_txt_heap`;
+  `grub-core/loader/slaunch/txt.c` `grub_txt_setup_mle_ptab`):
+  - `mle_ptab` is the *physical* address of a 3-level page table
+    (PDPT→PD→PT, 4 KiB pages) mapping the MLE.
+  - The MLE occupies linear `[0, mle_size)` in that mapping; both
+    loaders build a flat map, but QEMU walks the table rather than
+    assuming flat.
+  - `mle_hdr_base` is a *linear offset* into the MLE (tboot computes
+    `&g_mle_hdr - &_mle_start`, commented "linear addr (offset from
+    MLE base)"), **not** a physical address. The earlier wording "must
+    lie inside `[mle_ptab, mle_ptab + mle_size)`" was wrong and is
+    superseded; the spec was corrected in the same change.
+  - `mle_start_off`/`mle_end_off` in the MLE header are the loader's
+    bookkeeping for deriving `mle_size`; not used for the measurement.
+- Hash the MLE host-side (standing in for the TXT hardware, which on
+  real systems walks the MLE page table and extends PCR 18 itself) in
+  each active bank, ordered after the step-d hash sequence because
+  `_TPM_Hash_Start` zeroes PCR 18 as well.
+- Precondition 4 now performs the structural parse (section sizes, OS
+  SINIT data version ≥ 4, `mle_ptab` aligned/below 4 GiB,
+  `mle_size` page-aligned/≤ 2 MiB, MLE header UUID + length check).
 
 ## 4. Deliberate fidelity gap to document
 QEMU does not gate locality-4 MMIO the way a real chipset does, so a guest can

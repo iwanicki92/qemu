@@ -329,12 +329,26 @@ inputs.
 MLE header
 ==========
 
-Located at ``mle_hdr_base`` inside the MLE image (grub/tboot
-``mle.h``)::
+The MLE occupies linear addresses ``[0, mle_size)`` in the
+address space established by the page table at ``mle_ptab``
+(a *physical* address, below the image); both tboot
+(``txt/txt.c build_mle_pagetable``) and GRUB
+(``loader/slaunch/txt.c grub_txt_setup_mle_ptab``) build a flat
+map, but the table is walked, not assumed. ``mle_hdr_base`` is a
+*linear offset* into that space -- tboot computes it as
+``&g_mle_hdr - &_mle_start`` and comments it "linear addr
+(offset from MLE base)" -- not a physical address. The header
+itself (grub/tboot ``mle.h``)::
 
-  u32  version (0x00020001 = 2.1), u32 entry_point,
-  u32  first_valid_page, mle_start_off, mle_end_off,
-  u32  capabilities (txt_caps_t), cmdline offsets
+  u64  uuid (MLE_HDR_UUID), u32 length, u32 version
+       (0x00020001 = 2.1), u32 entry_point, u32
+       first_valid_page, u32 mle_start_off, u32 mle_end_off,
+  u32  capabilities (txt_caps_t), u32 cmdline_start_off,
+  u32  cmdline_end_off
+
+``mle_start_off``/``mle_end_off`` are the loader's own bookkeeping
+for deriving ``mle_size``; neither SINIT nor QEMU uses them to
+bound the measurement.
 
 ``txt_caps_t`` bits select RLP wake method (GETSEC[WAKEUP] vs
 MONITOR), whether EBX-page-table support is in use, TPM1.2 PCR
@@ -380,18 +394,25 @@ TXT.ERRORCODE + machine reset (as on HW):
    omits (see Deviations 1 and 2). Loaders do not verify the
    signature either, so an unsigned ACM that satisfies the
    structural checks above is accepted by tboot and GRUB.
-4. Heap: HEAP_BASE/SIZE set; bios_data and os_sinit_data parse,
-   versions in range; MLE header at ``mle_hdr_base`` inside
-   ``[mle_ptab, mle_ptab + mle_size)``.
+4. Heap: HEAP_BASE/SIZE set; the size-prefixed sections
+   (bios_data, os_mle_data, os_sinit_data) parse and fit in
+   HEAP_SIZE; os_sinit_data version in range (>= 4); ``mle_ptab``
+   non-zero, page-aligned, below 4 GiB; ``mle_size`` non-zero,
+   page-aligned and at most 2 MiB (one page table); ``mle_hdr_base``
+   leaves room for an MLE header inside ``[0, mle_size)``; the MLE
+   header's UUID matches ``MLE_HDR_UUID`` and its length is at
+   least the header minimum.
 
 Steps performed by QEMU (standing in for SINIT):
 
 a. Reset DRTM PCRs 17-22 (to zero; they read all-ones before any
    launch).
 b. Open private space, set ``STS.private_open``.
-c. Compute MLE hash (SHA-1 for TPM1.2; for TPM2, hash per active
-   bank: SHA-1/SHA-256/...) over the MLE pages indicated by the MLE
-   header (``mle_start_off`` .. ``mle_end_off``, first_valid_page).
+c. Compute the MLE hash (SHA-1 for TPM1.2; for TPM2, per active
+   bank: SHA-1/SHA-256/...) over ``[0, mle_size)`` as mapped by
+   the page table at ``mle_ptab``, and extend PCR 18 with it.
+   Ordered after the step-d hash sequence, because
+   ``_TPM_Hash_Start`` zeroes PCR 18 as well.
 d. Extend at **TIS locality 4** through the TPM backend:
    PCR17 (launch policy / DRTM control digests, MLE guide Table 1),
    PCR18 (MLE hash — SinitMleData.MleHash digest), PCR19 (launch
@@ -411,12 +432,16 @@ i. Transfer BSP control to the MLE entry point (see below). APs are
    held in the TXT sleep state until GETSEC[WAKEUP] / MONITOR wake.
 
 Current staged state (deviation 7): the helper implements the
-preconditions plus steps a and d over the SINIT ACM region
+preconditions plus steps a, c and d over the SINIT ACM region
 (TXT.SINIT_BASE/SIZE), using the TIS ``_TPM_Hash_Start`` /
 ``_TPM_Hash_Data`` / ``_TPM_Hash_End`` signal sequence at locality 4.
 ``_TPM_Hash_Start`` resets the DRTM PCRs and ``_TPM_Hash_End`` extends
 PCR 17 with the hash of the region in every active bank, so the TPM
-does the hashing exactly as it does on real hardware.
+does the hashing exactly as it does on real hardware.  Step c then
+reads the heap, resolves the MLE through its page table, and hashes
+it and extends PCR 18 host-side, standing in for the TXT hardware,
+which on real systems walks the MLE page table and extends PCR 18
+itself (deviation 6).
 
 Note this sequence is the *only* mechanism that works:
 ``TPM2_PCR_Reset`` cannot reset PCRs 17-22 even from locality 4 (swtpm
@@ -498,7 +523,8 @@ Deviations from real hardware
    digest lists, e.g. for PCR17, are normalized to the MLE guide's
    documented sequence).
 7. SENTER is staged ("semantic measured launch": preconditions +
-   steps a and d over the SINIT region): it does not transfer
+   steps a, c and d over the SINIT region and MLE): it does not
+   transfer
    control to the MLE, does not set STS.SENTER_DONE, and returns
    normally instead of performing the HW TXT reset.  Both the
    successful-measurement path and the precondition failures

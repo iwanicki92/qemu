@@ -173,6 +173,50 @@ static void txt_test_secrets(void)
     g_assert_cmphex(txt_read(TXT_E2STS) & TXT_E2STS_SECRET_STS, ==, 0);
 }
 
+/*
+ * The heap preconditions of the sinit_mle_data writer (see
+ * intel_txt.c, intel_txt_write_sinit_mle_data): the heap registers
+ * are set with the whole heap below 4 GiB, and the four size-
+ * prefixed sections are laid out so the sinit_mle_data section, its
+ * size prefix included, fits in the heap.
+ *
+ * The writer itself is not reachable from qtest until it is wired
+ * into the SENTER path: GETSEC is a guest instruction, so the
+ * written structure can only be checked from the guest-side launch
+ * test.  This pins the precondition state that test relies on.
+ */
+#define TXT_TEST_HEAP_BASE    0x3ab000
+#define TXT_TEST_HEAP_SIZE    0xf0000
+#define TXT_TEST_SEC_SIZE     0x1000
+
+static void txt_test_sinit_mle_data(void)
+{
+    uint64_t off;
+
+    txt_write(TXT_HEAP_BASE, TXT_TEST_HEAP_BASE);
+    txt_write(TXT_HEAP_SIZE, TXT_TEST_HEAP_SIZE);
+    g_assert_cmpuint(txt_read(TXT_HEAP_BASE), ==, TXT_TEST_HEAP_BASE);
+    g_assert_cmpuint(txt_read(TXT_HEAP_SIZE), ==, TXT_TEST_HEAP_SIZE);
+    /* the writer's offset arithmetic requires the heap below 4 GiB */
+    g_assert_cmphex(TXT_TEST_HEAP_BASE + TXT_TEST_HEAP_SIZE, <=,
+                    1ULL << 32);
+
+    /* four size-prefixed sections, one page each */
+    for (off = 0; off < 4 * TXT_TEST_SEC_SIZE; off += TXT_TEST_SEC_SIZE) {
+        writeq(TXT_TEST_HEAP_BASE + off, TXT_TEST_SEC_SIZE);
+        g_assert_cmpuint(readq(TXT_TEST_HEAP_BASE + off),
+                         ==, TXT_TEST_SEC_SIZE);
+    }
+
+    /*
+     * The sinit_mle_data section starts after the first three, and
+     * the whole section (its size prefix included) fits in the heap;
+     * one page also leaves room for the 144 byte fixed structure plus
+     * the MDR array.
+     */
+    g_assert_cmphex(4 * TXT_TEST_SEC_SIZE, <=, TXT_TEST_HEAP_SIZE);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -218,6 +262,7 @@ int main(int argc, char **argv)
     qtest_add_func("/txt/test_capabilities", txt_test_capabilities);
     qtest_add_func("/txt/test_spad_errorcode", txt_test_spad_errorcode);
     qtest_add_func("/txt/test_public_key", txt_test_public_key);
+    qtest_add_func("/txt/test_sinit_mle_data", txt_test_sinit_mle_data);
     /*
      * Registered last: requests a machine reset as a side effect of
      * testing the ESTS write-one-to-clear path.

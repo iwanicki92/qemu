@@ -124,6 +124,14 @@ void helper_getsec(CPUX86State *env)
         env->regs[R_ECX] = ecx;
         break;
     }
+#ifndef CONFIG_USER_ONLY
+    /*
+     * The chipset device this leaf drives (hw/i386/intel_txt.c) is
+     * only linked into the system emulator, so the case is compiled
+     * out for linux-user.  Nothing is lost: user mode always runs at
+     * CPL 3, so the CPL check above has already raised #GP(0) and
+     * this leaf is unreachable there.
+     */
     case GETSEC_LEAF_SENTER:
         /*
          * Staged measured launch: the chipset device validates the
@@ -142,6 +150,7 @@ void helper_getsec(CPUX86State *env)
         intel_txt_senter(env_archcpu(env)->txt_state);
 #endif
         break;
+#endif /* !CONFIG_USER_ONLY */
     default:
         /*
          * ENTERACCS, EXITAC, SEXIT, SMCTRL and WAKEUP are not

@@ -77,9 +77,13 @@ _start:
         call main
 
 _exit:	/* output any non-zero result in eax to isa-debug-exit device */
-        test %al, %al
+        test %eax, %eax
         jz 1f
-        out %ax, $0xf4
+        out %eax, $0xf4
+        /* Let QEMU process the requested failure shutdown.  An immediate
+         * ACPI poweroff would replace its non-zero exit code with zero. */
+2:      hlt
+        jmp 2b
 
 1:      /* QEMU ACPI poweroff */
         mov $0x604,%edx

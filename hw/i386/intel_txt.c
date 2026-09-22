@@ -1045,8 +1045,7 @@ static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
      * chipset at all: one entry must match TXT.DIDVID.
      */
     id_list_off = ldl_le_p(info + ACM_INFO_OFF_CHIPSET_ID_LIST);
-    if (id_list_off < info_off ||
-        (uint64_t)id_list_off + ACM_CHIPSET_ID_LIST_HDR_SIZE > size) {
+    if ((uint64_t)id_list_off + ACM_CHIPSET_ID_LIST_HDR_SIZE > size) {
         error_setg(errp, "ACM chipset id list offset 0x%x is outside the "
                    "0x%" PRIx64 " byte module", id_list_off, size);
         return -1;

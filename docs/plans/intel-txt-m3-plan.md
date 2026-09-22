@@ -536,3 +536,4 @@ guarantee is asserted by the TCG test (step 11, §5).
 - Code: `hw/tpm/tpm_tis.h:30`, `backends/tpm/tpm_emulator.c:230,269`,
   `backends/tpm/tpm_backend.c` (deliver/finish_sync), `hw/tpm/tpm_crb.c:247,350`
 - Intel TXT MLE Software Development Guide 315168-017 §1.9 (DRTM PCR digests)
+follow-up fix (one line) applied: id_list_off < info_off removed

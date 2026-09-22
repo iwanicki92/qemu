@@ -420,7 +420,10 @@ existing caveat that PCR values are not valid for remote attestation.
 - **qtest** (`tests/qtest/txt-test.c`): with a real `tpmdev emulator` backend,
   drive SENTER's measurement step and read PCR 17/18 back at locality 0;
   assert they moved off the pre-launch all-ones value and match digests
-  computed in the test. Extends the existing M1 txt-test.
+  computed in the test. **Closed by the guest TCG test instead**
+  (test-smx-getsec): it reads PCR 17/18 back through the real TPM at
+  locality 0 and asserts the exact SHA-256 digests host-side, which is
+  stronger than the qtest version of this item.
 - **Locality enforcement**: `TPM2_PCR_Reset(17)` must fail from locality 0 and
   succeed from locality 4 — this is the property the whole design rests on, so
   assert it directly rather than assuming it.

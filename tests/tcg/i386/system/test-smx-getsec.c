@@ -1116,6 +1116,8 @@ static void setup_mle(void)
         (volatile uint64_t *)(uintptr_t)(TEST_MLE_PTAB + 0x1000);
     volatile uint64_t *pt =
         (volatile uint64_t *)(uintptr_t)(TEST_MLE_PTAB + 0x2000);
+    /* volatile: SENTER consumes this guest page table outside C. */
+    volatile uint64_t *entry_pt = pt + 0x1000 / sizeof(*pt);
     volatile uint8_t *heap = (volatile uint8_t *)(uintptr_t)TEST_HEAP_BASE;
     volatile uint64_t *os_sinit;
     volatile uint32_t *hdr;
@@ -1142,16 +1144,26 @@ static void setup_mle(void)
     hdr[7] = 0;                  /* cmdline_start_off */
     hdr[8] = 0;                  /* cmdline_end_off */
 
-    /* Flat mapping: linear 0 -> TEST_MLE_BASE.  Present bit only. */
+    /*
+     * Measurement uses linear offsets starting at zero.  On SENTER
+     * the BSP's EIP is the resolved physical entry address, however,
+     * so it also needs an identity mapping to fetch those same bytes
+     * with paging enabled.  The second PT covers TEST_MLE_BASE.
+     */
     for (i = 0; i < 0x200; i++) {
         pdpt[i] = 0;
         pd[i] = 0;
         pt[i] = 0;
+        entry_pt[i] = 0;
     }
     pdpt[0] = (TEST_MLE_PTAB + 0x1000) | 1;
     pd[0] = (TEST_MLE_PTAB + 0x2000) | 1;
+    pd[TEST_MLE_BASE >> 21] = (TEST_MLE_PTAB + 0x3000) | 1;
     for (i = 0; i < (uint32_t)(TEST_MLE_SIZE / 0x1000); i++) {
-        pt[i] = (TEST_MLE_BASE + (uint64_t)i * 0x1000) | 1;
+        uint64_t phys = TEST_MLE_BASE + (uint64_t)i * 0x1000;
+
+        pt[i] = phys | 1;
+        entry_pt[(phys >> 12) & 0x1ff] = phys | 1;
     }
 
     /* Heap sections. */

@@ -106,6 +106,7 @@
  */
 #define TXT_ERR_SINIT_REGION_INVALID 0x80010001ULL
 #define TXT_ERR_LAUNCH_INCOMPLETE    0x80040001ULL
+#define TXT_ERR_ACM_INVALID          0x80060001ULL
 
 /*
  * Launch inputs for the SENTER cases: an 8 KiB SINIT ACM region at
@@ -126,6 +127,37 @@
 #define TEST_MLE_SIZE          0x2000ULL
 #define TEST_MLE_HDR_OFF       0x100ULL
 #define TEST_HEAP_SIZE         0x1000ULL
+
+/*
+ * Offsets inside the synthetic SINIT ACM fixture (see setup_acm()).
+ * Header offsets are from tboot's acm_hdr_t, the info table from
+ * acm_info_table_t, the chipset id list from acm_chipset_id_list_t.
+ */
+#define ACM_OFF_MODULE_TYPE     0x00   /* u16 */
+#define ACM_OFF_MODULE_SUBTYPE  0x02   /* u16 */
+#define ACM_OFF_HEADER_LEN      0x04   /* u32, dwords */
+#define ACM_OFF_MODULE_VENDOR   0x10   /* u32 */
+#define ACM_OFF_SIZE            0x18   /* u32, dwords */
+#define ACM_OFF_ENTRY_POINT     0x34   /* u32 */
+#define ACM_OFF_SCRATCH_SIZE    0x7c   /* u32, dwords */
+#define ACM_HEADER_LEN          161    /* dwords */
+#define ACM_SCRATCH_SIZE        143    /* dwords */
+/* (header_len + scratch_size) * 4 */
+#define ACM_INFO_OFF            0x4c0
+#define ACM_INFO_OFF_TYPE       (ACM_INFO_OFF + 0x10)  /* u8 */
+#define ACM_INFO_OFF_VERSION    (ACM_INFO_OFF + 0x11)  /* u8 */
+#define ACM_INFO_OFF_LENGTH     (ACM_INFO_OFF + 0x12)  /* u16 */
+#define ACM_INFO_OFF_ID_LIST    (ACM_INFO_OFF + 0x14)  /* u32 */
+#define ACM_ID_LIST_OFF         0x500
+#define ACM_ID_OFF_FLAGS        (ACM_ID_LIST_OFF + 0x04)  /* u32 */
+#define ACM_ID_OFF_VENDOR       (ACM_ID_LIST_OFF + 0x08)  /* u16 */
+#define ACM_ID_OFF_DEVICE       (ACM_ID_LIST_OFF + 0x0a)  /* u16 */
+#define ACM_ID_OFF_REVISION     (ACM_ID_LIST_OFF + 0x0c)  /* u16 */
+
+/* The chipset the fixture claims to be for: TXT.DIDVID's default. */
+#define ACM_CHIPSET_VENDOR      0x8086
+#define ACM_CHIPSET_DEVICE      0x29c0
+#define ACM_CHIPSET_REVISION    0x0000
 #define TEST_DPR               (TXT_DPR_TOP(0x1000000) | TXT_DPR_SIZE(2) | \
                                  TXT_DPR_LOCK)
 
@@ -524,25 +556,40 @@ static uint8_t tpm2_pcrread_cmd[20] = {
 
 /*
  * Expected PCR 17 (SHA-256 bank) once the DRTM has been established
- * over the SINIT region, which main() fills with acm[i] = (uint8_t)i.
- * The region is deliberately 8 KiB so the measurement spans more than
- * one PTM_HASH_DATA chunk (the control message carries at most 4096
- * bytes), exercising the backend's chunk loop.
+ * over the SINIT region, which setup_acm() fills with the synthetic
+ * ACM fixture.  The region is deliberately 8 KiB so the measurement
+ * spans more than one PTM_HASH_DATA chunk (the control message
+ * carries at most 4096 bytes), exercising the backend's chunk loop.
  *
  * _TPM_Hash_Start resets the PCR to zero and _TPM_Hash_End extends it
  * with the hash of the data, so the value is
  *
  *   SHA256( 0x00 * 32 || SHA256(region) )
  *
- * Reproduce with:
- *   python3 -c 'import hashlib;p=bytes(i&0xff for i in range(0x2000));\
- *     print(hashlib.sha256(bytes(32)+hashlib.sha256(p).digest()).hexdigest())'
+ * Reproduce with (mirroring setup_acm()):
+ *   python3 - <<'EOF'
+ *   import hashlib, struct
+ *   b = bytearray(i & 0xff for i in range(0x2000))
+ *   def w16(o, v): b[o:o+2] = struct.pack('<H', v)
+ *   def w32(o, v): b[o:o+4] = struct.pack('<I', v)
+ *   w16(0x00, 2); w16(0x02, 0); w32(0x04, 161); w32(0x10, 0x8086)
+ *   w32(0x18, 0x800); w32(0x34, 0x1000); w32(0x7c, 143)
+ *   b[0x4c0:0x4f0] = bytes(0x30)
+ *   b[0x4c0:0x4d0] = bytes([0xaa,0x3a,0xc0,0x7f,0xa7,0x46,0xdb,0x18,
+ *                           0x2e,0xac,0x69,0x8f,0x8d,0x41,0x7f,0x5a])
+ *   b[0x4d0] = 1; b[0x4d1] = 4; w16(0x4d2, 0x30); w32(0x4d4, 0x500)
+ *   b[0x500:0x514] = bytes(0x14)
+ *   w32(0x500, 1); w32(0x504, 0)
+ *   w16(0x508, 0x8086); w16(0x50a, 0x29c0); w16(0x50c, 0)
+ *   print(hashlib.sha256(bytes(32) +
+ *         hashlib.sha256(bytes(b)).digest()).hexdigest())
+ *   EOF
  */
 static const uint8_t pcr17_expected[32] = {
-    0x1e, 0x8a, 0xc4, 0x3b, 0xa2, 0x02, 0xd1, 0x11,
-    0x99, 0xcf, 0x22, 0xa2, 0x8c, 0xc7, 0x6b, 0xa7,
-    0x90, 0xef, 0xa3, 0xa2, 0xe0, 0x5e, 0xfe, 0xe7,
-    0x3b, 0x5e, 0x6c, 0xc4, 0xd7, 0x89, 0xc7, 0x41,
+    0xbc, 0xb4, 0x68, 0xd7, 0x25, 0xbe, 0x14, 0xa6,
+    0x53, 0xd4, 0xba, 0xc3, 0xfe, 0x2a, 0xf0, 0x9e,
+    0x6c, 0x18, 0xb6, 0x34, 0xe6, 0x28, 0x75, 0xf7,
+    0x38, 0x4c, 0x00, 0xcd, 0x05, 0xb7, 0x3a, 0x8d,
 };
 
 /*
@@ -629,6 +676,144 @@ static uint32_t tis_transmit(uint32_t tis_base, const uint8_t *cmd,
     tis_writeb_at(tis_base + TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
 
     return bcount;
+}
+
+/* ACM_UUID_V3 (tboot tboot/include/txt/acmod.h) in wire order. */
+static const uint8_t acm_uuid[16] = {
+    0xaa, 0x3a, 0xc0, 0x7f, 0xa7, 0x46, 0xdb, 0x18,
+    0x2e, 0xac, 0x69, 0x8f, 0x8d, 0x41, 0x7f, 0x5a,
+};
+
+/*
+ * Fixture stores go through volatile pointers: the bytes land in
+ * guest RAM that the TXT device reads back during SENTER, not in
+ * anything this program reads, so the compiler must not elide or
+ * reorder them.  setup_mle() writes its inputs the same way.
+ */
+static void acm_write16(uint32_t off, uint16_t val)
+{
+    /* Volatile: a store into guest RAM the device reads. */
+    *(volatile uint16_t *)(uintptr_t)(TEST_SINIT_BASE + off) = val;
+}
+
+static void acm_write32(uint32_t off, uint32_t val)
+{
+    /* Volatile: a store into guest RAM the device reads. */
+    *(volatile uint32_t *)(uintptr_t)(TEST_SINIT_BASE + off) = val;
+}
+
+/*
+ * Build the synthetic SINIT ACM fixture the device's precondition-3
+ * validation accepts: a chipset ACM of subtype SINIT from Intel,
+ * whose info table carries the ACM UUID and points at a chipset id
+ * list covering TXT.DIDVID.
+ *
+ * The body is the byte pattern acm[i] = (uint8_t)i with the header,
+ * info table and id list written over it, so the measurement still
+ * covers 8 KiB of varied content (two PTM_HASH_DATA chunks) and the
+ * expected PCR 17 digest below stays reproducible.
+ */
+static void setup_acm(void)
+{
+    /* Volatile for the same reason as the acm_write*() helpers. */
+    volatile uint8_t *acm = (volatile uint8_t *)(uintptr_t)TEST_SINIT_BASE;
+    uint32_t i;
+
+    for (i = 0; i < (uint32_t)TEST_SINIT_SIZE; i++) {
+        acm[i] = (uint8_t)i;
+    }
+
+    acm_write16(ACM_OFF_MODULE_TYPE, 0x0002);     /* chipset ACM */
+    acm_write16(ACM_OFF_MODULE_SUBTYPE, 0x0000);  /* SINIT, not reset */
+    acm_write32(ACM_OFF_HEADER_LEN, ACM_HEADER_LEN);
+    acm_write32(ACM_OFF_MODULE_VENDOR, 0x8086);
+    acm_write32(ACM_OFF_SIZE, (uint32_t)TEST_SINIT_SIZE / 4);
+    acm_write32(ACM_OFF_ENTRY_POINT, 0x1000);
+    acm_write32(ACM_OFF_SCRATCH_SIZE, ACM_SCRATCH_SIZE);
+
+    /* Info table at (header_len + scratch_size) * 4. */
+    for (i = 0; i < 0x30; i++) {
+        acm[ACM_INFO_OFF + i] = 0;
+    }
+    for (i = 0; i < 16; i++) {
+        acm[ACM_INFO_OFF + i] = acm_uuid[i];
+    }
+    acm[ACM_INFO_OFF_TYPE] = 0x01;                /* SINIT ACM */
+    acm[ACM_INFO_OFF_VERSION] = 4;
+    acm_write16(ACM_INFO_OFF_LENGTH, 0x30);
+    acm_write32(ACM_INFO_OFF_ID_LIST, ACM_ID_LIST_OFF);
+
+    /* One chipset id entry, matching TXT.DIDVID exactly (flags = 0). */
+    for (i = 0; i < 0x14; i++) {
+        acm[ACM_ID_LIST_OFF + i] = 0;
+    }
+    acm_write32(ACM_ID_LIST_OFF, 1);              /* count */
+    acm_write32(ACM_ID_OFF_FLAGS, 0);
+    acm_write16(ACM_ID_OFF_VENDOR, ACM_CHIPSET_VENDOR);
+    acm_write16(ACM_ID_OFF_DEVICE, ACM_CHIPSET_DEVICE);
+    acm_write16(ACM_ID_OFF_REVISION, ACM_CHIPSET_REVISION);
+}
+
+/*
+ * One §3.5 mutation: corrupt @width bytes of the fixture at @off with
+ * @val.  @width 0 is the special case "leave the ACM alone and write
+ * @val to TXT.SINIT_SIZE instead", which reaches the two size checks
+ * that compare the register against the header.
+ */
+struct acm_mutation {
+    const char *name;
+    uint32_t off;
+    uint8_t width;
+    uint32_t val;
+};
+
+static const struct acm_mutation acm_mutations[] = {
+    { "module_type not a chipset ACM", ACM_OFF_MODULE_TYPE, 2, 0x0003 },
+    { "module_subtype is a reset ACM", ACM_OFF_MODULE_SUBTYPE, 2, 0x0001 },
+    { "module_vendor not Intel", ACM_OFF_MODULE_VENDOR, 4, 0x1022 },
+    { "header size field disagrees with SINIT_SIZE", ACM_OFF_SIZE, 4,
+      0x400 },
+    { "entry_point past the end of the module", ACM_OFF_ENTRY_POINT, 4,
+      0x2000 },
+    { "entry_point zero", ACM_OFF_ENTRY_POINT, 4, 0 },
+    { "header_len puts the info table out of bounds", ACM_OFF_HEADER_LEN,
+      4, 0x40000 },
+    { "scratch_size puts the info table out of bounds",
+      ACM_OFF_SCRATCH_SIZE, 4, 0x40000 },
+    { "info table UUID corrupted", ACM_INFO_OFF, 1, 0x00 },
+    { "chipset_acm_type is BIOS, not SINIT", ACM_INFO_OFF_TYPE, 1, 0x00 },
+    { "info table version below the minimum", ACM_INFO_OFF_VERSION, 1, 2 },
+    { "chipset id list out of bounds", ACM_INFO_OFF_ID_LIST, 4, 0x2000 },
+    { "chipset id list empty", ACM_ID_LIST_OFF, 4, 0 },
+    { "chipset id vendor does not match DIDVID", ACM_ID_OFF_VENDOR, 2,
+      0x1234 },
+    { "chipset id device does not match DIDVID", ACM_ID_OFF_DEVICE, 2,
+      0x1234 },
+    { "chipset id revision does not match DIDVID", ACM_ID_OFF_REVISION, 2,
+      0x0003 },
+    { "chipset id revision mask matches nothing", ACM_ID_OFF_FLAGS, 4, 1 },
+    { "SINIT_SIZE not a multiple of 64", 0, 0, 0x2008 },
+    { "SINIT_SIZE disagrees with the header size field", 0, 0, 0x1000 },
+};
+
+static void acm_mutate(const struct acm_mutation *m)
+{
+    switch (m->width) {
+    case 0:
+        txt_write64(TXT_OFF_SINIT_SIZE, m->val);
+        break;
+    case 1:
+        /* Volatile: a store into guest RAM the device reads. */
+        *(volatile uint8_t *)(uintptr_t)(TEST_SINIT_BASE + m->off) =
+            (uint8_t)m->val;
+        break;
+    case 2:
+        acm_write16(m->off, (uint16_t)m->val);
+        break;
+    default:
+        acm_write32(m->off, m->val);
+        break;
+    }
 }
 
 /*
@@ -865,7 +1050,6 @@ int main(void)
     uint32_t eax = 0, ebx = 0, ecx = 0;
     uint32_t type;
     int index;
-    int i;
 
     ml_printf("smx: start\n");
     idt_install();
@@ -1027,19 +1211,17 @@ int main(void)
      *    0x1000000) (TOP 0x1000000, 2 MiB blocks, locked -- DPR is
      *    write-once, so this is the one chance), the 4 KiB SINIT
      *    ACM region at 0xE10000 (inside the DPR), and the 4 KiB heap
-     *    at 0xE11000.  Give the SINIT region deterministic content.
+     *    at 0xE11000.  The SINIT region gets the synthetic ACM
+     *    fixture, which precondition 3 must accept.
      */
     {
-        volatile uint8_t *acm = (volatile uint8_t *)TEST_SINIT_BASE;
-
+        setup_acm();
+        ml_printf("smx: synthetic SINIT ACM built\n");
         setup_mle();
 
         txt_write64(TXT_OFF_DPR, TEST_DPR);
         if (txt_read64(TXT_OFF_DPR) != TEST_DPR) {
             fail_msg("DPR readback mismatch after programming", 64);
-        }
-        for (i = 0; i < (int)TEST_SINIT_SIZE; i++) {
-            acm[i] = (uint8_t)i;
         }
         txt_write64(TXT_OFF_SINIT_BASE, TEST_SINIT_BASE);
         txt_write64(TXT_OFF_SINIT_SIZE, TEST_SINIT_SIZE);
@@ -1217,6 +1399,73 @@ int main(void)
         } else {
             ml_printf("PASS: TPM2_PCR_Extend(7) at locality 0 accepted "
                       "(control)\n");
+        }
+    }
+
+    /*
+     * 12. ACM validation (spec precondition 3): each mutation of the
+     *     fixture must be rejected with TXT_ERR_ACM_INVALID and must
+     *     measure nothing.  The fixture is rebuilt after every case,
+     *     so a mutation that somehow passed cannot poison the next
+     *     one, and the recovery SENTER at the end proves the rebuilt
+     *     fixture is still accepted -- without it a validator that
+     *     rejected everything would pass this whole step.
+     */
+    {
+        uint32_t n = sizeof(acm_mutations) / sizeof(acm_mutations[0]);
+        uint32_t m;
+        uint32_t bad = 0;
+
+        for (m = 0; m < n; m++) {
+            uint64_t ec;
+
+            acm_mutate(&acm_mutations[m]);
+            txt_write64(TXT_OFF_ERRORCODE, 0);
+            getsec_senter();
+            ec = txt_read64(TXT_OFF_ERRORCODE);
+
+            if (ec != TXT_ERR_ACM_INVALID) {
+                ml_printf("smx: ACM mutation \"%s\" gave ERRORCODE "
+                          "0x%llx\n", acm_mutations[m].name,
+                          (unsigned long long)ec);
+                bad++;
+            }
+
+            setup_acm();
+            txt_write64(TXT_OFF_SINIT_SIZE, TEST_SINIT_SIZE);
+        }
+
+        if (bad) {
+            fail_msg("ACM mutations were not all rejected with "
+                     "ACM_INVALID", 2048);
+        } else {
+            ml_printf("PASS: all %u ACM mutations rejected with 0x%llx\n",
+                      n, (unsigned long long)TXT_ERR_ACM_INVALID);
+        }
+    }
+
+    /*
+     * 13. Recovery: the rebuilt fixture must still launch, and the
+     *     re-run measurement must land on the same PCR 17 value --
+     *     the mutations measured nothing, so nothing drifted.
+     */
+    txt_write64(TXT_OFF_ERRORCODE, 0);
+    getsec_senter();
+    {
+        uint64_t ec = txt_read64(TXT_OFF_ERRORCODE);
+        uint8_t d[32];
+
+        if (ec != TXT_ERR_LAUNCH_INCOMPLETE) {
+            ml_printf("smx: ERRORCODE=0x%llx\n", (unsigned long long)ec);
+            fail_msg("the rebuilt ACM fixture was not accepted", 4096);
+        } else if (!pcr_read(17, d)) {
+            fail_msg("PCR 17 could not be read back after recovery", 4096);
+        } else if (!pcr_is(d, pcr17_expected)) {
+            pcr_print("17 after recovery", d);
+            fail_msg("PCR 17 changed across the ACM mutation cases", 4096);
+        } else {
+            ml_printf("PASS: the rebuilt ACM fixture launches and "
+                      "re-measures to the same PCR 17\n");
         }
     }
 

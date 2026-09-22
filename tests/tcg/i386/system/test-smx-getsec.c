@@ -50,6 +50,25 @@
 #define GETSEC_LEAF_SENTER       4
 #define GETSEC_LEAF_PARAMETERS   6
 
+/*
+ * IA32_FEATURE_CONTROL (MSR 0x3a) bits used by the step 15
+ * assertions.  The values mirror the FEATURE_CONTROL_* defines in
+ * target/i386/cpu.h, restated here because this binary links no
+ * QEMU headers.
+ */
+#define MSR_IA32_FEATURE_CONTROL 0x3a
+#define FC_LOCKED            (1U << 0)
+#define FC_VMXON_IN_SMX      (1U << 1)
+/*
+ * The two SENTER enable fields together: bits 14:8 enable the
+ * individual functions and bit 15 enables SENTER globally (tboot:
+ * SENTER_PARAM_CTL | ENABLE_SENTER).
+ */
+#define FC_SENTER_ENABLE     0x0000ff00U
+#define FC_RESERVED_BIT3     (1U << 3)
+#define FC_RESERVED_BIT16    (1U << 16)
+#define FC_SGX               (1U << 18)
+
 /* GETSEC[CAPABILITIES] leaf bitmap bits. */
 #define GETSEC_CAP_CHIPSET_PRESENT (1U << 0)
 #define GETSEC_CAP_EXITAC          (1U << 3)
@@ -302,6 +321,23 @@ static void getsec_senter(void)
     asm volatile(".byte 0x0f, 0x37"
                  :
                  : "a"(GETSEC_LEAF_SENTER));
+}
+
+static uint64_t msr_read64(uint32_t index)
+{
+    uint32_t eax, edx;
+
+    asm volatile("rdmsr" : "=a"(eax), "=d"(edx) : "c"(index));
+    return ((uint64_t)edx << 32) | (uint64_t)eax;
+}
+
+static void msr_write32(uint32_t index, uint32_t val)
+{
+    /*
+     * The high 32 bits are always zero: the bits asserted here all
+     * live in the low half of the register.
+     */
+    asm volatile("wrmsr" :: "a"(val), "d"((uint32_t)0), "c"(index));
 }
 
 /*
@@ -1741,6 +1777,162 @@ int main(void)
         } else {
             ml_printf("PASS: GETSEC at CPL3 with CR4.SMXE=0 raises #UD, "
                       "not #GP\n");
+        }
+    }
+
+    /*
+     * 15. IA32_FEATURE_CONTROL (MSR 0x3a): the register the TXT
+     *     firmware programs and locks.  Check the lifecycle: the
+     *     reset value, unlocked write/readback of the SENTER and
+     *     VMX-on bits, #GP(0) for writes of bits the platform does
+     *     not support, and #GP(0) for every write after the lock bit
+     *     is set while reads keep returning the locked value.  Both
+     *     RDMSR (0F 32) and WRMSR (0F 30) are 2-byte encodings, so
+     *     the #GP gate's EIP step applies unchanged.
+     */
+    {
+        uint32_t unlocked = FC_SENTER_ENABLE | FC_VMXON_IN_SMX;
+        uint64_t v;
+
+        /* Reset value: 0. */
+        v = msr_read64(MSR_IA32_FEATURE_CONTROL);
+        if (v != 0) {
+            ml_printf("smx: feature control at boot = 0x%llx\n",
+                      (unsigned long long)v);
+            fail_msg("IA32_FEATURE_CONTROL is not 0 at boot", 8);
+        } else {
+            ml_printf("PASS: IA32_FEATURE_CONTROL resets to 0\n");
+        }
+
+        /*
+         * tboot's supports_smx() requires the SENTER enable bit 15
+         * (tboot's ENABLE_SENTER) to be writable.  Write it alone and
+         * confirm no #GP(0) and an exact readback, so a mask that
+         * covers only bits 14:8 (0x7f0) is caught here.
+         */
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        msr_write32(MSR_IA32_FEATURE_CONTROL, 1U << 15);
+        if (gp_count != 0 ||
+            msr_read64(MSR_IA32_FEATURE_CONTROL) != (uint64_t)(1U << 15)) {
+            ml_printf("smx: #GP count=%d\n", gp_count);
+            fail_msg("SENTER enable bit 15 is not writable", 8);
+        } else {
+            ml_printf("PASS: SENTER enable bit 15 writes and reads back\n");
+        }
+
+        /*
+         * Unlocked: both SENTER enable fields and the VMX-in-SMX
+         * enable bit are writable and read back exactly.
+         */
+        msr_write32(MSR_IA32_FEATURE_CONTROL, unlocked);
+        v = msr_read64(MSR_IA32_FEATURE_CONTROL);
+        if (v != (uint64_t)unlocked) {
+            ml_printf("smx: feature control readback = 0x%llx\n",
+                      (unsigned long long)v);
+            fail_msg("unlocked IA32_FEATURE_CONTROL write did not "
+                     "read back", 8);
+        } else {
+            ml_printf("PASS: IA32_FEATURE_CONTROL reads back 0x%x "
+                      "while unlocked\n", unlocked);
+        }
+
+        /*
+         * Writes of bits the platform does not support raise #GP(0)
+         * and change nothing: first reserved bit 3, then the SGX
+         * bit, which TCG does not implement.
+         */
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        msr_write32(MSR_IA32_FEATURE_CONTROL, unlocked | FC_RESERVED_BIT3);
+        if (gp_count != 1 || gp_err != 0) {
+            ml_printf("smx: #GP count=%d error code=0x%x\n",
+                      gp_count, gp_err);
+            fail_msg("writing reserved bit 3 did not raise #GP(0)",
+                     8);
+        } else if (msr_read64(MSR_IA32_FEATURE_CONTROL) !=
+                   (uint64_t)unlocked) {
+            fail_msg("reserved-bit write changed the stored value",
+                     8);
+        } else {
+            ml_printf("PASS: reserved-bit write raises #GP(0) and "
+                      "changes nothing\n");
+        }
+
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        msr_write32(MSR_IA32_FEATURE_CONTROL, unlocked | FC_SGX);
+        if (gp_count != 1 || gp_err != 0) {
+            ml_printf("smx: #GP count=%d error code=0x%x\n",
+                      gp_count, gp_err);
+            fail_msg("writing the SGX bit did not raise #GP(0)",
+                     8);
+        } else if (msr_read64(MSR_IA32_FEATURE_CONTROL) !=
+                   (uint64_t)unlocked) {
+            fail_msg("SGX-bit write changed the stored value", 8);
+        } else {
+            ml_printf("PASS: SGX-bit write raises #GP(0) and changes "
+                      "nothing\n");
+        }
+
+        /*
+         * Bit 16 is reserved.  It sits directly above the SENTER
+         * enable field, so a mask written as bits 16:8 rather than
+         * 15:8 would accept it; check it explicitly.
+         */
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        msr_write32(MSR_IA32_FEATURE_CONTROL, unlocked | FC_RESERVED_BIT16);
+        if (gp_count != 1 || gp_err != 0) {
+            ml_printf("smx: #GP count=%d error code=0x%x\n",
+                      gp_count, gp_err);
+            fail_msg("writing reserved bit 16 did not raise #GP(0)",
+                     8);
+        } else if (msr_read64(MSR_IA32_FEATURE_CONTROL) !=
+                   (uint64_t)unlocked) {
+            fail_msg("reserved bit 16 write changed the stored value",
+                     8);
+        } else {
+            ml_printf("PASS: reserved bit 16 write raises #GP(0) and "
+                      "changes nothing\n");
+        }
+
+        /* Lock the register with the same configuration. */
+        msr_write32(MSR_IA32_FEATURE_CONTROL, unlocked | FC_LOCKED);
+        v = msr_read64(MSR_IA32_FEATURE_CONTROL);
+        if (v != (uint64_t)(unlocked | FC_LOCKED)) {
+            ml_printf("smx: feature control after lock = 0x%llx\n",
+                      (unsigned long long)v);
+            fail_msg("IA32_FEATURE_CONTROL lock write did not read "
+                     "back", 8);
+        } else {
+            ml_printf("PASS: IA32_FEATURE_CONTROL locked at 0x%x\n",
+                      (unlocked | FC_LOCKED));
+        }
+
+        /*
+         * Locked: any further WRMSR raises #GP(0) -- even one that
+         * writes the identical value -- and the stored value is
+         * unchanged, while the read still returns it.
+         */
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        msr_write32(MSR_IA32_FEATURE_CONTROL, unlocked);
+        if (gp_count != 1 || gp_err != 0) {
+            ml_printf("smx: #GP count=%d error code=0x%x\n",
+                      gp_count, gp_err);
+            fail_msg("write after lock did not raise #GP(0)", 8);
+        } else {
+            v = msr_read64(MSR_IA32_FEATURE_CONTROL);
+            if (v != (uint64_t)(unlocked | FC_LOCKED)) {
+                ml_printf("smx: feature control after failed write = "
+                          "0x%llx\n", (unsigned long long)v);
+                fail_msg("write after lock changed the stored value",
+                         8);
+            } else {
+                ml_printf("PASS: write after lock raises #GP(0) and "
+                          "the read still returns the locked value\n");
+            }
         }
     }
 

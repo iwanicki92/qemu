@@ -203,6 +203,46 @@ loader-driven SENTER test, *not* for the locality-4 PCR path in §3.1–3.4.
 That can be exercised from qtest with no ACM at all. Build the measurement
 path first; add the fixture when the test moves up to a real loader.
 
+### 3.6 Carried into M4: out-of-band completion disturbs the TIS frontend
+
+`tpm_backend_request_completed()` (`backends/tpm/tpm_backend.c`) has no
+notion of *who* submitted a command — it unconditionally calls the frontend's
+`request_completed` for every completion:
+
+```c
+TPMIfClass *tic = TPM_IF_GET_CLASS(s->tpmif);
+tic->request_completed(s->tpmif, ret);
+```
+
+So each TXT-issued DRTM command also runs `tpm_tis_request_completed()`
+(`hw/tpm/tpm_tis_common.c:235-268`), which sets
+`TPM_TIS_STS_VALID | TPM_TIS_STS_DATA_AVAILABLE`, moves the TIS to
+`TPM_TIS_STATE_COMPLETION` at whatever locality the *guest* last used,
+resets `rw_offset` and raises an IRQ — while the actual response bytes went
+into the TXT device's private buffer, which the guest cannot read. The guest's
+TPM driver therefore sees a completion for a command it never sent.
+
+Plan §3.3 anticipated only the locality-cache interaction; this is a second,
+larger side effect of sharing one backend between two frontends. It is
+unreachable while SENTER is a `#UD` stub, but **the M4 SENTER increment must
+address it** — either by saving and restoring the TIS locality/STS state
+around the measurement, or by suppressing the frontend notification for
+device-originated commands. The latter needs an API change under
+`hw/tpm/`/`backends/tpm/`, which this design has so far avoided, so expect
+that to be the point where the "no TPM-subsystem changes" property has to be
+re-argued.
+
+Two smaller items deferred with it:
+
+- `TPMBackend::cmd` is marked `/*< protected >*/`
+  (`include/system/tpm_backend.h:44-50`) but is the only way to detect an
+  in-flight request, because `tpm_backend_deliver_request()` returns void and
+  merely `error_report`s when busy. A public
+  `tpm_backend_request_pending()` predicate would be the clean fix.
+- The `txt_drtm_*` trace points fire before the send returns, so they log
+  intent rather than success. Fine for tracing; do not read them as proof a
+  measurement landed.
+
 ## 4. Deliberate fidelity gap to document
 QEMU does not gate locality-4 MMIO the way a real chipset does, so a guest can
 reach locality 4 through the existing TIS and extend PCR 17/18 itself. This is

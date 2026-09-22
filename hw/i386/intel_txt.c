@@ -4,11 +4,11 @@
  * Emulates the TXT public and private configuration spaces at
  * 0xFED30000 / 0xFED20000 on the q35 machine ("-machine txt=on").
  *
- * This is the M1 skeleton: register storage, defaults, command
- * register semantics and write-once DPR locking.  The measured
- * launch flow (GETSEC[SENTER] standing in for the SINIT ACM) is a
- * later milestone.  See docs/specs/intel-txt.rst for the register
- * map and the overall design.
+ * Register storage, defaults, command register semantics,
+ * write-once DPR locking and the DRTM measurement plumbing used by
+ * the measured launch flow (GETSEC[SENTER] standing in for the
+ * SINIT ACM).  See docs/specs/intel-txt.rst for the register map
+ * and the overall design.
  *
  * Copyright (c) 2026 Michał Kopeć <michal@nozomi.space>
  *
@@ -22,8 +22,14 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
+#include "qemu/main-loop.h"
 #include "system/runstate.h"
+#include "system/tpm_util.h"
 #include "trace.h"
+
+#ifdef CONFIG_TPM
+#include "system/tpm_backend.h"
+#endif
 
 struct IntelTxtState {
     SysBusDevice parent_obj;
@@ -59,6 +65,14 @@ struct IntelTxtState {
 
     /* TXT.DIDVID, configurable for experimentation (see spec) */
     uint64_t didvid;
+
+#ifdef CONFIG_TPM
+    /*
+     * TPM backend the DRTM measurements are submitted through.
+     * Resolved at realize; a device link, not migratable state.
+     */
+    TPMBackend *tpm;
+#endif
 };
 
 /*
@@ -270,6 +284,307 @@ static const MemoryRegionOps intel_txt_public_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/*
+ * DRTM measurement plumbing (see docs/specs/intel-txt.rst, "Steps
+ * performed by QEMU" steps a and d): QEMU stands in for the SINIT
+ * ACM, so the chipset's locality-4 hash sequence is performed with
+ * ordinary TPM2 commands sent through the linked TPM backend.
+ */
+#ifdef CONFIG_TPM
+
+/*
+ * TPM2 wire constants for the DRTM measurement commands (TCG TPM
+ * 2.0 Library Specification, Part 2: Structures, Table 22 and the
+ * TPM2_PCR_Reset / TPM2_PCR_Extend command definitions).  These are
+ * deliberately duplicated here rather than taken from
+ * backends/tpm/tpm_int.h, which is backend-internal.
+ */
+enum {
+    TPM2_ST_SESSIONS   = 0x8002,
+    TPM2_CC_PCR_Reset  = 0x0000013d,
+    TPM2_CC_PCR_Extend = 0x00000182,
+    TPM2_RS_PW         = 0x40000009, /* password auth session handle */
+    TPM2_RC_SUCCESS    = 0x00000000,
+};
+
+/*
+ * Response header: tag (u16) + responseSize (u32) + responseCode (u32).
+ * A failing TPM2 command answers with this header alone and no
+ * parameter area, so 10 bytes is the shortest legal response.  It is
+ * also the size tpm_util_write_fatal_error_response() writes when the
+ * backend transport itself fails -- that one carries the TPM 1.2
+ * TPM_TAG_RSP_COMMAND tag and TPM_FAIL (9) rather than a TPM2 code,
+ * which is harmless here because only the error code is ever read.
+ * Anything shorter than this is genuinely truncated.
+ */
+#define TPM2_RESP_HDR_SIZE 10
+
+/*
+ * Response buffer handed to the backend.
+ *
+ * Deliberately a fixed size rather than tpm_backend_get_buffer_size():
+ * that getter is *not* a pure query.  For the emulator backend it runs
+ * tpm_emulator_set_buffer_size(), which begins with
+ * tpm_emulator_stop_tpm() -- a CMD_STOP to swtpm -- and does not send a
+ * CMD_INIT afterwards.  Every other in-tree caller pairs it with
+ * tpm_backend_startup_tpm() and caches the result once
+ * (hw/tpm/tpm_tis_common.c:821+854, hw/tpm/tpm_crb.c:461+463,
+ * hw/tpm/tpm_spapr.c:302+307), so calling it per command would stop the
+ * guest's TPM before each measurement.  Caching it at realize would be
+ * wrong too: the TXT device is created during machine init, before the
+ * -device tpm-tis frontend exists to re-initialise the backend.
+ *
+ * 4096 is the buffer size the TPM 2.0 spec guarantees, and the value
+ * the emulator backend itself falls back to.  The commands built here
+ * are far smaller (27 bytes for PCR_Reset, 87 for a two-bank
+ * PCR_Extend) and their responses are a few dozen bytes.
+ */
+#define INTEL_TXT_TPM_BUF_SIZE 4096
+
+/* DRTM PCR range reset by the measured launch (spec step a) */
+#define INTEL_TXT_DRTM_PCR_FIRST 17
+#define INTEL_TXT_DRTM_PCR_LAST  22
+
+/* The DRTM measurements always run at TIS locality 4 (spec step d) */
+#define INTEL_TXT_DRTM_LOCTY 4
+
+/*
+ * Fixed password-authorization area appended to both DRTM commands:
+ * the TPM2_RS_PW session handle with an empty nonce and HMAC.
+ */
+struct tpm2_pw_auth_area {
+    uint32_t session_handle;
+    uint16_t nonce_size;
+    uint8_t  session_attributes;
+    uint16_t hmac_size;
+} QEMU_PACKED; /* 9 bytes */
+
+/* TPM2_PCR_Reset command: exactly 27 bytes on the wire */
+struct tpm2_cmd_pcr_reset {
+    uint16_t tag;
+    uint32_t cmd_size;
+    uint32_t cmd_code;
+    uint32_t pcr_handle;
+    uint32_t auth_size;
+    struct tpm2_pw_auth_area auth;
+} QEMU_PACKED;
+
+/*
+ * TPM2_PCR_Extend command: the fixed header part, followed by the
+ * TPML_DIGEST_VALUES entries (2-byte algorithm tag plus the digest
+ * itself, repeated count times).
+ */
+struct tpm2_cmd_pcr_extend {
+    uint16_t tag;
+    uint32_t cmd_size;
+    uint32_t cmd_code;
+    uint32_t pcr_handle;
+    uint32_t auth_size;
+    struct tpm2_pw_auth_area auth;
+    uint32_t count;
+    uint8_t  digest[];
+} QEMU_PACKED;
+
+/*
+ * Submit one prebuilt TPM2 command to the linked TPM backend at
+ * locality 4 and wait for the response.
+ *
+ * The helper owns the BQL and the backend's single in-flight command
+ * slot: tpm_backend_deliver_request() has one slot and silently drops
+ * a second submission (which the in-flight check below rejects), and
+ * tpm_backend_finish_sync() spins aio_poll() on the main AioContext,
+ * which requires the BQL (see include/qemu/aio-wait.h).  Holding the
+ * BQL here keeps the measurement path strictly one command at a time
+ * and non-reentrant; it also means no other BQL-protected frontend
+ * can interleave a submission with ours.
+ */
+static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
+                              uint32_t cmd_len, Error **errp)
+{
+    TPMBackendCmd tcmd;
+    uint8_t *resp;
+    uint32_t resp_len;
+    size_t resp_size;
+    int ret = 0;
+
+    BQL_LOCK_GUARD();
+
+    if (s->tpm == NULL) {
+        error_setg(errp, "Intel TXT device has no TPM backend");
+        return -1;
+    }
+    /*
+     * A backend with no frontend attached never had tpm_backend_init()
+     * called on it, so TPMBackend::tpmif is NULL and the completion
+     * callback would dereference it (backends/tpm/tpm_backend.c,
+     * tpm_backend_request_completed()).  This cannot be checked at
+     * realize: the TXT device is created during machine init, before
+     * the -device tpm-tis frontend is instantiated.
+     */
+    if (tpm_find() == NULL) {
+        error_setg(errp, "Intel TXT needs a TPM frontend device; "
+                   "add -device tpm-tis,tpmdev=...");
+        return -1;
+    }
+    if (s->tpm->cmd != NULL) {
+        error_setg(errp, "a TPM request is already in flight");
+        return -1;
+    }
+    resp_size = INTEL_TXT_TPM_BUF_SIZE;
+    if (resp_size < cmd_len) {
+        error_setg(errp, "TPM buffer is 0x%" PRIx64 " bytes, "
+                   "too small for the 0x%" PRIx32 " byte command",
+                   (uint64_t)resp_size, cmd_len);
+        return -1;
+    }
+
+    resp = g_malloc(resp_size);
+    tcmd = (TPMBackendCmd) {
+        .locty = INTEL_TXT_DRTM_LOCTY,
+        .in = cmd,
+        .in_len = cmd_len,
+        .out = resp,
+        .out_len = resp_size,
+    };
+    tpm_backend_deliver_request(s->tpm, &tcmd);
+    tpm_backend_finish_sync(s->tpm);
+
+    resp_len = tpm_cmd_get_size(resp);
+    if (resp_len < TPM2_RESP_HDR_SIZE || resp_len > resp_size) {
+        error_setg(errp, "TPM backend returned a truncated response "
+                   "(%u of 0x%" PRIx64 " bytes)",
+                   resp_len, (uint64_t)resp_size);
+        ret = -1;
+    } else if (tpm_cmd_get_errcode(resp) != TPM2_RC_SUCCESS) {
+        uint32_t errcode = tpm_cmd_get_errcode(resp);
+
+        trace_txt_drtm_tpm_error(errcode);
+        error_setg(errp, "TPM2 command at locality 4 failed: "
+                   "response code 0x%" PRIx32, errcode);
+        ret = -1;
+    }
+    g_free(resp);
+    return ret;
+}
+
+/*
+ * Build the 27-byte TPM2_PCR_Reset command for @pcr (0-based PCR
+ * index) into @cmd.
+ */
+static void intel_txt_build_pcr_reset(uint8_t *cmd, uint32_t pcr)
+{
+    struct tpm2_cmd_pcr_reset t = {
+        .tag = cpu_to_be16(TPM2_ST_SESSIONS),
+        .cmd_size = cpu_to_be32(sizeof(t)),
+        .cmd_code = cpu_to_be32(TPM2_CC_PCR_Reset),
+        .pcr_handle = cpu_to_be32(pcr),
+        .auth_size = cpu_to_be32(sizeof(t.auth)),
+    };
+
+    t.auth = (struct tpm2_pw_auth_area) {
+        .session_handle = cpu_to_be32(TPM2_RS_PW),
+        .nonce_size = 0,
+        .session_attributes = 0,
+        .hmac_size = 0,
+    };
+    memcpy(cmd, &t, sizeof(t));
+}
+
+/*
+ * Build the TPM2_PCR_Extend command for @pcr carrying the @n digests
+ * in @digests into @cmd (exactly @cmd_len bytes, as precomputed by
+ * the caller).
+ */
+static void intel_txt_build_pcr_extend(uint8_t *cmd, uint32_t cmd_len,
+                                       uint32_t pcr,
+                                       const TPMDigestValue *digests,
+                                       size_t n)
+{
+    struct tpm2_cmd_pcr_extend *t = (void *)cmd;
+    size_t off = sizeof(*t);
+    size_t i;
+
+    t->tag = cpu_to_be16(TPM2_ST_SESSIONS);
+    t->cmd_size = cpu_to_be32(cmd_len);
+    t->cmd_code = cpu_to_be32(TPM2_CC_PCR_Extend);
+    t->pcr_handle = cpu_to_be32(pcr);
+    t->auth_size = cpu_to_be32(sizeof(t->auth));
+    t->auth = (struct tpm2_pw_auth_area) {
+        .session_handle = cpu_to_be32(TPM2_RS_PW),
+        .nonce_size = 0,
+        .session_attributes = 0,
+        .hmac_size = 0,
+    };
+    t->count = cpu_to_be32(n);
+
+    for (i = 0; i < n; i++) {
+        stw_be_p(cmd + off, digests[i].alg);
+        memcpy(cmd + off + 2, digests[i].digest, digests[i].len);
+        off += 2 + digests[i].len;
+    }
+}
+
+/*
+ * Reset DRTM PCRs 17-22 at locality 4, one TPM2_PCR_Reset per PCR
+ * (spec step a).
+ */
+int intel_txt_drtm_reset_pcrs(IntelTxtState *s, Error **errp)
+{
+    for (uint32_t pcr = INTEL_TXT_DRTM_PCR_FIRST;
+         pcr <= INTEL_TXT_DRTM_PCR_LAST; pcr++) {
+        uint8_t cmd[sizeof(struct tpm2_cmd_pcr_reset)];
+        int ret;
+
+        intel_txt_build_pcr_reset(cmd, pcr);
+        trace_txt_drtm_reset_pcr(pcr);
+        ret = intel_txt_tpm_send(s, cmd, sizeof(cmd), errp);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Extend PCR @pcr with the @n digests in @digests at locality 4
+ * (spec step d).
+ */
+int intel_txt_drtm_extend_pcr(IntelTxtState *s, uint32_t pcr,
+                              const TPMDigestValue *digests, size_t n,
+                              Error **errp)
+{
+    uint32_t cmd_len = sizeof(struct tpm2_cmd_pcr_extend);
+    uint8_t *cmd;
+    int ret;
+
+    if (n == 0) {
+        error_setg(errp, "no digests given for the PCR %u extend", pcr);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if ((digests[i].alg != TPM2_ALG_SHA1 || digests[i].len != 20) &&
+            (digests[i].alg != TPM2_ALG_SHA256 || digests[i].len != 32)) {
+            error_setg(errp, "digest %zu: unsupported algorithm 0x%" PRIx16
+                       " with %zu-byte digest", i, digests[i].alg,
+                       digests[i].len);
+            return -1;
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        cmd_len += 2 + (uint32_t)digests[i].len;
+    }
+
+    cmd = g_malloc(cmd_len);
+    intel_txt_build_pcr_extend(cmd, cmd_len, pcr, digests, n);
+    trace_txt_drtm_extend_pcr(pcr, n);
+    ret = intel_txt_tpm_send(s, cmd, cmd_len, errp);
+    g_free(cmd);
+    return ret;
+}
+
+#endif /* CONFIG_TPM */
+
 static const MemoryRegionOps intel_txt_private_ops = {
     .read = intel_txt_private_read,
     .write = intel_txt_private_write,
@@ -318,6 +633,37 @@ static void intel_txt_realize(DeviceState *dev, Error **errp)
 {
     IntelTxtState *s = INTEL_TXT(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+#ifdef CONFIG_TPM
+    /*
+     * The DRTM measurements run through the TPM backend.  The q35
+     * machine refuses txt=on without one, so this cannot fail in
+     * practice; the guard keeps the API safe if the device is ever
+     * realized some other way.
+     */
+    s->tpm = qemu_find_tpm_be_any();
+    if (s->tpm == NULL) {
+        error_setg(errp, "txt=on requires a TPM backend "
+                   "(-tpmdev ..., -device tpm-tis,...)");
+        return;
+    }
+
+    /*
+     * Only the emulator backend honours TPMBackendCmd::locty --
+     * tpm_emulator_handle_request() issues CMD_SET_LOCALITY from it.
+     * tpm_passthrough_handle_request() ignores the field entirely and
+     * forwards to the host TPM at whatever locality the guest last
+     * opened, so the DRTM measurements would silently run outside
+     * locality 4 and defeat spec step d.  Refuse rather than measure
+     * into the wrong locality.
+     */
+    if (tpm_backend_get_type(s->tpm) != TPM_TYPE_EMULATOR) {
+        error_setg(errp, "txt=on requires -tpmdev emulator: the DRTM "
+                   "measurements need TPM locality 4, which only the "
+                   "emulator backend applies per command");
+        return;
+    }
+#endif
 
     memory_region_init_io(&s->mmio_public, OBJECT(s),
                           &intel_txt_public_ops, s,

@@ -11,6 +11,7 @@
 #define HW_I386_INTEL_TXT_H
 
 #include "exec/hwaddr.h"
+#include "qapi/error.h"
 #include "qom/object.h"
 
 #define TYPE_INTEL_TXT "intel-txt"
@@ -102,5 +103,42 @@
 typedef struct IntelTxtState IntelTxtState;
 DECLARE_INSTANCE_CHECKER(IntelTxtState, INTEL_TXT,
                          TYPE_INTEL_TXT)
+
+#ifdef CONFIG_TPM
+/*
+ * TPM2 hash algorithm tags for the DRTM digests (TCG TPM 2.0
+ * Library Specification, Part 2: Structures, Table 22).
+ */
+#define TPM2_ALG_SHA1   0x0004   /* 20-byte digest */
+#define TPM2_ALG_SHA256 0x000b   /* 32-byte digest */
+
+/*
+ * One hash-algorithm/digest pair, as passed to
+ * intel_txt_drtm_extend_pcr().
+ */
+typedef struct TPMDigestValue {
+    uint16_t alg;        /* TPM2_ALG_SHA1 or TPM2_ALG_SHA256 */
+    const uint8_t *digest;
+    size_t len;          /* 20 or 32 bytes, matching alg */
+} TPMDigestValue;
+
+/*
+ * Reset the DRTM PCRs (17-22) at TIS locality 4, standing in for
+ * the SINIT ACM (see docs/specs/intel-txt.rst, "Steps performed by
+ * QEMU" step a).  Returns 0 on success, -1 with @errp set
+ * otherwise.
+ */
+int intel_txt_drtm_reset_pcrs(IntelTxtState *s, Error **errp);
+
+/*
+ * Extend PCR @pcr with the @n digests in @digests at TIS locality
+ * 4, standing in for the SINIT ACM (see docs/specs/intel-txt.rst,
+ * "Steps performed by QEMU" step d).  Returns 0 on success, -1
+ * with @errp set otherwise.
+ */
+int intel_txt_drtm_extend_pcr(IntelTxtState *s, uint32_t pcr,
+                              const TPMDigestValue *digests, size_t n,
+                              Error **errp);
+#endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

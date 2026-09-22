@@ -329,6 +329,50 @@ This widens the TPM-subsystem footprint from two files to three
 property bending, as §3.6 predicted it would have to; it bends for the
 mechanism the hardware actually uses, which is the right reason.
 
+### 3.8 Verified locality-4 behaviour, and the step-c design it unblocks
+
+Measured against swtpm 0.10.2 through the control channel, after
+`TPM2_Startup(CLEAR)`. Recorded here because these facts are load-bearing
+and an earlier spike's results were lost:
+
+| operation | locality | result |
+|---|---|---|
+| PCR 17/18/19 initial read | 0 | `ffff…ff` (DRTM power-on value) |
+| `CMD_HASH_START` | 4 | **resets all of PCR 17-22 to zero**, not just 17 |
+| `CMD_HASH_END` | 4 | extends PCR 17 with the hash of the fed data |
+| `TPM2_PCR_Extend(18)` | 4 | **succeeds**, result is extend-from-zero |
+| `TPM2_PCR_Extend(18)` | 0 | rejected, `TPM_RC_LOCALITY` (0x907) |
+| `TPM2_PCR_Reset(17)` | 0, 3, 4 | rejected, `TPM_RC_LOCALITY` (0x907) — see §3.7 |
+
+Three consequences:
+
+1. **Spec step a is already fully satisfied** by `_TPM_Hash_Start`. It zeroes
+   the whole DRTM range, so no separate per-PCR reset is needed for 18-22
+   either. The §3.7 wording ("resets the DRTM PCRs") is now verified beyond
+   PCR 17.
+2. **Step c is unblocked and needs no new mechanism.** PCR 18 takes the MLE
+   hash via `intel_txt_drtm_extend_pcr()` — the helper deliberately retained
+   in `d68257ff6a` — at locality 4, which is what the real SINIT ACM does.
+   Because `_TPM_Hash_Start` has already zeroed PCR 18, the expected value is
+   a clean `H(0…0 ‖ mle_hash)` and is therefore assertable in the guest test
+   exactly as PCR 17 now is.
+3. **The locality-0 rejection is the control.** It proves `.locty = 4` is
+   doing real work rather than being ignored: the identical command fails at
+   locality 0 and succeeds at locality 4. Any future regression in the
+   locality plumbing will show up as `TPM_RC_LOCALITY` rather than as a
+   silent wrong-locality measurement.
+
+#### Step c work items
+
+- Parse the TXT heap: `os_sinit_data` → `mle_ptab`, the MLE header at
+  `mle_hdr_base` (which must lie inside `[mle_ptab, mle_ptab + mle_size)`,
+  spec precondition 4), then `mle_start_off` / `mle_end_off` /
+  `first_valid_page`.
+- Hash the MLE pages in each active bank and extend PCR 18.
+- Extend the guest test with a PCR 18 assertion mirroring the PCR 17 one.
+- Precondition 4 currently only checks that HEAP_BASE/SIZE are non-zero and
+  below 4 GiB; the structural parsing checks land with this slice.
+
 ## 4. Deliberate fidelity gap to document
 QEMU does not gate locality-4 MMIO the way a real chipset does, so a guest can
 reach locality 4 through the existing TIS and extend PCR 17/18 itself. This is

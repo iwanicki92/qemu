@@ -7,18 +7,31 @@ TXT lifecycle rather than infer integration correctness from component tests.
 This is a functional emulation acceptance suite, not proof of a security boundary
 against the host or a proof of complete architectural correctness.
 
-Initial baseline:
-
-- QEMU source: `db42739ebe` (record the full resolved commit and dirty diff for
-  every actual build/run).
+Baseline (record the full source revisions and hashes for subsequent runs):
 - tboot source: `c9ca81f41b4a3eaa8e00c12a3d1d6d3c783782d4`, currently available at
   `/home/michal/qemu-txt-work/tboot`. This path is a development convenience,
   not a portable runner requirement.
-- Full-system boot: **not yet attempted by this harness**.
-- Current SENTER is staged. A passing component test expecting
-  `LAUNCH_INCOMPLETE` is not evidence of a successful measured boot.
-- The master plan places MLE entry/transfer in M3; M4 is teardown and error
-  semantics. Completion of the recent M3 test tasks did not complete M3 itself.
+- First full-system baseline run: **2026-09-23, failed before measured launch**.
+  QEMU `44c9fefab0` (binary SHA-256
+  `2ed81dd1eb9bda7052d1f1467f9744c404fab0ce4c81f1f18ccaf837fdfca549`)
+  booted real tboot `c9ca81f` from a BIOS-only GRUB ISO under q35/TCG/TXT,
+  swtpm, one vCPU and `intel-iommu`. Tboot first reported
+  `IA32_FEATURE_CONTROL_MSR: 00000000` and
+  `ERR: IA32_FEATURE_CONTROL_MSR_LOCK is not locked`, then
+  `TXT.SINIT.BASE: 0x0`, `TXT.SINIT.SIZE: 0x0` and
+  `SINIT ACM not provided`. It fell back to an unmeasured host Linux
+  (whose `CONFIG_INTEL_TXT` is disabled); the runner timed out after 75 s.
+  This is a captured baseline failure, **not** a measured-boot pass.
+- Artifacts: `/home/michal/qemu-txt-work/e2e-baseline/` (ISO SHA-256
+  `dea5da6015c50f09b2fb1d49e1fe59ff2c3d866ab2af3d4e9e65b006699d9556`,
+  tboot.gz SHA-256
+  `b4a2490c03cdb8e1998cf79a949c7016f10d53a339e5aa0f78e24cd85963e2ed`,
+  run logs `run-20260923-011536/`). Tboot was built in an isolated source
+  copy with warning-specific GCC compatibility overrides and one build-only
+  replacement of obsolete GNU ld relinking with `objcopy --strip-debug`.
+  No tboot runtime or platform checks were modified.
+- SENTER now transfers a single vCPU to the synthetic test MLE, but real
+  tboot entry, complete PCRs and AP sleep/wakeup remain unverified.
 
 ## Target boot chain
 
@@ -59,7 +72,7 @@ can do this is a discovery item, not an assumption that stock firmware works.
 | Firmware/loader | Consistent heap, memory map, DPR and SINIT placement; real tboot accepts the platform and ACM |
 | Launch | Actual SENTER followed by tboot post-launch execution, valid TXT state and populated output heap |
 | Entry state | Required CPU registers/state and page mappings verified by diagnostic checks and real MLE execution |
-| SMP | Single-CPU baseline first. AP rendezvous/wakeup and all configured CPUs online is gated on the MWAIT-parking dependency noted below, not assumed reachable |
+| SMP | Single-CPU launch first; AP rendezvous/wakeup and all CPUs online require a verified AP sleep strategy and are currently rejected |
 | OS handoff | Linux recognises the tboot shared handoff; initramfs reports measured-launch status |
 | Measurements | Event log replay agrees with selected active PCR banks; quote signature, fresh nonce and PCR digest verified |
 | TPM sharing | Ordinary guest TPM commands remain usable after launch; no unsolicited frontend completions |
@@ -110,19 +123,22 @@ existing QEMU test infrastructure provides a better fit.
 
 ## Direct reconnaissance findings
 
-Delegated reconnaissance was stopped at the operator's request; these findings
-come from direct source and host inspection. No full-system boot has run yet.
+These findings come from direct source inspection and the baseline run
+recorded above. The boot is not a successful TXT launch.
 
 ### Build and boot artifacts
 
-- Host tools available: GCC, ld, grub-mkrescue, grub-mkstandalone, xorriso,
-  cpio, swtpm and Docker. GRUB's `i386-pc/multiboot.mod` is installed.
-  A `gcc -m32 -ffreestanding` compile-only probe succeeded. BusyBox is absent.
-- Build only tboot's freestanding target first, not the host policy tools:
-  `make -C <isolated-source-copy>/tboot`. `tboot/Makefile` produces `tboot.gz`;
-  `tboot/Config.mk` forces 32-bit code and a freestanding header environment.
-  This recipe is source-derived, not yet build-verified. Use an isolated copy
-  of the pinned revision because this Makefile writes into its source tree.
+- Host tools available: GCC, ld, grub-mkimage, xorriso, cpio and swtpm.
+  `grub-mkrescue` is installed but failed because `mformat` is missing;
+  `grub-mkstandalone -O i386-pc` exceeded the 0x78000 core size limit.
+  The baseline ISO was built with `grub-mkimage -O i386-pc`, prepended
+  `cdboot.img` and `xorriso -as mkisofs` instead. BusyBox is absent.
+- Build only tboot's freestanding target, not the host policy tools:
+  `make -C <isolated-source-copy>/tboot` with
+  `TBOOT_CFLAGS='-Wno-error=address-of-packed-member
+  -Wno-error=array-parameter -Wno-error=maybe-uninitialized'` and the
+  isolated copy's second ld pass replaced by `objcopy --strip-debug`.
+  Do not patch runtime checks or use the host source tree as a build output.
 - `README:73-83` and `tboot/20_linux_tboot:144-152` establish the GRUB order:
   multiboot tboot, module Linux, module initramfs, module SINIT last.
   Serial defaults are `115200,8n1,0x3f8` (`tboot/common/cmdline.c:77-81`).
@@ -148,22 +164,15 @@ come from direct source and host inspection. No full-system boot has run yet.
   processor identity. Generate an integration fixture for these real checks;
   do not simply reuse the unit fixture or weaken tboot.
 - `supports_txt()` (`tboot/txt/verify.c:122-237`) checks Intel identity, SMX,
-  locked/enabled feature-control MSR and required GETSEC capabilities. It also
-  requires VMX *unless* `use_mwait()` is true, in which case the VMX check is
-  skipped entirely. **Decision: run tboot with `ap_wake_mwait=true`.** The
-  reasoning is recorded in `docs/specs/intel-txt.rst`; in short, tboot's default
-  parks APs in a VMX mini-guest and QEMU TCG implements no VMX at all, while the
-  MWAIT parking loop still makes progress because TCG resolves MWAIT on an AP to
-  `helper_pause()`, a yield rather than a halt. This also means QEMU never has to
-  advertise a VMX capability it cannot honour.
-  Note the RLP *wake* stays GETSEC[WAKEUP] and is chosen separately, by what the
-  ACM advertises (`txt/txt.c:607-620`); only the *parking* is the MWAIT path.
-  `use_mwait()` additionally requires SSE3, so the CPU model must carry it.
-- Open dependency for SMP: with MWAIT parking the OS wakes each AP by writing
-  `ap_wake_trigger` in the tboot shared page, so Linux needs tboot MWAIT support.
-  The tboot README warns the system "can never boot up" without it. Unverified
-  here (no kernel source tree available). Irrelevant at one vCPU, where there are
-  no APs at all, but it gates the SMP acceptance group.
+  locked/enabled feature-control MSR and required GETSEC capabilities. It
+  requires VMX unless `use_mwait()` is true. **Selected path: tboot's default
+  VMX/GETSEC[WAKEUP], scoped to one vCPU.** A TXT-machine-specific VMX
+  capability opt-in may be needed, despite TCG not executing VMXON: at one
+  vCPU tboot checks CPUID/MSR bits but never runs the AP's VMX code. Do not
+  add VMX to all TCG guests. The MWAIT path is not the chosen escape hatch:
+  tboot's README warns that AP parking needs OS cooperation, and TCG does
+  not model the monitored-address wake semantics. Current SENTER rejects
+  SMP before PCR measurement; real AP sleep/wakeup remains future work.
 - `txt_verify_platform()` (`tboot/txt/verify.c:364-391`) also requires VT-d BIOS
   enablement and valid BIOS heap data. A firmware image and matching DMAR/VT-d
   configuration must be selected and verified, not assumed.
@@ -181,6 +190,13 @@ come from direct source and host inspection. No full-system boot has run yet.
   reset is inconsistent with this consumer and must be checked against the SDM
   before implementing teardown.
 
-Next: build the isolated, unmodified tboot target, select the firmware setup
-path and TXT-enabled kernel, then create and boot the baseline image. The first
-observed failure remains unknown until that run occurs.
+Next: implement a firmware-owned q35 TXT initialization path (or an explicit,
+non-firmware QEMU bring-up mode for diagnostic runs): lock and enable
+IA32_FEATURE_CONTROL, reserve/program SINIT and heap regions, fill BIOS Data,
+program DPR, and provide suitable DMAR/VT-d configuration. The generic
+coreboot TXT option cannot simply be enabled for emulation/qemu-q35: it
+requires platform DRAM-clear/reset capabilities and invokes a BIOS ACM that
+QEMU does not emulate. Run the baseline ISO after each gate and record the
+next observed tboot failure. Only then add TXT-scoped VMX capability bits if
+tboot reaches that check. A TXT-enabled Linux kernel and purpose-built
+initramfs remain necessary for full acceptance.

@@ -444,10 +444,22 @@ f. Set ``TXT.MLE_JOIN`` semantics: record the RLP join (from
    os_sinit_data or MLE header) so GETSEC[WAKEUP] can send APs there.
 g. Enforce VT-d PMR-equivalent protection on the MLE range
    (M5-level functional enforcement).
-h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``; close private
-   space.
+h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
+   stays **open**: the MLE runs with it open and closes it itself
+   (see below).
 i. Transfer BSP control to the MLE entry point (see below). APs are
    held in the TXT sleep state until GETSEC[WAKEUP] / MONITOR wake.
+
+Private space is opened at step b and is *not* closed by SENTER.  An
+earlier revision of this document had step h close it, which no MLE
+could survive: tboot's post-launch entry path reads ``TXT.HEAP_BASE``
+from the private region before it does anything else
+(``tboot/common/boot.S``, ``_post_launch_entry``), writes
+``TXT.MLE_JOIN`` there to wake the APs, and only closes the region
+from its own teardown path via ``CMD_CLOSE_PRIVATE``
+(``tboot/txt/txt.c``, ``txt_shutdown()``).  The region is therefore
+open from reset, stays open across SENTER for the MLE's use, and is
+closed by the MLE or by a TXT reset.
 
 Current staged state (deviation 7): the helper implements the
 preconditions plus steps a, c and d over the SINIT ACM region
@@ -485,26 +497,67 @@ MLE entry CPU state (BSP), per MLE Dev Guide:
 - 32-bit protected mode, paging enabled with the MLE page tables
   (from ``os_sinit_data.mle_ptab``), EPT/``ecx_pgtbl`` variants
   honored,
-- GDTR from the MLE_JOIN GDT (the loader-provided GDT), CS =
-  seg_sel (32-bit code, RPL0), DS/ES/SS = seg_sel+8,
-- EIP = MLE_JOIN entry_point, ESP = a value the MLE expects
-  (tboot/GRUB pass it via os_mle_data; pinned in M3),
-- interrupts/NMI/SMI masked as per the guide, EFLAGS fixed,
-- EBX/ECX/EDX scrubbed; the environment is "monitored".
+- GDTR from the **SINIT ACM header** (``gdt_base`` at offset 0x2c,
+  ``gdt_limit`` at 0x28), CS = the ACM header's ``seg_sel`` (0x30,
+  32-bit code, RPL0), DS/ES/SS = seg_sel+8,
+- EIP = the MLE entry point, i.e. the physical address that the MLE
+  header's ``entry_point`` resolves to through the MLE page table,
+- EBX = that same physical entry address, ECX = physical address of
+  the MLE page table, EDX = 0,
+- EFLAGS = 0x2, so interrupts are masked; the MLE installs its own
+  IDT before enabling them.
 
-The exact register details are pinned in M3 against the MLE Dev
-Guide §2.4 and the tboot/grub MLE entry assembly (the loaders are
-tolerant of legitimate HW variance here).
+``TXT.MLE_JOIN`` is **not** the source of the BSP's entry state.  It
+cannot be: tboot only writes MLE_JOIN *after* it is already running
+post-launch (``tboot/txt/txt.c``, ``txt_wakeup_cpus()``), purely so
+that GETSEC[WAKEUP] has somewhere to send the APs.  The ACM header is
+the only GDT description available to SINIT at entry, which is also
+why tboot's ``verify_acmod()`` validates ``seg_sel`` and checks it
+against ``gdt_limit``.
+
+How much of this the consumers actually rely on differs.  tboot
+checks EBX against its own entry symbol and requires the MLE page
+table's last PTE to map its last page (``_post_launch_entry``), so
+EBX and the page table are load-bearing.  For the segment state it
+assumes only that CS is usable -- ``__start`` comments "on entry only
+CS is guaranteed good" and immediately reloads GDT, the data
+segments and its own stack.  ESP is therefore not consumed, and
+EFLAGS is overwritten by the MLE once it has a stack.  QEMU still
+installs the full documented state rather than only what tboot
+inspects, so that a stricter MLE is not silently accommodated.
+
+Deviation: the ESP and EFLAGS values above, and the assumption that
+the ACM header's GDT remains loaded at MLE entry, are inferred from
+the consumer code rather than read from the MLE Dev Guide, which was
+not available when this was written.  They are recorded here so they
+can be checked against §2.4 of the guide rather than rediscovered.
 
 Teardown (GETSEC[SEXIT])
 ========================
 
 - Requires measured environment; otherwise #GP.
 - Clears secrets (QEMU: clears ``E2STS.SECRET_STS``), releases DPR
-  and PMR enforcement, resets the platform (full machine reset in
-  QEMU, matching HW's TXT reset semantics), leaving
-  ``ESTS.TXT_RESET_STS`` and ``STS.SEXIT_DONE`` readable until the
-  next TXT reset.
+  and PMR enforcement, closes private space, clears
+  ``STS.SENTER_DONE`` and the locality-open bits, and sets
+  ``STS.SEXIT_DONE``.
+
+SEXIT is **not** a platform reset, and an earlier revision of this
+document (and of the master plan) was wrong to describe it as one.
+Execution continues at the instruction after ``GETSEC[SEXIT]``:
+tboot's ``txt_shutdown()`` runs the command sequence
+``CMD_NO_SECRETS`` -> ``CMD_UNLOCK_MEM_CONFIG`` ->
+``CMD_CLOSE_PRIVATE``, re-asserts ``CR4.SMXE``, calls
+``__getsec_sexit()`` and then *prints* "measured environment torn
+down" (``tboot/txt/txt.c``) before handing off to the OS.  A reset
+there would make the whole handoff unreachable.  tboot does request a
+platform reset through ``TXT.CMD.RESET`` in one specific case, when
+APs are still parked in wait-for-SIPI at shutdown, which is a
+separate path from SEXIT itself.
+
+SEXIT does not clear the TXT configuration registers either:
+SINIT.BASE/SIZE, HEAP_BASE/SIZE and DPR stay programmed, which is
+what allows a further SENTER in the same power cycle.  Only a TXT
+reset clears them.  ``ESTS.TXT_RESET_STS`` remains sticky.
 
 Machine/device wiring
 =====================

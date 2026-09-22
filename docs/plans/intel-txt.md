@@ -203,7 +203,18 @@ HW (no NDA required):
   pxe-able ELF) — lets us test M3 before any real guest stack is ready.
 
 ### M4 — Teardown + error semantics (~1–2 weeks)
-- `GETSEC[SEXIT]`: platform reset, PCR 17-22 lifecycle sanity, DPR teardown.
+- `GETSEC[SEXIT]`: **not** a platform reset. Execution continues at the
+  instruction after the leaf, in the pre-SENTER CPU state; the chipset
+  clears `STS.SENTER_DONE`, closes private space, releases DPR/PMR and
+  sets `STS.SEXIT_DONE`, while SINIT/HEAP/DPR stay programmed so a
+  further SENTER can follow in the same power cycle. The earlier
+  "SEXIT = full machine reset" wording in this plan was wrong: tboot
+  runs `__getsec_sexit()` and then keeps executing to hand off to the
+  OS (`tboot/txt/txt.c`, `txt_shutdown()`). It requests a real platform
+  reset via `TXT.CMD.RESET` only when APs are stuck in wait-for-SIPI,
+  which is a separate path. See `docs/specs/intel-txt.rst`.
+- PCR 17-22 lifecycle sanity (PCRs survive SEXIT; a later SENTER
+  re-measures through the hash sequence), DPR teardown.
 - Error injection: `-global intel-txt.errorcode-inject=…` or a qtest
   write to ESTS/ERRORCODE; LT error handling (reset, no-go), txt-stat
   readable failure codes.

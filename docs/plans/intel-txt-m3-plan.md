@@ -92,23 +92,66 @@ to `tpm_util.h` then, not now.
   whenever the number differs — but the two frontends must not interleave
   in-flight commands.
 
-### 3.4 Open design question — resolve before writing the submit path
-`tpm_backend_finish_sync()` spins `aio_poll(qemu_get_aio_context(), true)`.
-The CRB calls it from a reset handler; SENTER runs in **vCPU context** inside a
-TCG helper. Blocking a vCPU thread there needs BQL care.
+### 3.4 Resolved: inline in the helper, under the BQL
 
-Two candidate shapes, to be decided first:
+`tpm_backend_finish_sync()` spins `aio_poll(qemu_get_aio_context(), true)`,
+and SENTER runs in **vCPU context** inside a TCG helper, so the question was
+whether that call is legal there at all.
 
-- **(a) Inline in the helper** — simplest control flow, blocks the vCPU across
-  several swtpm round trips.
-- **(b) Deferred to a bottom half** with the vCPU parked, resuming the launch
-  on completion. More machinery, but it matches how QEMU normally treats
-  long-running device work and composes better with steps e–i, which must run
-  after the extends.
+It is, conditionally. `aio_poll()` asserts
+`in_aio_context_home_thread(ctx)` (`util/aio-posix.c`), and for the main
+context that predicate is not "am I the main thread" but the BQL:
 
-Recommendation: prototype (a) to get PCR values on the wire, then move to (b)
-if the vCPU stall is observable or if step ordering forces it. Do not design
-the full state machine before the measurement path is proven.
+```c
+/* include/qemu/aio-wait.h:139-150 */
+static inline bool in_aio_context_home_thread(AioContext *ctx)
+{
+    if (ctx == qemu_get_current_aio_context()) {
+        return true;
+    }
+    if (ctx == qemu_get_aio_context()) {
+        return bql_locked();      /* <-- any thread, if it holds the BQL */
+    } else {
+        return false;
+    }
+}
+```
+
+So a vCPU thread may poll the main AioContext **provided it holds the BQL**.
+A TCG helper does not hold it on entry, so the measurement path must take it
+explicitly — `BQL_LOCK_GUARD()` (`include/qemu/main-loop.h:410`), or
+`bql_lock()`/`bql_unlock()` as `misc_helper.c:302` does around
+`apic_msr_write()`. Taking the BQL from an i386 TCG helper to reach a device
+is already routine: `misc_helper.c:114,302,480`, `seg_helper.c:137`,
+`fpu_helper.c:35`.
+
+**Decision: shape (a), inline in the helper under the BQL.** It keeps the
+launch sequence as straight-line code, which matters because spec steps e–i
+must run strictly after the extends complete. Deferring to a bottom half
+(shape (b)) buys nothing here: the vCPU has to be parked across the wait
+either way, and the state machine would have to reconstitute the launch
+context on resume.
+
+Caveats to respect in the implementation:
+
+- **We would be the first in-tree caller to do this from an instruction
+  helper.** The nearest analogue, `spapr_nvdimm_finish_flushes()`
+  (`hw/ppc/spapr_nvdimm.c:581`), carries a comment claiming a guest
+  `h_client_architecture_support` path, but its only actual caller is
+  `spapr_machine_reset()` (`hw/ppc/spapr.c:1830`) — the main thread. The
+  other `aio_poll(qemu_get_aio_context(), true)` users (`hw/9pfs/9p.c:4562`,
+  `:4569`) are reset paths too. Expect upstream to ask about this; the
+  aio-wait.h contract above is the justification.
+- **Reentrancy.** Spinning `aio_poll` runs main-loop AIO callbacks from the
+  vCPU thread. Do not call into it from anywhere already inside an
+  `aio_poll` dispatch, and keep the TXT device's own submit path
+  non-reentrant (cf. the recursion warning at `hw/hyperv/vmbus.c:2178`).
+- **Other vCPUs keep running** — plain TCG execution needs no BQL. Real
+  SENTER rendezvouses the APs; M3 measures on the BSP only, so this is a
+  known gap to close when GETSEC[WAKEUP] lands, not a blocker now.
+- While the BSP holds the BQL and polls, the main loop thread blocks waiting
+  for it. That is the standard pattern, but it means a hung swtpm stalls the
+  whole VM rather than one vCPU. Bound it if swtpm proves flaky in practice.
 
 ### 3.5 Synthetic SINIT ACM fixture (needed only for loader-level tests)
 QEMU never executes an ACM — it *is* the SINIT (master plan Option A). But a
@@ -176,6 +219,21 @@ existing caveat that PCR values are not valid for remote attestation.
 - **Locality enforcement**: `TPM2_PCR_Reset(17)` must fail from locality 0 and
   succeed from locality 4 — this is the property the whole design rests on, so
   assert it directly rather than assuming it.
+- **Build with `--enable-docs`.** M1 and M2 were both verified with
+  `--disable-docs`, so Sphinx never ran and two reST defects sat in
+  `docs/specs/intel-txt.rst` undetected — one of them (a malformed table)
+  silently dropped the entire register map from the rendered output. The
+  configure line for this work is:
+
+  ```
+  ./configure --target-list=i386-softmmu --enable-docs --disable-tools
+  ```
+
+  `make` then builds `docs/manual/specs/intel-txt.html` as part of the
+  normal target list, and any reST regression shows up as a build warning.
+  Spot-check with `grep -c '<tr' build/docs/manual/specs/intel-txt.html`
+  (expect 28 register rows) if the table is touched.
+
 - **Regression**: `tpm-tis-test`, `q35-test`, `txt-test` must stay green.
   M3 touches no TPM frontend code, so any movement here is a real bug.
 - **ACM validation** (once §3.5 lands): the fixture is accepted, and each

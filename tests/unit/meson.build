@@ -167,6 +167,12 @@ if have_system
     }
   endif
   tests += {'test-qdev': [qom, hwcore]}
+  if have_tpm
+    tests += {'tpm-ownership-test': [
+      qom,
+      meson.project_source_root() / 'backends/tpm/tpm_backend.c',
+    ]}
+  endif
 endif
 
 if have_ga and host_os == 'linux'

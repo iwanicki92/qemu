@@ -157,7 +157,21 @@
 #define ACM_OFF_HEADER_LEN      0x04   /* u32, dwords */
 #define ACM_OFF_MODULE_VENDOR   0x10   /* u32 */
 #define ACM_OFF_SIZE            0x18   /* u32, dwords */
+#define ACM_OFF_GDT_LIMIT       0x28   /* u32 */
+#define ACM_OFF_GDT_BASE        0x2c   /* u32 */
+#define ACM_OFF_SEG_SEL         0x30   /* u32 */
 #define ACM_OFF_ENTRY_POINT     0x34   /* u32 */
+/*
+ * The GDT the ACM header describes, placed in the fixture body just
+ * past the chipset id list: null, flat 32-bit code, flat 32-bit data.
+ * seg_sel picks the code entry, and the MLE guide's data selector is
+ * seg_sel + 8, which is the third entry -- so the limit has to cover
+ * all three.
+ */
+#define ACM_GDT_OFF             0x520
+#define ACM_GDT_SIZE            0x18
+#define ACM_GDT_LIMIT           (ACM_GDT_SIZE - 1)
+#define ACM_SEG_SEL             0x08
 #define ACM_OFF_SCRATCH_SIZE    0x7c   /* u32, dwords */
 #define ACM_HEADER_LEN          161    /* dwords */
 #define ACM_SCRATCH_SIZE        143    /* dwords */
@@ -809,7 +823,9 @@ static uint8_t tpm2_pcrread_cmd[20] = {
  *   def w16(o, v): b[o:o+2] = struct.pack('<H', v)
  *   def w32(o, v): b[o:o+4] = struct.pack('<I', v)
  *   w16(0x00, 2); w16(0x02, 0); w32(0x04, 161); w32(0x10, 0x8086)
- *   w32(0x18, 0x800); w32(0x34, 0x1000); w32(0x7c, 143)
+ *   w32(0x18, 0x800)
+ *   w32(0x28, 0x17); w32(0x2c, 0xE10000 + 0x520); w32(0x30, 8)
+ *   w32(0x34, 0x1000); w32(0x7c, 143)
  *   b[0x4c0:0x4f0] = bytes(0x30)
  *   b[0x4c0:0x4d0] = bytes([0xaa,0x3a,0xc0,0x7f,0xa7,0x46,0xdb,0x18,
  *                           0x2e,0xac,0x69,0x8f,0x8d,0x41,0x7f,0x5a])
@@ -817,15 +833,18 @@ static uint8_t tpm2_pcrread_cmd[20] = {
  *   b[0x500:0x514] = bytes(0x14)
  *   w32(0x500, 1); w32(0x504, 0)
  *   w16(0x508, 0x8086); w16(0x50a, 0x29c0); w16(0x50c, 0)
+ *   b[0x520:0x538] = bytes([0,0,0,0,0,0,0,0,
+ *                           0xff,0xff,0,0,0,0x9a,0xcf,0,
+ *                           0xff,0xff,0,0,0,0x92,0xcf,0])
  *   print(hashlib.sha256(bytes(32) +
  *         hashlib.sha256(bytes(b)).digest()).hexdigest())
  *   EOF
  */
 static const uint8_t pcr17_expected[32] = {
-    0xbc, 0xb4, 0x68, 0xd7, 0x25, 0xbe, 0x14, 0xa6,
-    0x53, 0xd4, 0xba, 0xc3, 0xfe, 0x2a, 0xf0, 0x9e,
-    0x6c, 0x18, 0xb6, 0x34, 0xe6, 0x28, 0x75, 0xf7,
-    0x38, 0x4c, 0x00, 0xcd, 0x05, 0xb7, 0x3a, 0x8d,
+    0x9a, 0x1f, 0x54, 0xe2, 0xfa, 0x4f, 0x81, 0x3f,
+    0x71, 0xc0, 0xe8, 0xb4, 0x4d, 0xeb, 0x0f, 0x25,
+    0x5e, 0x43, 0x05, 0xbf, 0xee, 0x94, 0x03, 0x19,
+    0x2d, 0x57, 0x4f, 0x1d, 0xde, 0x8c, 0x8f, 0xfe,
 };
 
 /*
@@ -964,6 +983,9 @@ static void setup_acm(void)
     acm_write32(ACM_OFF_HEADER_LEN, ACM_HEADER_LEN);
     acm_write32(ACM_OFF_MODULE_VENDOR, 0x8086);
     acm_write32(ACM_OFF_SIZE, (uint32_t)TEST_SINIT_SIZE / 4);
+    acm_write32(ACM_OFF_GDT_LIMIT, ACM_GDT_LIMIT);
+    acm_write32(ACM_OFF_GDT_BASE, (uint32_t)TEST_SINIT_BASE + ACM_GDT_OFF);
+    acm_write32(ACM_OFF_SEG_SEL, ACM_SEG_SEL);
     acm_write32(ACM_OFF_ENTRY_POINT, 0x1000);
     acm_write32(ACM_OFF_SCRATCH_SIZE, ACM_SCRATCH_SIZE);
 
@@ -988,6 +1010,19 @@ static void setup_acm(void)
     acm_write16(ACM_ID_OFF_VENDOR, ACM_CHIPSET_VENDOR);
     acm_write16(ACM_ID_OFF_DEVICE, ACM_CHIPSET_DEVICE);
     acm_write16(ACM_ID_OFF_REVISION, ACM_CHIPSET_REVISION);
+
+    /* The GDT the header points at: null, flat code, flat data. */
+    for (i = 0; i < ACM_GDT_SIZE; i++) {
+        acm[ACM_GDT_OFF + i] = 0;
+    }
+    for (i = 0; i < 2; i++) {
+        uint32_t e = ACM_GDT_OFF + 8 + i * 8;
+
+        acm[e + 0] = 0xff;                 /* limit 15:0  */
+        acm[e + 1] = 0xff;
+        acm[e + 5] = i == 0 ? 0x9a : 0x92; /* code / data, present, DPL0 */
+        acm[e + 6] = 0xcf;                 /* 32-bit, 4 KiB granularity */
+    }
 }
 
 /*
@@ -1012,6 +1047,14 @@ static const struct acm_mutation acm_mutations[] = {
     { "entry_point past the end of the module", ACM_OFF_ENTRY_POINT, 4,
       0x2000 },
     { "entry_point zero", ACM_OFF_ENTRY_POINT, 4, 0 },
+    { "seg_sel null", ACM_OFF_SEG_SEL, 4, 0 },
+    { "seg_sel is an LDT selector", ACM_OFF_SEG_SEL, 4,
+      ACM_SEG_SEL | 0x04 },
+    { "seg_sel is not ring 0", ACM_OFF_SEG_SEL, 4, ACM_SEG_SEL | 0x03 },
+    /* Low three bits clear, so this reaches the gdt_limit check. */
+    { "seg_sel past gdt_limit", ACM_OFF_SEG_SEL, 4, ACM_GDT_SIZE },
+    { "gdt_limit too small for seg_sel", ACM_OFF_GDT_LIMIT, 4, 0 },
+    { "seg_sel plus 8 overflows", ACM_OFF_SEG_SEL, 4, 0xfffffff8 },
     { "header_len puts the info table out of bounds", ACM_OFF_HEADER_LEN,
       4, 0x40000 },
     { "scratch_size puts the info table out of bounds",

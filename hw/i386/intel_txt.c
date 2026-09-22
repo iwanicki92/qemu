@@ -425,6 +425,9 @@ enum {
 #define ACM_HDR_OFF_HEADER_LEN      0x04   /* u32, dwords */
 #define ACM_HDR_OFF_MODULE_VENDOR   0x10   /* u32 */
 #define ACM_HDR_OFF_SIZE            0x18   /* u32, dwords */
+#define ACM_HDR_OFF_GDT_LIMIT       0x28   /* u32 */
+#define ACM_HDR_OFF_GDT_BASE        0x2c   /* u32 */
+#define ACM_HDR_OFF_SEG_SEL         0x30   /* u32 */
 #define ACM_HDR_OFF_ENTRY_POINT     0x34   /* u32 */
 #define ACM_HDR_OFF_SCRATCH_SIZE    0x7c   /* u32, dwords */
 /* Through the RSA-2048 signature and the 143-dword scratch area. */
@@ -1159,6 +1162,7 @@ static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
                                   uint64_t size, Error **errp)
 {
     uint32_t hdr_size, header_len, scratch_size, entry_point;
+    uint32_t seg_sel, gdt_limit;
     uint32_t info_off, id_list_off, count, i;
     uint16_t module_type, module_subtype;
     uint16_t vendor, device, revision;
@@ -1214,6 +1218,38 @@ static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
     if (entry_point == 0 || entry_point >= size) {
         error_setg(errp, "ACM entry_point 0x%x is zero or outside the "
                    "0x%" PRIx64 " byte module", entry_point, size);
+        return -1;
+    }
+
+    /*
+     * The header also describes the GDT the module runs under, and
+     * that description outlives the module: it is what the measured
+     * environment is entered with, since the MLE is given a usable CS
+     * and nothing else to bootstrap from.  So the selector has to be
+     * a plausible one before it is ever loaded.
+     *
+     * Same three checks tboot makes (txt/acmod.c, verify_acmod()):
+     * non-null, an offset into the GDT rather than the LDT and at
+     * ring 0 (the low three bits clear), and far enough inside
+     * gdt_limit for the descriptor to be there.  The data selector
+     * the MLE guide pairs with it is seg_sel + 8, so that addition is
+     * checked for wrap first; these fields all sit inside the
+     * ACM_HDR_MIN_SIZE prefix already required above.
+     */
+    seg_sel = ldl_le_p(acm + ACM_HDR_OFF_SEG_SEL);
+    gdt_limit = ldl_le_p(acm + ACM_HDR_OFF_GDT_LIMIT);
+    if (seg_sel > UINT32_MAX - 8) {
+        error_setg(errp, "ACM seg_sel 0x%x plus 8 overflows", seg_sel);
+        return -1;
+    }
+    if (seg_sel == 0 || (seg_sel & 0x07) != 0) {
+        error_setg(errp, "ACM seg_sel 0x%x is null, an LDT selector or "
+                   "not ring 0", seg_sel);
+        return -1;
+    }
+    if (seg_sel + 8 > gdt_limit) {
+        error_setg(errp, "ACM seg_sel 0x%x does not fit in gdt_limit 0x%x",
+                   seg_sel, gdt_limit);
         return -1;
     }
 

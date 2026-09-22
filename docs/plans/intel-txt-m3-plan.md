@@ -409,12 +409,19 @@ Three consequences:
   `mle_size` page-aligned/≤ 2 MiB, MLE header UUID + length check).
 
 ## 4. Deliberate fidelity gap to document
-QEMU does not gate locality-4 MMIO the way a real chipset does, so a guest can
-reach locality 4 through the existing TIS and extend PCR 17/18 itself. This is
-acceptable for a development platform but must be stated explicitly: the
-emulation is **not** a trust boundary. Add as a numbered item under
-"Deviations from real hardware" in `docs/specs/intel-txt.rst`, alongside the
-existing caveat that PCR values are not valid for remote attestation.
+
+The gap anticipated here — *the guest could reach locality 4 through the
+existing TIS and extend PCR 17/18 itself* — does not exist: QEMU's TIS
+frontend already gates locality-4 guest access the way a real chipset does.
+All guest writes to the locality-4 decode area are dropped
+(`hw/tpm/tpm_tis_common.c`, trace `tpm_tis_mmio_write_locty4`: "Access to
+locality 4 only allowed from hardware"), so a guest `REQUEST_USE` there is
+never granted and the locality can never become active for software. The only
+locality-4 path is the device-side DRTM measurement path. No spec deviation is
+needed for this; the existing "Deviations from real hardware" items (notably
+1 and 6: no ACM verification, semantic PCR digests) remain the correct
+statement that the emulation is **not** a trust boundary. The guest-side
+guarantee is asserted by the TCG test (step 11, §5).
 
 ## 5. Test plan
 - **qtest** (`tests/qtest/txt-test.c`): with a real `tpmdev emulator` backend,
@@ -424,9 +431,25 @@ existing caveat that PCR values are not valid for remote attestation.
   (test-smx-getsec): it reads PCR 17/18 back through the real TPM at
   locality 0 and asserts the exact SHA-256 digests host-side, which is
   stronger than the qtest version of this item.
-- **Locality enforcement**: `TPM2_PCR_Reset(17)` must fail from locality 0 and
-  succeed from locality 4 — this is the property the whole design rests on, so
-  assert it directly rather than assuming it.
+- **Locality enforcement**: **Closed by the guest TCG test** (step 11 of
+  test-smx-getsec), with three assertions:
+  1. `TPM2_PCR_Extend(18)` and `TPM2_PCR_Reset(17)` from locality 0 are
+     refused with `TPM_RC_LOCALITY` (0x907) — swtpm's TPM-level DRTM locality
+     protection, observed from the guest through the TIS FIFO.
+  2. The guest cannot activate locality 4: the test writes `REQUEST_USE` to
+     the locality-4 decode area and polls the locality-4 ACCESS register,
+     requiring that `ACTIVE_LOCALITY` never appears — the TIS frontend drops
+     guest locality-4 writes ("Access to locality 4 only allowed from
+     hardware"), matching real chipset behaviour where locality 4 is
+     reachable only from the TXT hardware.
+  3. Positive control: `TPM2_PCR_Extend(7)` from locality 0 succeeds, showing
+     the 0x907 refusals are specific to the DRTM PCRs, not the transport.
+
+  The original wording ("PCR_Reset(17) must fail from locality 0 and succeed
+  from locality 4") was wrong on two counts: DRTM PCRs 17-22 are not
+  command-resettable at any locality (the §3.8 matrix shows swtpm refusing
+  even at locality 4), and in this emulation the guest cannot address
+  locality 4 at all, so no guest-issued command ever reaches swtpm there.
 - **Build with `--enable-docs`.** M1 and M2 were both verified with
   `--disable-docs`, so Sphinx never ran and two reST defects sat in
   `docs/specs/intel-txt.rst` undetected — one of them (a malformed table)

@@ -306,8 +306,9 @@ static void getsec_senter(void)
 
 /*
  * The IDT installed by boot.S only carries fixed-up gates that point
- * at address 0, so install our own for #UD; the #GP path is not
- * exercised here (it requires dropping to CPL3).
+ * at address 0, so install our own: #UD (6) and #GP (13) for the
+ * GETSEC faults, plus a DPL-3 gate at 0x80 that the CPL3 cases use to
+ * get back to ring 0.
  */
 struct idt_desc {
     uint16_t off_lo;
@@ -321,10 +322,15 @@ struct idt_ptr {
     uint32_t base;
 } __attribute__((packed));
 
-static struct idt_desc idt[32];
+/* Vector 0x80 is the CPL3 return gate, so the table runs that far. */
+#define IDT_VECTOR_CPL3_RET 0x80
+
+static struct idt_desc idt[IDT_VECTOR_CPL3_RET + 1];
 static struct idt_ptr idtr;
 
 static int ud_count;
+static int gp_count;
+static uint32_t gp_err = 0xffffffffU;
 
 /*
  * The handler is referenced by name from the asm gate below; keep it
@@ -333,6 +339,39 @@ static int ud_count;
 void ud_handler(void)
 {
     ud_count++;
+}
+
+/*
+ * Records the #GP error code as well as the count: GETSEC at CPL != 0
+ * must raise #GP(0), and "(0)" is half the assertion -- a fault with a
+ * selector error code would mean something else faulted.
+ */
+void gp_handler(uint32_t err)
+{
+    gp_count++;
+    gp_err = err;
+}
+
+__attribute__((naked))
+static void gp_gate(void)
+{
+    /*
+     * #GP pushes an error code, so on entry the frame is
+     * [err][EIP][CS][EFLAGS] -- plus [ESP][SS] when the fault came
+     * from CPL3, which iret pops for us.  Hand the error code to the
+     * handler, step the saved EIP over the 2-byte GETSEC (0F 37),
+     * then drop the error code before returning.
+     */
+    asm volatile(
+        "pushal\n"
+        "pushl 32(%esp)\n"
+        "call gp_handler\n"
+        "addl $4, %esp\n"
+        "popal\n"
+        "addl $2, 4(%esp)\n"
+        "addl $4, %esp\n"
+        "iret\n"
+    );
 }
 
 __attribute__((naked))
@@ -353,25 +392,186 @@ static void ud_gate(void)
     );
 }
 
+/*
+ * Ring-3 entry point.  EAX already holds the GETSEC leaf (enter_cpl3()
+ * loads it before the iret), the #GP or #UD gate steps over the
+ * 2-byte GETSEC, and int $0x80 hands control back to ring 0.  It
+ * touches no memory and no I/O ports, so it needs neither a reloaded
+ * DS nor a raised IOPL.
+ */
+__attribute__((naked))
+void cpl3_entry(void)
+{
+    asm volatile(
+        ".byte 0x0f, 0x37\n"
+        "int $0x80\n"
+    );
+}
+
+/*
+ * Saved ring-0 continuation for the return gate.  Coming back from
+ * CPL3 cannot be an iret -- that would go back to ring 3 -- so the
+ * gate restores this stack pointer and jumps, i.e. a longjmp that
+ * lands in enter_cpl3() still at CPL0.
+ */
+uint32_t cpl3_ret_esp;
+uint32_t cpl3_ret_eip;
+uint32_t cpl3_stack_top;
+/*
+ * Volatile: the ring-3 stub reads this through a symbol reference
+ * from inline asm, so the store below must actually happen.
+ */
+volatile uint32_t cpl3_leaf;
+
+__attribute__((naked))
+void cpl3_ret_gate(void)
+{
+    asm volatile(
+        "movl cpl3_ret_esp, %esp\n"
+        "jmp *cpl3_ret_eip\n"
+    );
+}
+
+static void idt_set(int vector, void (*gate)(void), uint16_t access)
+{
+    uint32_t a = (uint32_t)(uintptr_t)gate;
+
+    idt[vector].off_lo = (uint16_t)(a & 0xffff);
+    idt[vector].off_hi = (uint16_t)((a >> 16) & 0xffff);
+    idt[vector].access = access;
+}
+
 static void idt_install(void)
 {
     int i;
 
-    for (i = 0; i < 32; i++) {
+    for (i = 0; i < (int)(sizeof(idt) / sizeof(idt[0])); i++) {
         idt[i] = (struct idt_desc) {
             .sel = 0x08, /* kernel code segment from boot.S */
         };
     }
-    {
-        uint32_t a = (uint32_t)(uintptr_t)ud_gate;
-        idt[6].off_lo = (uint16_t)(a & 0xffff);
-        idt[6].off_hi = (uint16_t)((a >> 16) & 0xffff);
-        /* 386 interrupt gate, DPL 0, present: 32-bit exception frame. */
-        idt[6].access = 0x8e00;
-    }
+    /* 386 interrupt gates, present: 0x8e00 is DPL 0, 0xee00 is DPL 3. */
+    idt_set(6, ud_gate, 0x8e00);
+    idt_set(13, gp_gate, 0x8e00);
+    /*
+     * The return gate must be reachable by an int from CPL3, and
+     * software interrupts do check the gate DPL (unlike exceptions),
+     * so this one is DPL 3.
+     */
+    idt_set(IDT_VECTOR_CPL3_RET, cpl3_ret_gate, 0xee00);
+
     idtr.limit = sizeof(idt) - 1;
     idtr.base = (uint32_t)(uintptr_t)idt;
     asm volatile("lidt %0" :: "m"(idtr));
+}
+
+/*
+ * boot.S builds a two-entry GDT (0x08 ring-0 code, 0x10 ring-0 data)
+ * and no TSS, which is all a ring-0-only test needs.  Dropping to CPL3
+ * needs ring-3 descriptors to iret to and a TSS for the ring-0 stack
+ * the fault handlers run on, so install a wider GDT here.  Selectors
+ * 0x08 and 0x10 keep boot.S's contents, so the already-loaded CS/DS
+ * stay valid across the lgdt.
+ */
+struct gdt_desc {
+    uint16_t limit_lo;
+    uint16_t base_lo;
+    uint8_t base_mid;
+    uint8_t access;
+    uint8_t gran;
+    uint8_t base_hi;
+} __attribute__((packed));
+
+struct gdt_ptr {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+
+/* 32-bit TSS; only ss0/esp0 and the I/O map base matter here. */
+struct tss32 {
+    uint32_t link;
+    uint32_t esp0;
+    uint32_t ss0;
+    uint32_t unused[22];   /* esp1 .. ldt */
+    uint16_t trap;
+    uint16_t iomap;
+} __attribute__((packed));
+
+#define SEL_CODE3 0x18
+#define SEL_DATA3 0x20
+#define SEL_TSS   0x28
+
+static struct gdt_desc gdt[6];
+static struct gdt_ptr gdtr;
+static struct tss32 tss;
+/* Ring-3 stack, and the ring-0 stack the fault handlers switch to. */
+static uint8_t cpl3_stack[4096] __attribute__((aligned(16)));
+static uint8_t cpl0_stack[8192] __attribute__((aligned(16)));
+
+static void gdt_set(int index, uint32_t base, uint32_t limit,
+                    uint8_t access, uint8_t gran)
+{
+    gdt[index].limit_lo = (uint16_t)(limit & 0xffff);
+    gdt[index].base_lo = (uint16_t)(base & 0xffff);
+    gdt[index].base_mid = (uint8_t)((base >> 16) & 0xff);
+    gdt[index].access = access;
+    gdt[index].gran = (uint8_t)(gran | ((limit >> 16) & 0x0f));
+    gdt[index].base_hi = (uint8_t)((base >> 24) & 0xff);
+}
+
+static void gdt_install(void)
+{
+    uint32_t tss_base = (uint32_t)(uintptr_t)&tss;
+
+    gdt_set(0, 0, 0, 0, 0);
+    /* Flat 4 GiB segments: access 0x9b/0x93 ring 0, 0xfb/0xf3 ring 3. */
+    gdt_set(1, 0, 0xfffff, 0x9b, 0xc0);
+    gdt_set(2, 0, 0xfffff, 0x93, 0xc0);
+    gdt_set(3, 0, 0xfffff, 0xfb, 0xc0);
+    gdt_set(4, 0, 0xfffff, 0xf3, 0xc0);
+    /* Available 32-bit TSS (type 0x9, present), byte granular. */
+    gdt_set(5, tss_base, sizeof(tss) - 1, 0x89, 0x00);
+
+    tss.ss0 = 0x10;
+    tss.esp0 = (uint32_t)(uintptr_t)(cpl0_stack + sizeof(cpl0_stack));
+    /* No I/O permission bitmap: a base past the TSS limit denies all. */
+    tss.iomap = sizeof(tss);
+
+    cpl3_stack_top = (uint32_t)(uintptr_t)(cpl3_stack + sizeof(cpl3_stack));
+
+    gdtr.limit = sizeof(gdt) - 1;
+    gdtr.base = (uint32_t)(uintptr_t)gdt;
+    asm volatile("lgdt %0" :: "m"(gdtr));
+    /* Reload CS from the new table even though 0x08 is unchanged. */
+    asm volatile("ljmp $0x08, $1f\n"
+                 "1:\n");
+    asm volatile("ltr %%ax" :: "a"((uint16_t)SEL_TSS));
+}
+
+/*
+ * Run GETSEC with leaf @leaf at CPL3 and come back.  The iret frame
+ * drops to ring 3 with IOPL 0 and interrupts left masked; cpl3_entry()
+ * returns through int $0x80, whose gate restores the stack saved here.
+ * Everything is referenced through globals because the return path is
+ * a longjmp: no register the compiler picked would survive it.
+ */
+static void enter_cpl3(uint32_t leaf)
+{
+    cpl3_leaf = leaf;
+    asm volatile(
+        "movl %%esp, cpl3_ret_esp\n"
+        "movl $1f, cpl3_ret_eip\n"
+        "movl cpl3_leaf, %%eax\n"
+        "pushl $0x23\n"              /* SS  = SEL_DATA3 | RPL 3 */
+        "pushl cpl3_stack_top\n"     /* ESP */
+        "pushl $0x00000002\n"        /* EFLAGS: reserved bit only */
+        "pushl $0x1b\n"              /* CS  = SEL_CODE3 | RPL 3 */
+        "pushl $cpl3_entry\n"
+        "iret\n"
+        "1:\n"
+        : /* no outputs */
+        : /* no inputs */
+        : "eax", "ebx", "ecx", "edx", "esi", "edi", "memory");
 }
 
 static int main_fail;
@@ -1466,6 +1666,81 @@ int main(void)
         } else {
             ml_printf("PASS: the rebuilt ACM fixture launches and "
                       "re-measures to the same PCR 17\n");
+        }
+    }
+
+    /*
+     * 14. GETSEC is a CPL0 instruction: from CPL3 it must raise
+     *     #GP(0), and with CR4.SMXE clear the #UD must take
+     *     precedence over that #GP (SDM; smx_helper.c checks SMXE
+     *     first).  Ring 3 is entered through a real iret with a TSS
+     *     in place, so this exercises the CPL check the way a guest
+     *     userspace program would hit it.
+     */
+    gdt_install();
+    ml_printf("smx: ring-3 descriptors and TSS installed\n");
+    {
+        int ud_before;
+
+        /* CAPABILITIES is the most innocuous leaf; CPL still wins. */
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        enter_cpl3(GETSEC_LEAF_CAPABILITIES);
+        if (gp_count != 1) {
+            ml_printf("smx: #GP count=%d\n", gp_count);
+            fail_msg("GETSEC[CAPABILITIES] at CPL3 did not raise #GP",
+                     8192);
+        } else if (gp_err != 0) {
+            ml_printf("smx: #GP error code=0x%x\n", gp_err);
+            fail_msg("GETSEC at CPL3 raised #GP with a non-zero error "
+                     "code", 8192);
+        } else {
+            ml_printf("PASS: GETSEC[CAPABILITIES] at CPL3 raises "
+                      "#GP(0)\n");
+        }
+
+        /*
+         * SENTER from CPL3 must fault before the device sees
+         * anything: ERRORCODE stays at the value written here, which
+         * no SENTER path ever records.
+         */
+        txt_write64(TXT_OFF_ERRORCODE, 0);
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        enter_cpl3(GETSEC_LEAF_SENTER);
+        {
+            uint64_t ec = txt_read64(TXT_OFF_ERRORCODE);
+
+            if (gp_count != 1 || gp_err != 0) {
+                ml_printf("smx: #GP count=%d error code=0x%x\n", gp_count,
+                          gp_err);
+                fail_msg("GETSEC[SENTER] at CPL3 did not raise #GP(0)",
+                         8192);
+            } else if (ec != 0) {
+                ml_printf("smx: ERRORCODE=0x%llx\n",
+                          (unsigned long long)ec);
+                fail_msg("GETSEC[SENTER] at CPL3 reached the chipset",
+                         8192);
+            } else {
+                ml_printf("PASS: GETSEC[SENTER] at CPL3 raises #GP(0) "
+                          "without reaching the chipset\n");
+            }
+        }
+
+        /* With SMXE clear the #UD wins, even at CPL3. */
+        write_cr4(read_cr4() & ~CR4_SMXE_MASK);
+        ud_before = ud_count;
+        gp_count = 0;
+        enter_cpl3(GETSEC_LEAF_CAPABILITIES);
+        write_cr4(read_cr4() | CR4_SMXE_MASK);
+        if (ud_count != ud_before + 1 || gp_count != 0) {
+            ml_printf("smx: #UD count=%d (was %d), #GP count=%d\n",
+                      ud_count, ud_before, gp_count);
+            fail_msg("GETSEC at CPL3 with CR4.SMXE=0 did not take the "
+                     "#UD precedence", 8192);
+        } else {
+            ml_printf("PASS: GETSEC at CPL3 with CR4.SMXE=0 raises #UD, "
+                      "not #GP\n");
         }
     }
 

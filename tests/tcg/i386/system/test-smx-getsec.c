@@ -146,6 +146,12 @@
 #define TIS_STS_TPM_GO             (1U << 5)
 #define TIS_STS_DATA_AVAILABLE     (1U << 4)
 
+/*
+ * Each TIS locality has its own 4 KiB decode area; locality N starts
+ * at TPM_TIS_BASE + (N << 12) (see include/hw/acpi/tpm.h).
+ */
+#define TIS_LOCTY_OFF(n)           ((uint32_t)(n) << 12)
+
 static uint64_t txt_read64(uint32_t off)
 {
     volatile uint64_t *p = (volatile uint64_t *)(TXT_PUBLIC_BASE + off);
@@ -200,6 +206,26 @@ static void tis_writel(uint32_t off, uint32_t v)
     volatile uint32_t *p = (volatile uint32_t *)(TPM_TIS_BASE + off);
 
     *p = v;
+}
+
+static uint32_t tis_readl_at(uint32_t addr)
+{
+    return *(volatile uint32_t *)addr;
+}
+
+static uint8_t tis_readb_at(uint32_t addr)
+{
+    return *(volatile uint8_t *)addr;
+}
+
+static void tis_writeb_at(uint32_t addr, uint8_t v)
+{
+    *(volatile uint8_t *)addr = v;
+}
+
+static void tis_writel_at(uint32_t addr, uint32_t v)
+{
+    *(volatile uint32_t *)addr = v;
 }
 
 static uint32_t read_cr4(void)
@@ -547,65 +573,64 @@ static const uint8_t pcr18_expected[32] = {
 };
 
 /*
- * Run one TPM command through the locality-0 TIS FIFO and copy up to
- * @out_len response bytes into @out.  Returns the response length, or
- * 0 on failure.  Shares the sequence tpm2_startup() uses: request the
- * locality, go command-ready, push the command, TPM_GO, poll for
- * dataAvailable, drain.
+ * Run one TPM command through the TIS FIFO of the locality whose
+ * decode area starts at @tis_base (TPM_TIS_BASE for locality 0) and
+ * copy up to @out_len response bytes into @out.  Returns the response
+ * length, or 0 on failure.  Shares the sequence tpm2_startup() uses:
+ * request the locality, go command-ready, push the command, TPM_GO,
+ * poll for dataAvailable, drain.
  */
-static uint32_t tis_transmit(const uint8_t *cmd, uint32_t cmd_len,
-                             uint8_t *out, uint32_t out_len)
+static uint32_t tis_transmit(uint32_t tis_base, const uint8_t *cmd,
+                             uint32_t cmd_len, uint8_t *out,
+                             uint32_t out_len)
 {
     uint32_t sts;
     uint32_t bcount;
     uint32_t i;
 
-    tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_REQUEST_USE);
-    tis_writel(TIS_OFF_STS, TIS_STS_COMMAND_READY);
+    tis_writeb_at(tis_base + TIS_OFF_ACCESS, TIS_ACCESS_REQUEST_USE);
+    tis_writel_at(tis_base + TIS_OFF_STS, TIS_STS_COMMAND_READY);
 
-    sts = tis_readl(TIS_OFF_STS);
+    sts = tis_readl_at(tis_base + TIS_OFF_STS);
     if (((sts >> 8) & 0xffff) < cmd_len) {
-        tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+        tis_writeb_at(tis_base + TIS_OFF_ACCESS,
+                      TIS_ACCESS_ACTIVE_LOCALITY);
         return 0;
     }
     for (i = 0; i < cmd_len; i++) {
-        tis_writeb(TIS_OFF_DATA_FIFO, cmd[i]);
+        tis_writeb_at(tis_base + TIS_OFF_DATA_FIFO, cmd[i]);
     }
-    tis_writeb(TIS_OFF_STS, TIS_STS_TPM_GO);
+    tis_writeb_at(tis_base + TIS_OFF_STS, TIS_STS_TPM_GO);
 
     for (i = 0; i < 1000000; i++) {
-        sts = tis_readl(TIS_OFF_STS);
+        sts = tis_readl_at(tis_base + TIS_OFF_STS);
         if (sts & TIS_STS_DATA_AVAILABLE) {
             break;
         }
     }
     if (!(sts & TIS_STS_DATA_AVAILABLE)) {
-        tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+        tis_writeb_at(tis_base + TIS_OFF_ACCESS,
+                      TIS_ACCESS_ACTIVE_LOCALITY);
         return 0;
     }
 
-    sts = tis_readl(TIS_OFF_STS);
+    sts = tis_readl_at(tis_base + TIS_OFF_STS);
     bcount = (sts >> 8) & 0xffff;
     if (bcount > 4096) {
         bcount = 4096;
     }
     for (i = 0; i < bcount; i++) {
-        uint8_t b = tis_readb(TIS_OFF_DATA_FIFO);
+        uint8_t b = tis_readb_at(tis_base + TIS_OFF_DATA_FIFO);
 
         if (i < out_len) {
             out[i] = b;
         }
     }
-    tis_writeb(TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
+    tis_writeb_at(tis_base + TIS_OFF_ACCESS, TIS_ACCESS_ACTIVE_LOCALITY);
 
     return bcount;
 }
 
-/*
- * Read PCR 17 (SHA-256) into @digest.  Returns 1 on success.  The
- * TPM2_PCR_Read response tail is the 32-byte digest, so it is taken
- * from the end of the response rather than by walking the structure.
- */
 /*
  * Build the step-c launch inputs in guest RAM: an MLE image with its
  * header, a 3-level page table mapping that image flat at linear 0, and
@@ -682,6 +707,12 @@ static void setup_mle(void)
     ml_printf("smx: MLE image, page table and heap built\n");
 }
 
+/*
+ * Read one PCR (@pcr) as SHA-256 into @digest.  Returns 1 on success.
+ * The TPM2_PCR_Read response tail is the 32-byte digest, so it is
+ * taken from the end of the response rather than by walking the
+ * structure.
+ */
 static int pcr_read(int pcr, uint8_t *digest)
 {
     uint8_t resp[128];
@@ -692,8 +723,8 @@ static int pcr_read(int pcr, uint8_t *digest)
     tpm2_pcrread_cmd[18] = 0;
     tpm2_pcrread_cmd[19] = 0;
     tpm2_pcrread_cmd[17 + pcr / 8] = (uint8_t)(1u << (pcr % 8));
-    n = tis_transmit(tpm2_pcrread_cmd, sizeof(tpm2_pcrread_cmd),
-                     resp, sizeof(resp));
+    n = tis_transmit(TPM_TIS_BASE, tpm2_pcrread_cmd,
+                     sizeof(tpm2_pcrread_cmd), resp, sizeof(resp));
     uint32_t rc;
     uint32_t i;
 
@@ -734,6 +765,97 @@ static void pcr_print(const char *what, const uint8_t *d)
         ml_printf(" %x", d[i]);
     }
     ml_printf("\n");
+}
+
+/*
+ * TPM_RC_LOCALITY (TPM 2.0 Part 1): the command was refused because
+ * the current TIS locality does not permit it.  Response codes are
+ * big-endian 32-bit values at offset 6 of the QEMU TPM response
+ * header (see backends/tpm/tpm_int.h), so 0x907 comes back as
+ * 0x00000907.
+ */
+#define TPM_RC_LOCALITY        0x00000907U
+
+/*
+ * TPM2_PCR_Extend in the QEMU/swtpm wire format: tag 0x8002 (one
+ * authorization session), 4-byte big-endian length and command code,
+ * the PCR handle, an empty TPM_RS_PW auth session, and a
+ * TPML_DIGEST_VALUES carrying one SHA-256 digest.  The byte-exact
+ * layout (including the 13-byte empty auth session) was verified
+ * against swtpm in the M0 locality spike.
+ */
+static const uint8_t pcrextend_fixed[10] = {
+    0x80, 0x02, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x01, 0x82,
+};
+static const uint8_t pcrextend_mid[19] = {
+    /* empty TPM_RS_PW auth session (13 bytes) */
+    0x00, 0x00, 0x00, 0x09, 0x40, 0x00, 0x00, 0x09, 0x00, 0x00,
+    0x00, 0x00, 0x00,
+    /* then TPML_DIGEST_VALUES: one digest, SHA-256 */
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x0B,
+};
+static uint8_t tpm2_pcrextend_cmd[65];
+
+static void copy_bytes(uint8_t *dst, const uint8_t *src, uint32_t len)
+{
+    uint32_t i;
+
+    for (i = 0; i < len; i++) {
+        dst[i] = src[i];
+    }
+}
+
+static void pcrextend_build(uint32_t pcr, const uint8_t *digest)
+{
+    copy_bytes(tpm2_pcrextend_cmd, pcrextend_fixed, 10);
+    tpm2_pcrextend_cmd[10] = (uint8_t)(pcr >> 24);
+    tpm2_pcrextend_cmd[11] = (uint8_t)(pcr >> 16);
+    tpm2_pcrextend_cmd[12] = (uint8_t)(pcr >> 8);
+    tpm2_pcrextend_cmd[13] = (uint8_t)pcr;
+    copy_bytes(tpm2_pcrextend_cmd + 14, pcrextend_mid, 19);
+    copy_bytes(tpm2_pcrextend_cmd + 33, digest, 32);
+}
+
+/*
+ * TPM2_PCR_Reset in the same format: handle plus the empty auth
+ * session, no body.
+ */
+static const uint8_t pcrreset_fixed[10] = {
+    0x80, 0x02, 0x00, 0x00, 0x00, 0x1B, 0x00, 0x00, 0x01, 0x3D,
+};
+static const uint8_t pcrreset_mid[13] = {
+    0x00, 0x00, 0x00, 0x09, 0x40, 0x00, 0x00, 0x09, 0x00, 0x00,
+    0x00, 0x00, 0x00,
+};
+static uint8_t tpm2_pcrreset_cmd[27];
+
+static void pcrreset_build(uint32_t pcr)
+{
+    copy_bytes(tpm2_pcrreset_cmd, pcrreset_fixed, 10);
+    tpm2_pcrreset_cmd[10] = (uint8_t)(pcr >> 24);
+    tpm2_pcrreset_cmd[11] = (uint8_t)(pcr >> 16);
+    tpm2_pcrreset_cmd[12] = (uint8_t)(pcr >> 8);
+    tpm2_pcrreset_cmd[13] = (uint8_t)pcr;
+    copy_bytes(tpm2_pcrreset_cmd + 14, pcrreset_mid, 13);
+}
+
+/*
+ * Send @cmd through the TIS FIFO of the locality at @tis_base and
+ * return its 32-bit response code, or 0xFFFF when no usable response
+ * came back.  The response code sits at offset 6 of the QEMU TPM
+ * response header.
+ */
+static uint32_t tpm2_cmd_rc(uint32_t tis_base, const uint8_t *cmd,
+                            uint32_t cmd_len)
+{
+    uint8_t resp[128];
+    uint32_t n = tis_transmit(tis_base, cmd, cmd_len, resp, sizeof(resp));
+
+    if (n < 10) {
+        return 0xFFFF;
+    }
+    return ((uint32_t)resp[6] << 24) | ((uint32_t)resp[7] << 16) |
+         ((uint32_t)resp[8] << 8) | (uint32_t)resp[9];
 }
 
 int main(void)
@@ -1008,6 +1130,93 @@ int main(void)
             fail_msg("PCR 18 does not match the expected MLE hash", 512);
         } else {
             ml_printf("PASS: PCR 18 holds the expected MLE hash\n");
+        }
+    }
+
+    /*
+     * 11. Locality enforcement: the measurement that landed in steps
+     *     9-10 was issued by the device at locality 4; this step
+     *     proves the guest cannot bypass that.  First, the TPM itself
+     *     must refuse DRTM-PCR manipulation from locality 0 with
+     *     TPM_RC_LOCALITY: a TPM2_PCR_Extend of a DRTM PCR and a
+     *     TPM2_PCR_Reset of one both fail there.  (DRTM PCRs 17-22
+     *     are not command-resettable at any locality, which is
+     *     exactly why SENTER uses the TIS hash sequence, whose
+     *     _TPM_Hash_Start zeroes them, instead of PCR_Reset.)
+     *     Second, locality 4 itself must be unreachable from the
+     *     guest: it is the SENTER/DRTM locality, and like real
+     *     chipset behaviour the TIS frontend drops guest writes to
+     *     the locality-4 decode area (hw/tpm/tpm_tis_common.c), so a
+     *     guest REQUEST_USE there is never granted.  All of the
+     *     refused commands change no state, so the PCR 17/18 values
+     *     asserted above are left untouched.  The final check is a
+     *     positive control: an ordinary PCR is extendable from
+     *     locality 0, so the TPM_RC_LOCALITY refusals are
+     *     specifically about DRTM locality protection, not the
+     *     transport.
+     */
+    {
+        uint32_t rc;
+
+        pcrextend_build(18, pcr18_expected);
+        rc = tpm2_cmd_rc(TPM_TIS_BASE, tpm2_pcrextend_cmd,
+                         sizeof(tpm2_pcrextend_cmd));
+        if (rc != TPM_RC_LOCALITY) {
+            ml_printf("smx: TPM2_PCR_Extend(18) at locality 0 rc=0x%x\n",
+                      rc);
+            fail_msg("TPM2_PCR_Extend(18) at locality 0 was not refused "
+                     "with TPM_RC_LOCALITY", 1024);
+        } else {
+            ml_printf("PASS: TPM2_PCR_Extend(18) at locality 0 refused "
+                      "(rc=0x%x)\n", rc);
+        }
+
+        pcrreset_build(17);
+        rc = tpm2_cmd_rc(TPM_TIS_BASE, tpm2_pcrreset_cmd,
+                         sizeof(tpm2_pcrreset_cmd));
+        if (rc != TPM_RC_LOCALITY) {
+            ml_printf("smx: TPM2_PCR_Reset(17) at locality 0 rc=0x%x\n", rc);
+            fail_msg("TPM2_PCR_Reset(17) at locality 0 was not refused "
+                     "with TPM_RC_LOCALITY", 1024);
+        } else {
+            ml_printf("PASS: TPM2_PCR_Reset(17) at locality 0 refused "
+                      "(rc=0x%x)\n", rc);
+        }
+
+        {
+            uint32_t access;
+            uint32_t i;
+            int granted = 0;
+
+            tis_writeb_at(TPM_TIS_BASE + TIS_LOCTY_OFF(4) + TIS_OFF_ACCESS,
+                          TIS_ACCESS_REQUEST_USE);
+            for (i = 0; i < 100000; i++) {
+                access = tis_readl_at(TPM_TIS_BASE + TIS_LOCTY_OFF(4) +
+                                     TIS_OFF_ACCESS);
+                if (access & TIS_ACCESS_ACTIVE_LOCALITY) {
+                    granted = 1;
+                    break;
+                }
+            }
+            if (granted) {
+                fail_msg("locality 4 became active for the guest "
+                         "(hardware-only locality)", 1024);
+            } else {
+                ml_printf("PASS: guest cannot select locality 4 "
+                          "(ACCESS=0x%x)\n", access);
+            }
+        }
+
+        pcrextend_build(7, pcr18_expected);
+        rc = tpm2_cmd_rc(TPM_TIS_BASE, tpm2_pcrextend_cmd,
+                         sizeof(tpm2_pcrextend_cmd));
+        if (rc != 0) {
+            ml_printf("smx: TPM2_PCR_Extend(7) at locality 0 rc=0x%x\n", rc);
+            fail_msg("TPM2_PCR_Extend(7) at locality 0 was not accepted "
+                     "(control)", 1024);
+        } else {
+            ml_printf("PASS: TPM2_PCR_Extend(7) at locality 0 accepted "
+                      "(control)\n");
         }
     }
 

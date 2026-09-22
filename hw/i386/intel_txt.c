@@ -18,6 +18,7 @@
 
 #include "qemu/osdep.h"
 
+#include "e820_memory_layout.h"
 #include "hw/i386/intel_txt.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
@@ -454,6 +455,39 @@ enum {
 #define ACM_CHIPSET_ID_OFF_REVISION   0x08   /* u16 */
 #define ACM_CHIPSET_ID_FLAG_REV_MASK  0x1
 
+/*
+ * sinit_mle_data (tboot include/txt/heap.h, sinit_mle_data_t) and
+ * the memory descriptors it carries.  Offsets are bytes from the
+ * start of the structure, which is the data part of the heap section
+ * (after its size prefix); the fields marked "TPM 1.2" and the VT-d
+ * DMAR fields are all zero in QEMU.
+ */
+#define SINIT_MLE_OFF_VERSION           0x00  /* u32 */
+#define SINIT_MLE_OFF_BIOS_ACM_ID       0x04  /* 20 bytes, TPM 1.2 */
+#define SINIT_MLE_OFF_EDX_SENTER_FLAGS  0x18  /* u32, TPM 1.2 */
+#define SINIT_MLE_OFF_MSEG_VALID        0x1c  /* u64, TPM 1.2 */
+#define SINIT_MLE_OFF_SINIT_HASH        0x24  /* 20 bytes, TPM 1.2 */
+#define SINIT_MLE_OFF_MLE_HASH          0x38  /* 20 bytes, TPM 1.2 */
+#define SINIT_MLE_OFF_STM_HASH          0x4c  /* 20 bytes, TPM 1.2 */
+#define SINIT_MLE_OFF_LCP_POLICY_HASH   0x60  /* 20 bytes, TPM 1.2 */
+#define SINIT_MLE_OFF_LCP_POLICY_CTRL   0x74  /* u32, TPM 1.2 */
+#define SINIT_MLE_OFF_RLP_WAKEUP_ADDR   0x78  /* u32 */
+#define SINIT_MLE_OFF_RESERVED          0x7c  /* u32 */
+#define SINIT_MLE_OFF_NUM_MDRS          0x80  /* u32 */
+#define SINIT_MLE_OFF_MDRS_OFF          0x84  /* u32, from section start */
+#define SINIT_MLE_OFF_NUM_VTD_DMARS     0x88  /* u32 */
+#define SINIT_MLE_OFF_VTD_DMARS_OFF     0x8c  /* u32 */
+#define SINIT_MLE_FIXED_SIZE            0x90  /* version 6 fixed part */
+#define SINIT_MLE_VERSION               6
+
+/* sinit_mdr_t: u64 base, u64 length, u8 mem_type, 7 reserved bytes */
+#define SINIT_MDR_SIZE                  0x18
+#define SINIT_MDR_OFF_BASE              0x00  /* u64 */
+#define SINIT_MDR_OFF_LENGTH            0x08  /* u64 */
+#define SINIT_MDR_OFF_MEM_TYPE          0x10  /* u8 */
+/* The only MDR type tboot's e820 verification treats as covering */
+#define MDR_MEMTYPE_GOOD                0x00
+
 /* ACM_UUID_V3 from tboot include/txt/acmod.h, in wire order */
 static const uint8_t intel_txt_acm_uuid[16] = {
     0xaa, 0x3a, 0xc0, 0x7f, 0xa7, 0x46, 0xdb, 0x18,
@@ -755,6 +789,19 @@ static bool intel_txt_gread_u64(uint64_t addr, uint64_t *out, Error **errp)
     return true;
 }
 
+/* Write @len bytes of guest memory, reporting the failing address. */
+static bool intel_txt_gwrite(uint64_t addr, const void *buf, size_t len,
+                             Error **errp)
+{
+    if (address_space_write(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        error_setg(errp, "cannot write %zu bytes of guest memory at 0x%"
+                   PRIx64, len, addr);
+        return false;
+    }
+    return true;
+}
+
 /*
  * Translate MLE linear offset @lin to a guest physical address using the
  * page table at @ptab: PDPT[0] -> PD -> PT -> 4 KiB page.  Only the
@@ -796,6 +843,38 @@ static bool intel_txt_mle_xlate(uint64_t ptab, uint64_t lin, uint64_t *phys,
 }
 
 /*
+ * Parse the size-prefixed TXT heap sections (tboot include/txt/heap.h,
+ * "TXT heap data format and field accessor fns"): bios_data,
+ * os_mle_data, os_sinit_data and sinit_mle_data follow one another at
+ * HEAP_BASE, each preceded by a u64 byte count that includes the count
+ * itself.  Reads the first three sizes and requires that the sections
+ * fit in HEAP_SIZE.  The caller is responsible for the heap register
+ * preconditions (HEAP_BASE/SIZE set, the heap entirely below 4 GiB),
+ * which also bound every offset computed from them.
+ */
+static bool intel_txt_heap_parse(IntelTxtState *s,
+                                 uint64_t *bios_sz, uint64_t *os_mle_sz,
+                                 uint64_t *os_sinit_sz, Error **errp)
+{
+    if (!intel_txt_gread_u64(s->heap_base, bios_sz, errp) ||
+        !intel_txt_gread_u64(s->heap_base + *bios_sz, os_mle_sz, errp) ||
+        !intel_txt_gread_u64(s->heap_base + *bios_sz + *os_mle_sz,
+                             os_sinit_sz, errp)) {
+        return false;
+    }
+    if (*bios_sz < sizeof(uint64_t) || *os_mle_sz < sizeof(uint64_t) ||
+        *os_sinit_sz < sizeof(uint64_t) ||
+        *bios_sz + *os_mle_sz + *os_sinit_sz > s->heap_size) {
+        error_setg(errp, "TXT heap sections do not fit in HEAP_SIZE "
+                   "(bios 0x%" PRIx64 ", os_mle 0x%" PRIx64
+                   ", os_sinit 0x%" PRIx64 ", heap 0x%" PRIx64 ")",
+                   *bios_sz, *os_mle_sz, *os_sinit_sz, s->heap_size);
+        return false;
+    }
+    return true;
+}
+
+/*
  * Spec step c: hash the MLE as the page table maps it and extend PCR 18
  * with the result (which is what a real SINIT ACM does).  PCR 18 has
  * already been zeroed by the _TPM_Hash_Start of step a, so the value
@@ -815,19 +894,14 @@ static int intel_txt_measure_mle(IntelTxtState *s, Error **errp)
     int ret = -1;
 
     /* Walk the size-prefixed heap sections to reach os_sinit_data. */
-    if (!intel_txt_gread_u64(s->heap_base, &bios_sz, errp) ||
-        !intel_txt_gread_u64(s->heap_base + bios_sz, &os_mle_sz, errp) ||
-        !intel_txt_gread_u64(s->heap_base + bios_sz + os_mle_sz,
-                             &os_sinit_sz, errp)) {
+    if (!intel_txt_heap_parse(s, &bios_sz, &os_mle_sz, &os_sinit_sz,
+                              errp)) {
         return -1;
     }
-    if (bios_sz < sizeof(uint64_t) || os_mle_sz < sizeof(uint64_t) ||
-        os_sinit_sz < sizeof(uint64_t) + OS_SINIT_MIN_SIZE ||
-        bios_sz + os_mle_sz + os_sinit_sz > s->heap_size) {
-        error_setg(errp, "TXT heap sections do not fit in HEAP_SIZE "
-                   "(bios 0x%" PRIx64 ", os_mle 0x%" PRIx64
-                   ", os_sinit 0x%" PRIx64 ", heap 0x%" PRIx64 ")",
-                   bios_sz, os_mle_sz, os_sinit_sz, s->heap_size);
+    if (os_sinit_sz < sizeof(uint64_t) + OS_SINIT_MIN_SIZE) {
+        error_setg(errp, "os_sinit_data is 0x%" PRIx64 " bytes, below the "
+                   "0x%x minimum for its structure", os_sinit_sz,
+                   (unsigned)(sizeof(uint64_t) + OS_SINIT_MIN_SIZE));
         return -1;
     }
     os_sinit = s->heap_base + bios_sz + os_mle_sz + sizeof(uint64_t);
@@ -922,6 +996,144 @@ out:
     g_free(sha1);
     g_free(sha256);
     return ret;
+}
+
+/*
+ * Build and write the sinit_mle_data heap section, the data SINIT
+ * hands to the MLE (tboot include/txt/heap.h, sinit_mle_data_t,
+ * version 6): the fixed structure followed immediately by the memory
+ * descriptor (MDR) array it points to.
+ *
+ * The loader has already laid out the four size-prefixed heap
+ * sections and reserved the size of the fourth; this fills in its
+ * contents and leaves the loader's size prefix in place.  tboot
+ * verifies the guest e820 map against the MDRs after the measured
+ * launch (txt/verify.c, verify_e820_map): any RAM not covered by an
+ * MDR with mem_type at most MDR_MEMTYPE_GOOD is downgraded and the
+ * verification fails, and the gaps before the first and after the
+ * last covering MDR must hold no RAM.  So every E820_RAM entry of
+ * QEMU's own e820 table becomes a GOOD MDR, covering low and high
+ * memory alike; the gaps between them are non-RAM by construction,
+ * which is exactly what tboot's gap walk requires.
+ *
+ * Not called yet: the launch commit wires this into the SENTER path
+ * together with the CPU transfer, so the attribute silences the
+ * unused-function warning until then.
+ */
+static bool G_GNUC_UNUSED intel_txt_write_sinit_mle_data(IntelTxtState *s,
+                                                         Error **errp)
+{
+    uint64_t bios_sz, os_mle_sz, os_sinit_sz;
+    uint64_t heap_end, region, region_size;
+    uint64_t mdr_off, mdr_end;
+    int nr_entries, nr_ram = 0, i;
+    uint8_t *buf;
+
+    /*
+     * The same precondition 4 as the staged launch: the heap
+     * registers are set and the whole heap is below 4 GiB, which
+     * also bounds every offset computed below.
+     */
+    if (s->heap_base == 0 || s->heap_size == 0 ||
+        s->heap_base >= INTEL_TXT_GUEST_32BIT_LIMIT ||
+        s->heap_size > INTEL_TXT_GUEST_32BIT_LIMIT - s->heap_base) {
+        error_setg(errp, "TXT.HEAP_BASE/SIZE not set or not entirely "
+                   "below 4 GiB (base 0x%" PRIx64 ", size 0x%" PRIx64 ")",
+                   s->heap_base, s->heap_size);
+        return false;
+    }
+
+    if (!intel_txt_heap_parse(s, &bios_sz, &os_mle_sz, &os_sinit_sz,
+                              errp)) {
+        return false;
+    }
+
+    /*
+     * The sinit_mle_data section starts after the first three.  Its
+     * size prefix is set by the loader, and the whole section, prefix
+     * included, must fit in the heap.
+     */
+    heap_end = s->heap_base + s->heap_size;
+    region = s->heap_base + bios_sz + os_mle_sz + os_sinit_sz;
+    if (!intel_txt_gread_u64(region, &region_size, errp)) {
+        return false;
+    }
+    if (region_size < sizeof(uint64_t) || region_size > heap_end - region) {
+        error_setg(errp, "sinit_mle_data section of 0x%" PRIx64
+                   " bytes at heap offset 0x%" PRIx64 " does not fit "
+                   "in the 0x%" PRIx64 " byte heap",
+                   region_size, region - s->heap_base, s->heap_size);
+        return false;
+    }
+
+    /*
+     * One GOOD MDR per E820_RAM entry of QEMU's own e820 table, the
+     * same collection fw_cfg and the TDX measurement make.
+     */
+    nr_entries = e820_get_table(NULL);
+    for (i = 0; i < nr_entries; i++) {
+        uint64_t addr, len;
+
+        if (e820_get_entry(i, E820_RAM, &addr, &len)) {
+            nr_ram++;
+        }
+    }
+    if (nr_ram == 0) {
+        error_setg(errp, "no E820_RAM entries in the guest e820 table");
+        return false;
+    }
+
+    /*
+     * The MDR array sits right after the fixed structure.  mdrs_off
+     * is measured from the start of the section, i.e. its size prefix
+     * (tboot txt/txt.c: mdrs_base = sinit_mle_data - sizeof(uint64_t)
+     * + mdrs_off), so the 8 byte prefix precedes the structure.
+     */
+    mdr_off = sizeof(uint64_t) + SINIT_MLE_FIXED_SIZE;
+    mdr_end = mdr_off + (uint64_t)nr_ram * SINIT_MDR_SIZE;
+    if (mdr_end > region_size) {
+        error_setg(errp, "sinit_mle_data with %d MDRs needs 0x%" PRIx64
+                   " bytes, more than the 0x%" PRIx64 " byte section",
+                   nr_ram, mdr_end, region_size);
+        return false;
+    }
+
+    buf = g_malloc0(mdr_end);
+    stl_le_p(buf + SINIT_MLE_OFF_VERSION, SINIT_MLE_VERSION);
+    /*
+     * rlp_wakeup_addr stays zero: the emulation uses the
+     * GETSEC[WAKEUP] rendezvous, not the MONITOR mechanism.  All the
+     * TPM 1.2 hash and policy fields and the VT-d DMAR fields stay
+     * zero as well.
+     */
+    stl_le_p(buf + SINIT_MLE_OFF_NUM_MDRS, nr_ram);
+    stl_le_p(buf + SINIT_MLE_OFF_MDRS_OFF, mdr_off);
+
+    {
+        uint64_t off = mdr_off;
+
+        for (i = 0; i < nr_entries; i++) {
+            uint64_t addr, len;
+
+            if (!e820_get_entry(i, E820_RAM, &addr, &len)) {
+                continue;
+            }
+            /* mem_type stays zero: MDR_MEMTYPE_GOOD */
+            stq_le_p(buf + off + SINIT_MDR_OFF_BASE, addr);
+            stq_le_p(buf + off + SINIT_MDR_OFF_LENGTH, len);
+            off += SINIT_MDR_SIZE;
+        }
+    }
+
+    if (!intel_txt_gwrite(region + sizeof(uint64_t), buf, mdr_end,
+                          errp)) {
+        g_free(buf);
+        return false;
+    }
+
+    trace_txt_sinit_mle_data((uint32_t)nr_ram, region - s->heap_base);
+    g_free(buf);
+    return true;
 }
 
 /*

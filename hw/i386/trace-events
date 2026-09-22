@@ -160,3 +160,4 @@ txt_drtm_hash_start(int locty, size_t len) "DRTM: _TPM_Hash_Start at locality %d
 txt_drtm_hash_done(size_t len) "DRTM: _TPM_Hash_End done, %zu bytes measured"
 txt_measure_mle(uint64_t ptab, uint64_t size, uint64_t hdr_off) "DRTM: MLE measured via ptab 0x%"PRIx64" size 0x%"PRIx64" hdr@0x%"PRIx64
 txt_acm_validated(uint64_t size, uint32_t entry_point, uint32_t chipset_ids) "GETSEC[SENTER]: SINIT ACM accepted, size 0x%"PRIx64" entry 0x%"PRIx32" %"PRIu32" chipset ids"
+txt_sinit_mle_data(uint32_t num_mdrs, uint64_t region_off) "sinit_mle_data written: %u MDRs at heap offset 0x%"PRIx64

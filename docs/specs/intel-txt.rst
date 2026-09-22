@@ -362,6 +362,36 @@ support. The semantic SENTER honors ``rlp_wake_getsec`` /
 ``rlp_wake_monitor`` from the intersection of MLE and os_sinit_data
 capabilities.
 
+The emulated SINIT advertises ``rlp_wake_getsec`` and **not**
+``rlp_wake_monitor``, which pins the RLP wake to GETSEC[WAKEUP].  The
+choice is the ACM's to make: an MLE takes MONITOR whenever the ACM
+offers it and only falls back to GETSEC otherwise (tboot
+``txt/txt.c``, ``txt_launch_environment()``).  GETSEC[WAKEUP] is the
+leaf this model implements, so offering MONITOR as well would only
+let the MLE select a mechanism QEMU does not provide.
+
+RLP wake is a separate question from how the MLE then *parks* its
+APs, and the two are chosen independently -- the wake method comes
+from this capability intersection, while the parking method is the
+MLE's own decision (in tboot, the ``ap_wake_mwait`` command-line
+option).  The distinction matters to this emulation because the two
+parking strategies have very different requirements:
+
+- MONITOR/MWAIT parking is a polling loop over a shared trigger word
+  with MWAIT as a power hint.  Under TCG MWAIT on an AP resolves to
+  ``helper_pause()``, which yields to the main loop without halting
+  the vCPU, so the loop still makes progress and the mechanism works.
+- Parking APs in a VMX mini-guest (tboot's default) executes VMXON,
+  VMPTRLD, a long run of VMWRITEs and VMLAUNCH, and relies on
+  intercepting INIT/SIPI.  **QEMU TCG implements no VMX at all**, so
+  that path faults on the first VMXON.
+
+Measured launch under this model therefore expects an MLE configured
+for MONITOR/MWAIT parking (for tboot, ``ap_wake_mwait=true``).  Note
+that an MLE which gates on ``CPUID.1.ECX.VMX`` before it gets that
+far will still refuse to launch; tboot skips its VMX check entirely
+when MWAIT parking is selected.
+
 Semantic measured launch (GETSEC[SENTER])
 =========================================
 

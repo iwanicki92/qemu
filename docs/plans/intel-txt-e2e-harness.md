@@ -59,7 +59,7 @@ can do this is a discovery item, not an assumption that stock firmware works.
 | Firmware/loader | Consistent heap, memory map, DPR and SINIT placement; real tboot accepts the platform and ACM |
 | Launch | Actual SENTER followed by tboot post-launch execution, valid TXT state and populated output heap |
 | Entry state | Required CPU registers/state and page mappings verified by diagnostic checks and real MLE execution |
-| SMP | Single-CPU baseline, then AP rendezvous/wakeup and all configured CPUs online |
+| SMP | Single-CPU baseline first. AP rendezvous/wakeup and all configured CPUs online is gated on the MWAIT-parking dependency noted below, not assumed reachable |
 | OS handoff | Linux recognises the tboot shared handoff; initramfs reports measured-launch status |
 | Measurements | Event log replay agrees with selected active PCR banks; quote signature, fresh nonce and PCR digest verified |
 | TPM sharing | Ordinary guest TPM commands remain usable after launch; no unsolicited frontend completions |
@@ -148,10 +148,22 @@ come from direct source and host inspection. No full-system boot has run yet.
   processor identity. Generate an integration fixture for these real checks;
   do not simply reuse the unit fixture or weaken tboot.
 - `supports_txt()` (`tboot/txt/verify.c:122-237`) checks Intel identity, SMX,
-  locked/enabled feature-control MSR and required GETSEC capabilities. Default
-  AP wakeup requires VMX; the supported `ap_wake_mwait=true` path uses MONITOR/
-  MWAIT when SSE3 is present. Evaluate that real tboot configuration for TCG,
-  rather than advertising unsupported VMX or using PERMISSIVE_BOOT.
+  locked/enabled feature-control MSR and required GETSEC capabilities. It also
+  requires VMX *unless* `use_mwait()` is true, in which case the VMX check is
+  skipped entirely. **Decision: run tboot with `ap_wake_mwait=true`.** The
+  reasoning is recorded in `docs/specs/intel-txt.rst`; in short, tboot's default
+  parks APs in a VMX mini-guest and QEMU TCG implements no VMX at all, while the
+  MWAIT parking loop still makes progress because TCG resolves MWAIT on an AP to
+  `helper_pause()`, a yield rather than a halt. This also means QEMU never has to
+  advertise a VMX capability it cannot honour.
+  Note the RLP *wake* stays GETSEC[WAKEUP] and is chosen separately, by what the
+  ACM advertises (`txt/txt.c:607-620`); only the *parking* is the MWAIT path.
+  `use_mwait()` additionally requires SSE3, so the CPU model must carry it.
+- Open dependency for SMP: with MWAIT parking the OS wakes each AP by writing
+  `ap_wake_trigger` in the tboot shared page, so Linux needs tboot MWAIT support.
+  The tboot README warns the system "can never boot up" without it. Unverified
+  here (no kernel source tree available). Irrelevant at one vCPU, where there are
+  no APs at all, but it gates the SMP acceptance group.
 - `txt_verify_platform()` (`tboot/txt/verify.c:364-391`) also requires VT-d BIOS
   enablement and valid BIOS heap data. A firmware image and matching DMAR/VT-d
   configuration must be selected and verified, not assumed.

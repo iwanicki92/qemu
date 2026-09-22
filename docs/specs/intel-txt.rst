@@ -173,20 +173,18 @@ TYPE_CODE = 1 (SINIT ACM); the reason is the PROGRESS_CODE):
   +-------------+------------------------+----------------------------------------------------------------+
   | 0x80020001  | SINIT_NOT_IN_DPR       | SINIT region not entirely inside the (nonzero) DPR range       |
   +-------------+------------------------+----------------------------------------------------------------+
-  | 0x80030001  | HEAP_INVALID           | TXT.HEAP_BASE/SIZE zero or region not below 4 GiB              |
+  | 0x80030001  | HEAP_INVALID           | TXT heap registers or size-prefixed SINIT-MLE section invalid  |
   +-------------+------------------------+----------------------------------------------------------------+
-  | 0x80040001  | LAUNCH_INCOMPLETE      | Preconditions passed and the DRTM measurement succeeded, but   |
-  |             |                        | the launch stopped short of the MLE transfer (deviation 7)     |
+  | 0x80040001  | LAUNCH_INCOMPLETE      | Historical staged-launch code; no longer issued on success     |
   +-------------+------------------------+----------------------------------------------------------------+
-  | 0x80050001  | MEASURE_FAILED         | Preconditions passed but the DRTM measurement itself failed    |
-  |             |                        | (TPM backend error). Distinct from LAUNCH_INCOMPLETE on        |
-  |             |                        | purpose: one shared value made a rejected measurement          |
-  |             |                        | indistinguishable from a staged-but-successful one             |
+  | 0x80050001  | MEASURE_FAILED         | DRTM measurement or MLE image/entry validation failed          |
   +-------------+------------------------+----------------------------------------------------------------+
   | 0x80060001  | ACM_INVALID            | The region TXT.SINIT_BASE/SIZE points at does not              |
   |             |                        | structurally describe a SINIT ACM for this chipset - bad ACM   |
   |             |                        | header, malformed or out-of-bounds info table, or a chipset    |
   |             |                        | id list that does not cover TXT.DIDVID.                        |
+  +-------------+------------------------+----------------------------------------------------------------+
+  | 0x80070001  | APS_UNSUPPORTED        | Multiple vCPUs: AP sleep/wakeup is not implemented yet         |
   +-------------+------------------------+----------------------------------------------------------------+
 
 TXT private config space
@@ -395,8 +393,8 @@ when MWAIT parking is selected.
 Semantic measured launch (GETSEC[SENTER])
 =========================================
 
-Preconditions checked by the helper, each failure raising
-TXT.ERRORCODE + machine reset (as on HW):
+Preconditions checked by the helper; failures set TXT.ERRORCODE and
+return without a machine reset (a QEMU semantic deviation):
 
 1. CR4.SMXE, CPL0, chipset present (CAPABILITIES bit0).
 2. EBX/ECX: SINIT ACM in guest RAM, below 4 GiB, within DPR cover,
@@ -429,12 +427,11 @@ TXT.ERRORCODE + machine reset (as on HW):
      is what loaders match against; the header's own ``chipset_id``
      field is not used for this.
 
-   Deliberately **not** checked: the RSA signature and public-key
-   fields (see the note below), the processor id list (there is no
-   meaningful emulated platform id to match), and the SINIT/MLE
-   capability intersection plus the ``MLE_JOIN`` ``seg_sel`` /
-   ``gdt_limit`` checks, which belong to the later MLE-transfer slice
-   that actually consumes them.
+   The ACM ``seg_sel`` and ``gdt_limit`` are checked before the
+   transfer; the ACM GDT describes the BSP's entry selectors. Not
+   checked: RSA signature and public-key fields, the processor id
+   list (no emulated platform id), or SINIT/MLE capability intersection.
+   ``MLE_JOIN`` is for later AP wakeup, not the BSP entry.
 
    **No signature check**: ``rsa2048_pubkey``, ``pub_exp`` and
    ``rsa2048_sig`` are ignored. On real hardware the CPU verifies
@@ -448,37 +445,37 @@ TXT.ERRORCODE + machine reset (as on HW):
    non-zero, page-aligned, below 4 GiB; ``mle_size`` non-zero,
    page-aligned and at most 2 MiB (one page table); ``mle_hdr_base``
    leaves room for an MLE header inside ``[0, mle_size)``; the MLE
-   header's UUID matches ``MLE_HDR_UUID`` and its length is at
-   least the header minimum.
+   header's UUID matches ``MLE_HDR_UUID`` and its length fits in
+   the image; ``entry_point`` is inside the image and resolves to a
+   physical address below 4 GiB. The fourth size-prefixed section
+   (sinit_mle_data) must fit the heap and its GOOD memory descriptors.
 
-Steps performed by QEMU (standing in for SINIT):
+SINIT-equivalent sequence (unimplemented portions noted):
 
 a. Reset DRTM PCRs 17-22 (to zero; they read all-ones before any
    launch).
-b. Open private space, set ``STS.private_open``.
+b. Keep private space open for the MLE; set ``STS.private_open`` on
+   successful entry.
 c. Compute the MLE hash (SHA-1 for TPM1.2; for TPM2, per active
    bank: SHA-1/SHA-256/...) over ``[0, mle_size)`` as mapped by
    the page table at ``mle_ptab``, and extend PCR 18 with it.
    Ordered after the step-d hash sequence, because
    ``_TPM_Hash_Start`` zeroes PCR 18 as well.
-d. Extend at **TIS locality 4** through the TPM backend:
-   PCR17 (launch policy / DRTM control digests, MLE guide Table 1),
-   PCR18 (MLE hash — SinitMleData.MleHash digest), PCR19 (launch
-   context digests). Locality 3 is used for the SINIT-authority
-   digests where applicable.
-e. Populate ``sinit_mle_data_t``: version, edx_senter_flags,
-   sinit_hash, mle_hash, stm_hash, lcp_policy_hash, rlp_wakeup_addr,
-   MDRs (from the guest memory map), num_vtd_dmars=0,
-   proc_scrtm_status.
-f. Set ``TXT.MLE_JOIN`` semantics: record the RLP join (from
-   os_sinit_data or MLE header) so GETSEC[WAKEUP] can send APs there.
-g. Enforce VT-d PMR-equivalent protection on the MLE range
-   (M5-level functional enforcement).
+d. Extend the first PCR17 component at **TIS locality 4** through
+   the TPM backend. The remaining launch-policy/context digests
+   (including PCR19) are not yet implemented.
+e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
+   E820_RAM entries. The other hash/policy fields and DMAR count
+   currently remain zero.
+f. ``TXT.MLE_JOIN`` is written by the MLE and consumed by the later
+   GETSEC[WAKEUP] leaf; AP wakeup remains unimplemented.
+g. VT-d PMR-equivalent protection on the MLE range remains deferred.
 h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).
-i. Transfer BSP control to the MLE entry point (see below). APs are
-   held in the TXT sleep state until GETSEC[WAKEUP] / MONITOR wake.
+i. Transfer BSP control to the MLE entry point (see below). Until
+   AP sleep state and GETSEC[WAKEUP] exist, reject multi-vCPU launches
+   before changing PCRs; APs are **not** silently left running.
 
 Private space is opened at step b and is *not* closed by SENTER.  An
 earlier revision of this document had step h close it, which no MLE
@@ -491,9 +488,14 @@ from its own teardown path via ``CMD_CLOSE_PRIVATE``
 open from reset, stays open across SENTER for the MLE's use, and is
 closed by the MLE or by a TXT reset.
 
-Current staged state (deviation 7): the helper implements the
-preconditions plus steps a, c and d over the SINIT ACM region
-(TXT.SINIT_BASE/SIZE), using the TIS ``_TPM_Hash_Start`` /
+Current implementation: for a single vCPU, SENTER checks the launch
+inputs, measures the SINIT ACM and MLE, writes the SINIT-MLE heap section,
+sets the SENTER_DONE / MEM_CONFIG_LOCK / PRIVATE_OPEN status bits, and
+transfers BSP execution to the MLE entry with its PAE page tables.
+Multiple vCPUs are rejected *before measurement*: until GETSEC[WAKEUP]
+and AP sleep state are implemented, allowing an AP to continue running
+outside the measured environment would violate the DRTM boundary.
+The SINIT measurement uses the TIS ``_TPM_Hash_Start`` /
 ``_TPM_Hash_Data`` / ``_TPM_Hash_End`` signal sequence at locality 4.
 ``_TPM_Hash_Start`` resets the DRTM PCRs and ``_TPM_Hash_End`` extends
 PCR 17 with the hash of the region in every active bank, so the TPM
@@ -511,16 +513,13 @@ backend's control channel, so it requires ``-tpmdev emulator``; the
 passthrough backend cannot express it, and ``txt=on`` refuses a
 backend that does not implement it.
 
-The resulting PCR 17 is still only the *first component* of the
-eventual composite; steps c/e extend the remainder (MLE and
-launch-context digests), so it is neither final nor attestable and
-will change when those land.  PCR 18 (the MLE hash) is not extended
-yet.  Instead of steps b-i, SENTER records TXT.ERRORCODE =
-0x80040001 (LAUNCH_INCOMPLETE) and returns normally;
-STS.SENTER_DONE is not set, so a loader seeing ERRORCODE/STS observes
-a failed launch — the staging state the master plan sanctions.  A
-precondition failure records the matching precondition ERRORCODE and
-issues no TPM commands at all.
+PCR 17 remains only the first component of the eventual composite;
+launch-context digests are not yet extended, so it is not final or
+attestable. PCR 18 receives the measured MLE hash. Invalid ACM inputs
+and unsupported SMP are rejected before TPM commands; malformed MLE
+or missing SINIT-MLE heap data may be rejected after DRTM measurement,
+with STS.SENTER_DONE clear. A successful single-vCPU launch clears
+TXT.ERRORCODE and enters the MLE instead of returning to the loader.
 
 MLE entry CPU state (BSP), per MLE Dev Guide:
 
@@ -623,18 +622,13 @@ Deviations from real hardware
    differ from what a real SINIT would extend (exact per-generation
    digest lists, e.g. for PCR17, are normalized to the MLE guide's
    documented sequence).
-7. SENTER is staged ("semantic measured launch": preconditions +
-   steps a, c and d over the SINIT region and MLE): it does not
-   transfer
-   control to the MLE, does not set STS.SENTER_DONE, and returns
-   normally instead of performing the HW TXT reset.  Both the
-   successful-measurement path and the precondition failures
-   therefore surface as defined TXT.ERRORCODE values (table above)
-   that a loader reading the registers would treat as a failed
-   launch.  This is the master plan's M2/M3 staging state, to be
-   replaced when the MLE entry/transfer slice lands.
-8. The staged SENTER takes the SINIT base/size from the pre-
-   programmed TXT.SINIT_BASE/SIZE registers; it does not latch the
+7. SENTER transfers a single BSP to the MLE after the partial DRTM
+   measurement. Multiple vCPUs are rejected before measurement until
+   AP parking and GETSEC[WAKEUP] are implemented. The PCR 17 composite
+   and VT-d enforcement remain incomplete: a successful transfer
+   does not imply production-grade TXT attestation.
+8. SENTER takes the SINIT base/size from the pre-programmed
+   TXT.SINIT_BASE/SIZE registers; it does not latch the
    GETSEC[SENTER] EBX/ECX operands into them (on HW the chipset
    latches the operands).
 

@@ -20,6 +20,7 @@
 
 #include "e820_memory_layout.h"
 #include "hw/i386/intel_txt.h"
+#include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
@@ -883,7 +884,8 @@ static bool intel_txt_heap_parse(IntelTxtState *s,
  * already been zeroed by the _TPM_Hash_Start of step a, so the value
  * lands as a clean extend-from-zero.
  */
-static int intel_txt_measure_mle(IntelTxtState *s, Error **errp)
+static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
+                                 Error **errp)
 {
     uint64_t bios_sz, os_mle_sz, os_sinit_sz, os_sinit;
     uint64_t ptab, mle_size, hdr_base, hdr_phys, entry_phys;
@@ -1009,6 +1011,10 @@ static int intel_txt_measure_mle(IntelTxtState *s, Error **errp)
     trace_txt_measure_mle(ptab, mle_size, hdr_base);
     ret = intel_txt_drtm_extend_pcr(s, INTEL_TXT_DRTM_PCR_MLE, digests, 2,
                                    errp);
+    if (ret == 0) {
+        entry->entry_phys = entry_phys;
+        entry->ptab = ptab;
+    }
 out:
     g_free(mle);
     g_free(sha1);
@@ -1034,12 +1040,8 @@ out:
  * memory alike; the gaps between them are non-RAM by construction,
  * which is exactly what tboot's gap walk requires.
  *
- * Not called yet: the launch commit wires this into the SENTER path
- * together with the CPU transfer, so the attribute silences the
- * unused-function warning until then.
  */
-static bool G_GNUC_UNUSED intel_txt_write_sinit_mle_data(IntelTxtState *s,
-                                                         Error **errp)
+static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
 {
     uint64_t bios_sz, os_mle_sz, os_sinit_sz;
     uint64_t heap_end, region, region_size;
@@ -1365,15 +1367,30 @@ static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
     return 0;
 }
 
-void intel_txt_senter(IntelTxtState *s)
+bool intel_txt_senter(IntelTxtState *s, IntelTxtMleEntry *entry)
 {
-    uint64_t dpr_size;
-    uint64_t dpr_top;
+    uint64_t dpr_size, dpr_top, cs_addr, ds_addr;
+    uint32_t cs_flags, ds_flags;
     uint8_t *acm = NULL;
+    CPUState *cpu;
     Error *err = NULL;
     int ret = 0;
 
     trace_txt_senter();
+
+    /*
+     * GETSEC[WAKEUP] is not implemented yet.  Never claim a measured
+     * launch while another vCPU can keep executing outside the MLE.
+     * Reject before resetting any PCR, rather than leaving live APs
+     * outside the DRTM boundary.
+     */
+    CPU_FOREACH(cpu) {
+        if (cpu != current_cpu) {
+            s->errorcode = TXT_ERRORCODE_APS_UNSUPPORTED;
+            trace_txt_senter_errorcode(s->errorcode);
+            return false;
+        }
+    }
 
     /*
      * Precondition 2: TXT.SINIT_BASE/SIZE.  Non-zero, the region
@@ -1420,6 +1437,35 @@ void intel_txt_senter(IntelTxtState *s)
     if (intel_txt_validate_acm(s, acm, s->sinit_size, &err) < 0) {
         goto fail_acm;
     }
+    entry->gdt_base = ldl_le_p(acm + ACM_HDR_OFF_GDT_BASE);
+    entry->gdt_limit = ldl_le_p(acm + ACM_HDR_OFF_GDT_LIMIT);
+    entry->seg_sel = ldl_le_p(acm + ACM_HDR_OFF_SEG_SEL);
+    cs_addr = (uint64_t)entry->gdt_base + entry->seg_sel;
+    ds_addr = cs_addr + 8;
+    if (cs_addr >= INTEL_TXT_GUEST_32BIT_LIMIT ||
+        ds_addr > INTEL_TXT_GUEST_32BIT_LIMIT - 8 ||
+        !intel_txt_gread_u64(cs_addr, &entry->cs_desc, &err) ||
+        !intel_txt_gread_u64(ds_addr, &entry->ds_desc, &err)) {
+        if (!err) {
+            error_setg(&err, "ACM GDT descriptors exceed 32-bit memory");
+        }
+        goto fail_acm;
+    }
+    cs_flags = entry->cs_desc >> 32;
+    ds_flags = entry->ds_desc >> 32;
+    /*
+     * Require present, ring-0, 32-bit code and writable data GDT
+     * entries. Installing unvalidated descriptors in the CPU cache
+     * would turn a malformed ACM into a post-measurement triple fault.
+     */
+    if (entry->gdt_limit > UINT16_MAX ||
+        (cs_flags & 0x0040f800) != 0x00409800 ||
+        (ds_flags & 0x0040fa00) != 0x00409200 ||
+        (cs_flags & 0x00200000)) {
+        error_setg(&err, "ACM GDT does not contain 32-bit ring-0 code "
+                   "and writable data descriptors");
+        goto fail_acm;
+    }
 
     /*
      * Precondition 4: TXT.HEAP_BASE/SIZE set, the region below
@@ -1446,11 +1492,9 @@ void intel_txt_senter(IntelTxtState *s)
      * The TPM does the hashing here, exactly as on real hardware where
      * the chipset streams bytes at it rather than presenting a digest.
      *
-     * This is still only the first component of the eventual PCR 17
-     * value: steps c/e (MLE hash, sinit_mle_data) extend more in later
-     * slices, so it is not final or attestable.  PCR 18 is untouched;
-     * its content is the MLE hash, which needs the heap parsing of
-     * step c.
+     * This is only the first component of the eventual PCR 17 value;
+     * launch-context digests are not yet extended, so PCR 17 is not
+     * final or attestable.  PCR 18 receives the MLE hash below.
      */
     ret = intel_txt_drtm_hash_measure(s, acm, s->sinit_size, &err);
     if (ret < 0) {
@@ -1462,29 +1506,35 @@ void intel_txt_senter(IntelTxtState *s)
      * sequence because _TPM_Hash_Start zeroes PCR 18 as well, so doing
      * it the other way round would discard this extend.
      */
-    ret = intel_txt_measure_mle(s, &err);
+    ret = intel_txt_measure_mle(s, entry, &err);
     if (ret < 0) {
         goto fail_measure;
     }
+    if (!intel_txt_write_sinit_mle_data(s, &err)) {
+        goto fail_heap_data;
+    }
 
     g_free(acm);
-    s->errorcode = TXT_ERRORCODE_LAUNCH_INCOMPLETE;
-    trace_txt_senter_errorcode(s->errorcode);
-    return;
+    s->errorcode = 0;
+    s->sts |= TXT_STS_SENTER_DONE | TXT_STS_MEM_CONFIG_LOCK |
+              TXT_STS_PRIVATE_OPEN;
+    return true;
 
 fail_sinit_region:
     s->errorcode = TXT_ERRORCODE_SINIT_REGION_INVALID;
     trace_txt_senter_errorcode(s->errorcode);
-    return;
+    return false;
 fail_sinit_dpr:
     s->errorcode = TXT_ERRORCODE_SINIT_NOT_IN_DPR;
     trace_txt_senter_errorcode(s->errorcode);
-    return;
+    return false;
+fail_heap_data:
+    error_report_err(err);
 fail_heap:
     g_free(acm);
     s->errorcode = TXT_ERRORCODE_HEAP_INVALID;
     trace_txt_senter_errorcode(s->errorcode);
-    return;
+    return false;
 fail_acm:
     /*
      * A precondition failure, so nothing has been measured: report
@@ -1495,20 +1545,17 @@ fail_acm:
     g_free(acm);
     s->errorcode = TXT_ERRORCODE_ACM_INVALID;
     trace_txt_senter_errorcode(s->errorcode);
-    return;
+    return false;
 fail_measure:
     /*
-     * The launch inputs validated but the measurement itself failed
-     * (TPM backend error, in-flight request, ...).  This gets its own
-     * code rather than reusing LAUNCH_INCOMPLETE: sharing one value
-     * makes a rejected measurement look identical to a staged launch
-     * that measured successfully, which is precisely how a broken
-     * PCR_Reset went unnoticed behind a passing test.
+     * Measurement or MLE image/entry validation failed (TPM backend
+     * error, malformed MLE header or page table, ...).
      */
     error_report_err(err);
     g_free(acm);
     s->errorcode = TXT_ERRORCODE_MEASURE_FAILED;
     trace_txt_senter_errorcode(s->errorcode);
+    return false;
 }
 
 #endif /* CONFIG_TPM */

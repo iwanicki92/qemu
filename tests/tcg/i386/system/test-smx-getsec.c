@@ -104,6 +104,8 @@
 #define TXT_OFF_DPR            0x330
 
 #define TXT_STS_SENTER_DONE    (1ULL << 0)
+#define TXT_STS_MEM_CONFIG_LOCK (1ULL << 6)
+#define TXT_STS_PRIVATE_OPEN   (1ULL << 7)
 
 /* TXT.DPR layout: bit 0 LOCK, bits [11:4] SIZE in 1 MiB blocks,
    bits [31:20] TOP. */
@@ -124,7 +126,7 @@
  * docs/specs/intel-txt.rst).
  */
 #define TXT_ERR_SINIT_REGION_INVALID 0x80010001ULL
-#define TXT_ERR_LAUNCH_INCOMPLETE    0x80040001ULL
+#define TXT_ERR_HEAP_INVALID         0x80030001ULL
 #define TXT_ERR_MEASURE_FAILED       0x80050001ULL
 #define TXT_ERR_ACM_INVALID          0x80060001ULL
 
@@ -327,11 +329,9 @@ static void getsec_senter(void)
 {
     /*
      * SENTER is GETSEC[4]: opcode 0F 37 with the leaf index in EAX
-     * (0F 34 is SMI, not GETSEC).  At CPL0 with CR4.SMXE set and the
-     * chipset present this does not raise an exception in the staging
-     * state: the helper validates the launch inputs, issues the DRTM
-     * measurement, and returns normally with a defined TXT.ERRORCODE
-     * (see target/i386/tcg/smx_helper.c).
+     * (0F 34 is SMI, not GETSEC).  With valid launch inputs this
+     * transfers to the MLE; rejected launches return with a defined
+     * TXT.ERRORCODE (see target/i386/tcg/smx_helper.c).
      */
     asm volatile(".byte 0x0f, 0x37"
                  :
@@ -1056,6 +1056,10 @@ static const struct acm_mutation acm_mutations[] = {
     { "seg_sel past gdt_limit", ACM_OFF_SEG_SEL, 4, ACM_GDT_SIZE },
     { "gdt_limit too small for seg_sel", ACM_OFF_GDT_LIMIT, 4, 0 },
     { "seg_sel plus 8 overflows", ACM_OFF_SEG_SEL, 4, 0xfffffff8 },
+    { "GDT code descriptor is not executable", ACM_GDT_OFF + 8 + 5,
+      1, 0x92 },
+    { "GDT data descriptor not present", ACM_GDT_OFF + 16 + 5,
+      1, 0x12 },
     { "header_len puts the info table out of bounds", ACM_OFF_HEADER_LEN,
       4, 0x40000 },
     { "scratch_size puts the info table out of bounds",
@@ -1167,7 +1171,7 @@ static void setup_mle(void)
     }
 
     /* Heap sections. */
-    for (i = 0; i < 0x48; i++) {
+    for (i = 0; i < 0x50; i++) {
         heap[i] = 0;
     }
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x00) = 0x10;
@@ -1333,6 +1337,142 @@ static uint32_t tpm2_cmd_rc(uint32_t tis_base, const uint8_t *cmd,
     }
     return ((uint32_t)resp[6] << 24) | ((uint32_t)resp[7] << 16) |
          ((uint32_t)resp[8] << 8) | (uint32_t)resp[9];
+}
+
+/* The MLE entry stub sets its own stack before touching C code. */
+static uint8_t mle_entry_stack[4096] __attribute__((aligned(16)));
+/* volatile: the naked assembly entry writes these before C reads them. */
+static volatile uint32_t mle_seen_ebx, mle_seen_ecx, mle_seen_edx;
+/* volatile: these too are written by assembly, outside the C flow. */
+static volatile uint32_t mle_seen_eflags, mle_seen_cr0;
+
+/* volatile: read guest RAM that SENTER populated outside the C flow. */
+static uint64_t guest_le(volatile uint8_t *p, unsigned int bytes)
+{
+    uint64_t value = 0;
+    unsigned int i;
+
+    for (i = 0; i < bytes; i++) {
+        value |= (uint64_t)p[i] << (8 * i);
+    }
+    return value;
+}
+
+static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
+{
+    struct {
+        uint16_t limit;
+        uint32_t base;
+    } __attribute__((packed)) gdtr;
+    uint32_t cr0, cr3, cr4;
+    uint16_t cs, ds;
+    uint64_t sts;
+    /* volatile: SINIT writes this guest heap outside the C flow. */
+    volatile uint8_t *section = (volatile uint8_t *)(uintptr_t)
+        (TEST_HEAP_BASE + 0x48);
+    uint32_t count, off;
+
+    asm volatile("mov %%cr0, %0" : "=r"(cr0));
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    asm volatile("sgdt %0" : "=m"(gdtr));
+    asm volatile("mov %%cs, %0" : "=r"(cs));
+    asm volatile("mov %%ds, %0" : "=r"(ds));
+    sts = txt_read64(TXT_OFF_STS);
+    count = guest_le(section + 8 + 0x80, 4);
+    off = guest_le(section + 8 + 0x84, 4);
+
+    if (mle_seen_ebx != TEST_MLE_BASE + 0x200 ||
+        mle_seen_ecx != TEST_MLE_PTAB || mle_seen_edx != 0 ||
+        mle_seen_eflags != 0x2 || !(mle_seen_cr0 & (1u << 31)) ||
+        (cr0 & (1u << 31)) || !(cr4 & (1u << 5)) ||
+        cr3 != TEST_MLE_PTAB) {
+        fail_msg("MLE entry register/paging state is wrong", 16384);
+    }
+    if (gdtr.base != TEST_SINIT_BASE + ACM_GDT_OFF ||
+        gdtr.limit != ACM_GDT_LIMIT || cs != ACM_SEG_SEL ||
+        ds != ACM_SEG_SEL + 8) {
+        fail_msg("MLE entry GDT or segment selectors are wrong", 16384);
+    }
+    if ((sts & (TXT_STS_SENTER_DONE | TXT_STS_MEM_CONFIG_LOCK |
+                TXT_STS_PRIVATE_OPEN)) !=
+        (TXT_STS_SENTER_DONE | TXT_STS_MEM_CONFIG_LOCK |
+         TXT_STS_PRIVATE_OPEN) || txt_read64(TXT_OFF_ERRORCODE)) {
+        fail_msg("MLE entry TXT status is wrong", 16384);
+    }
+    if (guest_le(section + 8, 4) != 6 ||
+        count == 0 || off != 0x98 || off + 0x18 > 0x400 ||
+        !guest_le(section + off + 8, 8) ||
+        section[off + 0x10] != 0) {
+        fail_msg("MLE entry SINIT-MLE MDR is missing", 16384);
+    }
+
+    if (main_fail) {
+        ml_printf("smx: MLE landing failed (0x%x)\n", main_fail);
+        asm volatile("out %%eax, $0xf4" :: "a"(main_fail));
+    } else {
+        ml_printf("PASS: SENTER transferred to the MLE with heap and "
+                  "CPU state intact\n");
+        ml_printf("test-smx-getsec: all tests passed\n");
+        asm volatile("out %%ax, %%dx" :: "a"(0x2000), "d"(0x604));
+    }
+    for (;;) {
+        asm volatile("hlt");
+    }
+}
+
+/*
+ * Capture the register state before the compiler can reuse caller-saved
+ * registers.  The physical MLE stub jumps here with paging disabled.
+ */
+static void __attribute__((naked, noreturn, used)) mle_landing(void)
+{
+    asm volatile("movl %%ebx, mle_seen_ebx\n"
+                 "movl %%ecx, mle_seen_ecx\n"
+                 "movl %%edx, mle_seen_edx\n"
+                 "movl %%edi, mle_seen_eflags\n"
+                 "movl %%esi, mle_seen_cr0\n"
+                 "jmp mle_landing_c\n" : : : "memory");
+}
+
+static void setup_mle_entry(void)
+{
+    /*
+     * Physical code at TEST_MLE_BASE+0x200: set a known stack, save
+     * EFLAGS and CR0, turn paging off, and jump to the guest-side C
+     * assertion routine.  The kernel text is not in the MLE mapping.
+     */
+    static const uint8_t stub[] = {
+        0xbc, 0, 0, 0, 0,          /* mov esp, stack top */
+        0x9c, 0x5f,                /* pushfd; pop edi */
+        0x0f, 0x20, 0xc6,          /* mov esi, cr0 */
+        0x0f, 0x20, 0xc0,          /* mov eax, cr0 */
+        0x25, 0xff, 0xff, 0xff, 0x7f, /* and eax, ~CR0.PG */
+        0x0f, 0x22, 0xc0,          /* mov cr0, eax */
+        0xb8, 0, 0, 0, 0,          /* mov eax, landing */
+        0xff, 0xe0,                /* jmp eax */
+    };
+    /* volatile: SENTER executes the bytes from guest physical RAM. */
+    volatile uint8_t *code = (volatile uint8_t *)(uintptr_t)
+        (TEST_MLE_BASE + 0x200);
+    /* volatile: the chipset reads this guest PAE page table. */
+    volatile uint64_t *pt = (volatile uint64_t *)(uintptr_t)
+        (TEST_MLE_PTAB + 0x2000);
+    uint32_t stack = (uintptr_t)mle_entry_stack + sizeof(mle_entry_stack);
+    uint32_t landing = (uintptr_t)mle_landing;
+    uint32_t i;
+
+    /* The first pushfd runs while paging is still enabled. */
+    pt[((stack - 4) >> 12) & 0x1ff] = ((stack - 4) & ~0xfffULL) | 3;
+    for (i = 0; i < sizeof(stub); i++) {
+        code[i] = stub[i];
+    }
+    for (i = 0; i < 4; i++) {
+        code[1 + i] = stack >> (8 * i);
+        code[22 + i] = landing >> (8 * i);
+    }
+    /* Complete the fourth size-prefixed heap section only at launch. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x48) = 0x400;
 }
 
 int main(void)
@@ -1526,9 +1666,10 @@ int main(void)
      * 8. SENTER with valid launch inputs: the preconditions pass, the
      *    DRTM is established over the SINIT region with the TIS hash
      *    signals (which reset PCRs 17-22 and extend PCR 17 with the
-     *    region's hash), and the staged launch stops short of the MLE
-     *    transfer with LAUNCH_INCOMPLETE.  STS.SENTER_DONE must still
-     *    be clear.  The PCR 17 value itself is checked in step 9.
+     *    region's hash).  The fourth heap section is deliberately not
+     *    populated until the final entry test, so SENTER rejects it
+     *    with HEAP_INVALID after measuring, without transferring away
+     *    from the remaining negative tests.  STS.SENTER_DONE stays clear.
      */
     txt_write64(TXT_OFF_ERRORCODE, 0);
     ml_printf("smx: SENTER, launch inputs set ...\n");
@@ -1539,16 +1680,17 @@ int main(void)
 
         ml_printf("smx: ERRORCODE=0x%llx STS=0x%llx\n",
                   (unsigned long long)ec, (unsigned long long)sts);
-        if (ec != TXT_ERR_LAUNCH_INCOMPLETE) {
-            fail_msg("SENTER with valid inputs: wrong ERRORCODE", 128);
+        if (ec != TXT_ERR_HEAP_INVALID) {
+            fail_msg("SENTER without SINIT-MLE heap: wrong ERRORCODE",
+                     128);
         }
         if (sts & TXT_STS_SENTER_DONE) {
             fail_msg("SENTER with valid inputs: SENTER_DONE set", 128);
         }
-        if (ec == TXT_ERR_LAUNCH_INCOMPLETE &&
+        if (ec == TXT_ERR_HEAP_INVALID &&
             !(sts & TXT_STS_SENTER_DONE)) {
-            ml_printf("PASS: SENTER with valid inputs records "
-                      "0x%llx (launch incomplete, staged)\n",
+            ml_printf("PASS: SENTER measures but rejects missing "
+                      "SINIT-MLE heap (0x%llx)\n",
                       (unsigned long long)ec);
         }
     }
@@ -1747,7 +1889,7 @@ int main(void)
         uint64_t ec = txt_read64(TXT_OFF_ERRORCODE);
         uint8_t d[32];
 
-        if (ec != TXT_ERR_LAUNCH_INCOMPLETE) {
+        if (ec != TXT_ERR_HEAP_INVALID) {
             ml_printf("smx: ERRORCODE=0x%llx\n", (unsigned long long)ec);
             fail_msg("the rebuilt ACM fixture was not accepted", 4096);
         } else if (!pcr_read(17, d)) {
@@ -2044,8 +2186,14 @@ int main(void)
         }
     }
 
-    if (!main_fail) {
-        ml_printf("test-smx-getsec: all tests passed\n");
+    if (main_fail) {
+        return main_fail;
     }
+
+    setup_mle_entry();
+    txt_write64(TXT_OFF_ERRORCODE, 0);
+    ml_printf("smx: final SENTER to the MLE ...\n");
+    getsec_senter();
+    fail_msg("successful SENTER returned instead of entering MLE", 16384);
     return main_fail;
 }

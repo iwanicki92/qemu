@@ -1,11 +1,9 @@
 /*
  * QEMU Intel TXT (Trusted Execution Technology)
  *
- * GETSEC (SMX) instruction emulation, M2: decode + static semantics;
- * M3: SENTER is a staged semantic measured launch (see
- * hw/i386/intel_txt.c, intel_txt_senter()).  SEXIT/WAKEUP/SMCTRL/
- * ENTERACCS/EXITAC are still stubs that raise #UD; they are filled in
- * by M4 (teardown).
+ * GETSEC (SMX) instruction emulation: static leaves and single-vCPU
+ * semantic SENTER (see hw/i386/intel_txt.c). SEXIT/WAKEUP/SMCTRL/
+ * ENTERACCS/EXITAC remain unimplemented.
  *
  * Copyright (c) 2026 Michał Kopeć <michal@nozomi.space>
  *
@@ -18,6 +16,7 @@
 #include "exec/cpu-defs.h"
 #include "exec/helper-proto.h"
 #include "exec/translation-block.h"
+#include "accel/tcg/cpu-loop.h"
 #include "helper-tcg.h"
 #include "hw/i386/intel_txt.h"
 #include "qemu/bitops.h"
@@ -58,6 +57,22 @@
 #define GETSEC_PARAM_TXT_EXT_PROCESSOR_SCRTM  BIT(5)
 /* 32 KiB max ACM size, in 32-byte units. */
 #define GETSEC_PARAM_MAX_ACM_SIZE             (0x8000 / 0x20)
+
+#if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TPM)
+static void getsec_load_mle_seg(CPUX86State *env, int reg, uint32_t selector,
+                                uint64_t desc)
+{
+    uint32_t e2 = desc >> 32;
+    uint32_t limit = (desc & 0xffff) | (e2 & 0xf0000);
+    uint32_t base = ((desc >> 16) & 0xffff) | ((e2 & 0xff) << 16) |
+                    (e2 & 0xff000000);
+
+    if (e2 & DESC_G_MASK) {
+        limit = (limit << 12) | 0xfff;
+    }
+    cpu_x86_load_seg_cache(env, reg, selector, base, limit, e2);
+}
+#endif
 
 void helper_getsec(CPUX86State *env)
 {
@@ -133,21 +148,48 @@ void helper_getsec(CPUX86State *env)
      * this leaf is unreachable there.
      */
     case GETSEC_LEAF_SENTER:
-        /*
-         * Staged measured launch: the chipset device validates the
-         * launch inputs, issues the DRTM measurement, and stops
-         * short of the MLE transfer with a defined TXT.ERRORCODE
-         * (see docs/specs/intel-txt.rst, deviations).  The
-         * chipset-present check is the CAPABILITIES bit-0 contract.
-         */
+        /* The chipset-present check is the CAPABILITIES bit-0 contract. */
         if (env_archcpu(env)->txt_state == NULL) {
             trace_getsec_senter_no_chipset();
             raise_exception_ra(env, EXCP0D_GPF, GETPC());
             break;
         }
 #ifdef CONFIG_TPM
-        trace_getsec_senter();
-        intel_txt_senter(env_archcpu(env)->txt_state);
+        {
+            IntelTxtMleEntry entry;
+
+            trace_getsec_senter();
+            if (!intel_txt_senter(env_archcpu(env)->txt_state, &entry)) {
+                break;
+            }
+            /*
+             * The entry is a physical address, with an identity mapping
+             * supplied by the loader in its PAE page tables.  Install the
+             * new execution state before leaving the translated GETSEC TB.
+             */
+            cpu_x86_update_cr0(env, env->cr[0] & ~CR0_PG_MASK);
+            cpu_x86_update_cr4(env, env->cr[4] | CR4_PAE_MASK);
+            cpu_x86_update_cr3(env, entry.ptab);
+            env->gdt.base = entry.gdt_base;
+            env->gdt.limit = entry.gdt_limit;
+            getsec_load_mle_seg(env, R_CS, entry.seg_sel, entry.cs_desc);
+            getsec_load_mle_seg(env, R_DS, entry.seg_sel + 8,
+                                entry.ds_desc);
+            getsec_load_mle_seg(env, R_ES, entry.seg_sel + 8,
+                                entry.ds_desc);
+            getsec_load_mle_seg(env, R_SS, entry.seg_sel + 8,
+                                entry.ds_desc);
+            cpu_x86_load_seg_cache(env, R_FS, 0, 0, 0, 0);
+            cpu_x86_load_seg_cache(env, R_GS, 0, 0, 0, 0);
+            env->regs[R_EBX] = entry.entry_phys;
+            env->regs[R_ECX] = entry.ptab;
+            env->regs[R_EDX] = 0;
+            env->regs[R_ESP] = 0;
+            cpu_load_eflags(env, 0x2, ~0u);
+            env->eip = entry.entry_phys;
+            cpu_x86_update_cr0(env, env->cr[0] | CR0_PE_MASK | CR0_PG_MASK);
+            cpu_loop_exit(env_cpu(env));
+        }
 #endif
         break;
 #endif /* !CONFIG_USER_ONLY */

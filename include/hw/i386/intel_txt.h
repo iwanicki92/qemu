@@ -110,21 +110,18 @@
 #define TXT_ERRORCODE_HEAP_INVALID \
     (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
      TXT_ERRORCODE_PROGRESS_CODE(0x03))
-/* SENTER: the preconditions passed and the staged measurement was
-   issued, but the launch stopped short of the MLE transfer (see the
-   numbered deviation in docs/specs/intel-txt.rst). */
+/* Historical staged-launch error code; no longer issued on success. */
 #define TXT_ERRORCODE_LAUNCH_INCOMPLETE \
     (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
      TXT_ERRORCODE_PROGRESS_CODE(0x04))
-/* SENTER: the preconditions passed but the DRTM measurement itself
-   failed (TPM backend error, request already in flight, ...).  This
-   must stay distinct from LAUNCH_INCOMPLETE: sharing one code made a
-   failed measurement indistinguishable from a staged-but-successful
-   one, and a test asserting on it passed while the measurement was
-   in fact rejected with TPM_RC_LOCALITY. */
+/* SENTER: DRTM measurement failed or the MLE image/entry is invalid. */
 #define TXT_ERRORCODE_MEASURE_FAILED \
     (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
      TXT_ERRORCODE_PROGRESS_CODE(0x05))
+/* APs cannot be released safely until GETSEC[WAKEUP] is implemented. */
+#define TXT_ERRORCODE_APS_UNSUPPORTED \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x07))
 /*
  * SENTER precondition: the region TXT.SINIT_BASE/SIZE points at does
  * not describe a SINIT ACM for this chipset -- bad ACM header,
@@ -187,19 +184,19 @@ int intel_txt_drtm_extend_pcr(IntelTxtState *s, uint32_t pcr,
                               const TPMDigestValue *digests, size_t n,
                               Error **errp);
 
+/* CPU state handed to the BSP after a successful measured launch. */
+typedef struct IntelTxtMleEntry {
+    uint32_t entry_phys, ptab;
+    uint32_t gdt_base, gdt_limit, seg_sel;
+    uint64_t cs_desc, ds_desc;
+} IntelTxtMleEntry;
+
 /*
- * Perform the staged GETSEC[SENTER] measured launch
- * (docs/specs/intel-txt.rst, "Semantic measured launch"): validate
- * the launch inputs (TXT.SINIT_BASE/SIZE, DPR cover,
- * TXT.HEAP_BASE/SIZE), then step a (reset the DRTM PCRs) and the
- * first component of step d (extend PCR 17 with the SHA-1 and
- * SHA-256 hashes of the SINIT ACM region).  A precondition failure
- * records the matching precondition TXT.ERRORCODE and measures
- * nothing.  The successful path records TXT_ERRORCODE_LAUNCH_
- * INCOMPLETE instead of transferring to the MLE: STS.SENTER_DONE is
- * not set in this staging state, and the helper returns normally.
+ * Validate and measure the launch, populate the SINIT-MLE heap data,
+ * and return true with the BSP entry state on success.  A rejected
+ * launch records TXT.ERRORCODE and returns false without transferring.
  */
-void intel_txt_senter(IntelTxtState *s);
+bool intel_txt_senter(IntelTxtState *s, IntelTxtMleEntry *entry);
 #endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

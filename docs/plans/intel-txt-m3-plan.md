@@ -213,6 +213,21 @@ chipset-present (`:91`) and `grub_txt_verify_platform()`. It sets
 `slr_intel_policy_staging.pcr = 18` for the OS-MLE data, which is directly
 relevant to the PCR18 digest content.
 
+**Status: implemented.**
+
+- The device-side validation landed as `intel_txt_validate_acm()` in
+  `hw/i386/intel_txt.c`, recording `TXT_ERRORCODE_ACM_INVALID`
+  (0x80060001) on failure.
+- The synthetic fixture is built by `setup_acm()` in
+  `tests/tcg/i386/system/test-smx-getsec.c`: an 8 KiB blob at guest
+  physical 0xE10000 whose body is the byte pattern `acm[i] = (uint8_t)i`
+  with the header, the info table (at offset 0x4c0) and a one-entry
+  chipset id list (at offset 0x500) written over it.
+- The two fixture constraints from this section that were NOT
+  implemented are the `seg_sel`/`gdt_limit` checks and the capability
+  intersection — both are deferred to the MLE-transfer slice, because
+  that is what consumes them.
+
 **Scope note:** this fixture is a prerequisite for an end-to-end
 loader-driven SENTER test, *not* for the locality-4 PCR path in §3.1–3.4.
 That can be exercised from qtest with no ACM at all. Build the measurement
@@ -467,10 +482,17 @@ guarantee is asserted by the TCG test (step 11, §5).
 
 - **Regression**: `tpm-tis-test`, `q35-test`, `txt-test` must stay green.
   M3 touches no TPM frontend code, so any movement here is a real bug.
-- **ACM validation** (once §3.5 lands): the fixture is accepted, and each
-  mutated field from §3.5 is rejected with the right `TXT.ERRORCODE`. Include
-  a `module_subtype = 0x01` (reset ACM) case — the pre-correction spec wording
-  would have *accepted* that one and rejected every real SINIT.
+- **ACM validation**: **Closed** by the guest TCG test. Step 12 of
+  `test-smx-getsec.c` runs a 19-case mutation matrix (table
+  `acm_mutations[]`): each case corrupts one §3.5 field of the fixture and
+  requires SENTER to record `0x80060001` (`ACM_INVALID`) — the
+  `module_subtype = 0x01` (reset ACM) case is included in the matrix.
+  Step 13 is a recovery case: the rebuilt fixture still launches
+  (`ERRORCODE` 0x80040001 `LAUNCH_INCOMPLETE`) and re-measures to the same
+  PCR 17 value — the recovery case is what stops a validator that rejects
+  everything from passing the step. The pre-correction spec wording would
+  have been wrong in the opposite direction: it would have *accepted* the
+  reset ACM and rejected every real SINIT.
 
 ### Carried over from the M2 review (`d99ea234`, verdict `mergeable`)
 - `#GP(0)` on `GETSEC` at CPL≠0 is verified by code reading only

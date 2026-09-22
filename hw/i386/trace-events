@@ -158,3 +158,4 @@ txt_senter(void) "GETSEC[SENTER]: staged measured launch entered"
 txt_senter_errorcode(uint64_t code) "GETSEC[SENTER]: TXT.ERRORCODE = 0x%"PRIx64
 txt_drtm_hash_start(int locty, size_t len) "DRTM: _TPM_Hash_Start at locality %d over %zu bytes"
 txt_drtm_hash_done(size_t len) "DRTM: _TPM_Hash_End done, %zu bytes measured"
+txt_measure_mle(uint64_t ptab, uint64_t size, uint64_t hdr_off) "DRTM: MLE measured via ptab 0x%"PRIx64" size 0x%"PRIx64" hdr@0x%"PRIx64

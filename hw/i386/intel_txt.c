@@ -362,6 +362,65 @@ enum {
 #define INTEL_TXT_MAX_ACM_SIZE 0x8000
 
 /*
+ * MLE measurement (spec step c).
+ *
+ * The TXT heap is a sequence of sections, each preceded by a u64 byte
+ * count that includes the count itself (tboot
+ * include/txt/heap.h:383-425): bios_data, os_mle_data, os_sinit_data,
+ * sinit_mle_data.  Only os_sinit_data is read here.
+ *
+ * Inside os_sinit_data, the MLE is described by mle_ptab, mle_size and
+ * mle_hdr_base.  Note what these mean, because it is easy to get wrong:
+ *
+ *  - mle_ptab is a *physical* address, of a 3-level page table
+ *    (PDPT -> PD -> PT, 4 KiB pages) that maps the MLE.
+ *  - The MLE occupies linear addresses [0, mle_size) in that mapping;
+ *    linear 0 is the first measured byte.  Both tboot
+ *    (txt/txt.c build_mle_pagetable) and GRUB
+ *    (loader/slaunch/txt.c grub_txt_setup_mle_ptab) build a flat map,
+ *    but the table is walked here rather than assumed flat.
+ *  - mle_hdr_base is a *linear offset* within that range, not a
+ *    physical address: tboot computes it as
+ *    "&g_mle_hdr - &_mle_start" and comments it "linear addr (offset
+ *    from MLE base)".
+ *  - mle_start_off / mle_end_off in the MLE header are the loader's
+ *    own bookkeeping, used to derive mle_size; SINIT does not need
+ *    them and neither do we.
+ */
+#define INTEL_TXT_OS_SINIT_MIN_VER 4
+
+/* One page table covers 512 4 KiB pages; tboot assumes the same bound. */
+#define INTEL_TXT_MAX_MLE_SIZE (512 * 4096)
+
+/* Page/table address bits of a 64-bit PDPTE/PDE/PTE. */
+#define INTEL_TXT_PTE_ADDR_MASK 0x000ffffffffff000ULL
+
+/* PCR 18 carries the MLE hash (MLE Dev Guide, DRTM PCR usage). */
+#define INTEL_TXT_DRTM_PCR_MLE 18
+
+/* Offsets within os_sinit_data (tboot include/txt/heap.h, __packed) */
+#define OS_SINIT_OFF_VERSION      0x00   /* u32 */
+#define OS_SINIT_OFF_FLAGS        0x04   /* u32 */
+#define OS_SINIT_OFF_MLE_PTAB     0x08   /* u64 */
+#define OS_SINIT_OFF_MLE_SIZE     0x10   /* u64 */
+#define OS_SINIT_OFF_MLE_HDR_BASE 0x18   /* u64 */
+#define OS_SINIT_MIN_SIZE         0x20
+
+/* Offsets within the MLE header (tboot include/mle.h mle_hdr_t) */
+#define MLE_HDR_OFF_UUID          0x00   /* 16 bytes */
+#define MLE_HDR_OFF_LENGTH        0x10   /* u32 */
+#define MLE_HDR_OFF_VERSION       0x14   /* u32 */
+#define MLE_HDR_OFF_ENTRY_POINT   0x18   /* u32 */
+#define MLE_HDR_OFF_FIRST_VALID   0x1c   /* u32 */
+#define MLE_HDR_MIN_SIZE          0x30
+
+/* MLE_HDR_UUID from tboot include/mle.h, in wire (little-endian) order */
+static const uint8_t intel_txt_mle_uuid[16] = {
+    0x5a, 0xac, 0x82, 0x90, 0x6f, 0x47, 0xa7, 0x74,
+    0x0f, 0x5c, 0x55, 0xa2, 0xcb, 0x51, 0xb6, 0x42,
+};
+
+/*
  * Fixed password-authorization area appended to both DRTM commands:
  * the TPM2_RS_PW session handle with an empty nonce and HMAC.
  */
@@ -616,6 +675,209 @@ static int intel_txt_drtm_hash_measure(IntelTxtState *s, const uint8_t *data,
     return 0;
 }
 
+/* Read @len bytes of guest memory, reporting the failing address. */
+static bool intel_txt_gread(uint64_t addr, void *buf, size_t len, Error **errp)
+{
+    if (address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        error_setg(errp, "cannot read %zu bytes of guest memory at 0x%"
+                   PRIx64, len, addr);
+        return false;
+    }
+    return true;
+}
+
+static bool intel_txt_gread_u32(uint64_t addr, uint32_t *out, Error **errp)
+{
+    uint32_t v;
+
+    if (!intel_txt_gread(addr, &v, sizeof(v), errp)) {
+        return false;
+    }
+    *out = le32_to_cpu(v);
+    return true;
+}
+
+static bool intel_txt_gread_u64(uint64_t addr, uint64_t *out, Error **errp)
+{
+    uint64_t v;
+
+    if (!intel_txt_gread(addr, &v, sizeof(v), errp)) {
+        return false;
+    }
+    *out = le64_to_cpu(v);
+    return true;
+}
+
+/*
+ * Translate MLE linear offset @lin to a guest physical address using the
+ * page table at @ptab: PDPT[0] -> PD -> PT -> 4 KiB page.  Only the
+ * first PDPT entry is used, matching what both loaders build, but the
+ * PD and PT are indexed properly so a larger MLE still resolves.
+ */
+static bool intel_txt_mle_xlate(uint64_t ptab, uint64_t lin, uint64_t *phys,
+                                Error **errp)
+{
+    uint64_t pdpte, pde, pte;
+
+    if (!intel_txt_gread_u64(ptab, &pdpte, errp)) {
+        return false;
+    }
+    if (!(pdpte & 1)) {
+        error_setg(errp, "MLE page table: PDPT entry 0 not present");
+        return false;
+    }
+    if (!intel_txt_gread_u64((pdpte & INTEL_TXT_PTE_ADDR_MASK) +
+                             ((lin >> 21) & 0x1ff) * 8, &pde, errp)) {
+        return false;
+    }
+    if (!(pde & 1)) {
+        error_setg(errp, "MLE page table: no PD entry for linear 0x%"
+                   PRIx64, lin);
+        return false;
+    }
+    if (!intel_txt_gread_u64((pde & INTEL_TXT_PTE_ADDR_MASK) +
+                             ((lin >> 12) & 0x1ff) * 8, &pte, errp)) {
+        return false;
+    }
+    if (!(pte & 1)) {
+        error_setg(errp, "MLE page table: no PT entry for linear 0x%"
+                   PRIx64, lin);
+        return false;
+    }
+    *phys = (pte & INTEL_TXT_PTE_ADDR_MASK) | (lin & 0xfff);
+    return true;
+}
+
+/*
+ * Spec step c: hash the MLE as the page table maps it and extend PCR 18
+ * with the result (which is what a real SINIT ACM does).  PCR 18 has
+ * already been zeroed by the _TPM_Hash_Start of step a, so the value
+ * lands as a clean extend-from-zero.
+ */
+static int intel_txt_measure_mle(IntelTxtState *s, Error **errp)
+{
+    uint64_t bios_sz, os_mle_sz, os_sinit_sz, os_sinit;
+    uint64_t ptab, mle_size, hdr_base, hdr_phys;
+    uint32_t version, hdr_len;
+    uint8_t uuid[sizeof(intel_txt_mle_uuid)];
+    uint8_t *mle = NULL;
+    uint8_t *sha1 = NULL, *sha256 = NULL;
+    size_t sha1_len = 0, sha256_len = 0;
+    TPMDigestValue digests[2];
+    uint64_t off;
+    int ret = -1;
+
+    /* Walk the size-prefixed heap sections to reach os_sinit_data. */
+    if (!intel_txt_gread_u64(s->heap_base, &bios_sz, errp) ||
+        !intel_txt_gread_u64(s->heap_base + bios_sz, &os_mle_sz, errp) ||
+        !intel_txt_gread_u64(s->heap_base + bios_sz + os_mle_sz,
+                             &os_sinit_sz, errp)) {
+        return -1;
+    }
+    if (bios_sz < sizeof(uint64_t) || os_mle_sz < sizeof(uint64_t) ||
+        os_sinit_sz < sizeof(uint64_t) + OS_SINIT_MIN_SIZE ||
+        bios_sz + os_mle_sz + os_sinit_sz > s->heap_size) {
+        error_setg(errp, "TXT heap sections do not fit in HEAP_SIZE "
+                   "(bios 0x%" PRIx64 ", os_mle 0x%" PRIx64
+                   ", os_sinit 0x%" PRIx64 ", heap 0x%" PRIx64 ")",
+                   bios_sz, os_mle_sz, os_sinit_sz, s->heap_size);
+        return -1;
+    }
+    os_sinit = s->heap_base + bios_sz + os_mle_sz + sizeof(uint64_t);
+
+    if (!intel_txt_gread_u32(os_sinit + OS_SINIT_OFF_VERSION, &version, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_MLE_PTAB, &ptab, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_MLE_SIZE, &mle_size,
+                             errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_MLE_HDR_BASE, &hdr_base,
+                             errp)) {
+        return -1;
+    }
+
+    if (version < INTEL_TXT_OS_SINIT_MIN_VER) {
+        error_setg(errp, "os_sinit_data version %u is below the minimum %u",
+                   version, INTEL_TXT_OS_SINIT_MIN_VER);
+        return -1;
+    }
+    if (ptab == 0 || (ptab & 0xfff) ||
+        ptab >= INTEL_TXT_GUEST_32BIT_LIMIT) {
+        error_setg(errp, "mle_ptab 0x%" PRIx64 " is zero, unaligned or "
+                   "not below 4 GiB", ptab);
+        return -1;
+    }
+    if (mle_size == 0 || (mle_size & 0xfff) ||
+        mle_size > INTEL_TXT_MAX_MLE_SIZE) {
+        error_setg(errp, "mle_size 0x%" PRIx64 " is zero, not page-aligned "
+                   "or larger than the 0x%x maximum", mle_size,
+                   INTEL_TXT_MAX_MLE_SIZE);
+        return -1;
+    }
+    /*
+     * mle_hdr_base is a linear offset into the MLE, so it is bounded by
+     * mle_size -- not by mle_ptab, which is the page table's physical
+     * address and unrelated to the MLE's address space.
+     */
+    if (hdr_base > mle_size - MLE_HDR_MIN_SIZE) {
+        error_setg(errp, "mle_hdr_base 0x%" PRIx64 " leaves no room for an "
+                   "MLE header inside mle_size 0x%" PRIx64, hdr_base,
+                   mle_size);
+        return -1;
+    }
+
+    /* The MLE header identifies the image; check its UUID and length. */
+    if (!intel_txt_mle_xlate(ptab, hdr_base, &hdr_phys, errp) ||
+        !intel_txt_gread(hdr_phys + MLE_HDR_OFF_UUID, uuid, sizeof(uuid),
+                         errp) ||
+        !intel_txt_gread_u32(hdr_phys + MLE_HDR_OFF_LENGTH, &hdr_len, errp)) {
+        return -1;
+    }
+    if (memcmp(uuid, intel_txt_mle_uuid, sizeof(uuid)) != 0) {
+        error_setg(errp, "no MLE header UUID at linear offset 0x%" PRIx64,
+                   hdr_base);
+        return -1;
+    }
+    if (hdr_len < MLE_HDR_MIN_SIZE) {
+        error_setg(errp, "MLE header length %u is shorter than the %u byte "
+                   "minimum", hdr_len, MLE_HDR_MIN_SIZE);
+        return -1;
+    }
+
+    /* Gather the MLE image page by page through the mapping. */
+    mle = g_malloc(mle_size);
+    for (off = 0; off < mle_size; off += 4096) {
+        uint64_t page;
+
+        if (!intel_txt_mle_xlate(ptab, off, &page, errp) ||
+            !intel_txt_gread(page, mle + off, 4096, errp)) {
+            goto out;
+        }
+    }
+
+    if (qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA1, mle, mle_size,
+                           &sha1, &sha1_len, errp) < 0 ||
+        qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256, mle, mle_size,
+                           &sha256, &sha256_len, errp) < 0) {
+        goto out;
+    }
+
+    digests[0] = (TPMDigestValue) {
+        .alg = TPM2_ALG_SHA1, .digest = sha1, .len = sha1_len,
+    };
+    digests[1] = (TPMDigestValue) {
+        .alg = TPM2_ALG_SHA256, .digest = sha256, .len = sha256_len,
+    };
+
+    trace_txt_measure_mle(ptab, mle_size, hdr_base);
+    ret = intel_txt_drtm_extend_pcr(s, INTEL_TXT_DRTM_PCR_MLE, digests, 2,
+                                   errp);
+out:
+    g_free(mle);
+    g_free(sha1);
+    g_free(sha256);
+    return ret;
+}
+
 void intel_txt_senter(IntelTxtState *s)
 {
     uint64_t dpr_size;
@@ -698,6 +960,16 @@ void intel_txt_senter(IntelTxtState *s)
     }
 
     ret = intel_txt_drtm_hash_measure(s, acm, s->sinit_size, &err);
+    if (ret < 0) {
+        goto fail_measure;
+    }
+
+    /*
+     * Step c: measure the MLE into PCR 18.  Ordered after the hash
+     * sequence because _TPM_Hash_Start zeroes PCR 18 as well, so doing
+     * it the other way round would discard this extend.
+     */
+    ret = intel_txt_measure_mle(s, &err);
     if (ret < 0) {
         goto fail_measure;
     }

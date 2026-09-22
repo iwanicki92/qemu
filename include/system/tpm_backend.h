@@ -162,6 +162,24 @@ bool tpm_backend_had_startup_error(TPMBackend *s);
 void tpm_backend_deliver_request(TPMBackend *s, TPMBackendCmd *cmd);
 
 /**
+ * tpm_backend_request_pending:
+ * @s: the backend
+ *
+ * Whether a TPM request is currently in flight in the backend's
+ * single command slot (see tpm_backend_deliver_request(), which drops
+ * a second submission while one is pending).
+ *
+ * This is the supported way for device code to test for an in-flight
+ * request; the slot itself (TPMBackend::cmd) stays protected.
+ *
+ * Must be called with the BQL held, and the caller has to keep holding
+ * it up to the matching tpm_backend_deliver_request(): the slot is
+ * cleared from the completion callback without atomics, so a check
+ * made outside the BQL can be stale by the time it is acted on.
+ */
+bool tpm_backend_request_pending(TPMBackend *s);
+
+/**
  * tpm_backend_reset:
  * @s: the backend to reset
  *

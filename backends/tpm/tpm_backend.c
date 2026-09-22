@@ -122,6 +122,11 @@ void tpm_backend_deliver_request(TPMBackend *s, TPMBackendCmd *cmd)
                            tpm_backend_request_completed, s);
 }
 
+bool tpm_backend_request_pending(TPMBackend *s)
+{
+    return s->cmd != NULL;
+}
+
 void tpm_backend_reset(TPMBackend *s)
 {
     TPMBackendClass *k = TPM_BACKEND_GET_CLASS(s);

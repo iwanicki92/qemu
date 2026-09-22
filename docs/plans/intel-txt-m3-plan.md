@@ -495,12 +495,38 @@ guarantee is asserted by the TCG test (step 11, §5).
   reset ACM and rejected every real SINIT.
 
 ### Carried over from the M2 review (`d99ea234`, verdict `mergeable`)
-- `#GP(0)` on `GETSEC` at CPL≠0 is verified by code reading only
-  (`smx_helper.c:67-75`); the guest test skips it because it needs a CPL3 drop.
-  Add CPL3 coverage here.
-- The AAA-opcode regression argument for the GETSEC decode entry was
-  by-construction, never run. Do one `check-tcg-i386` pass
-  (`tests/tcg/i386/test-i386.c:1099-1106` covers `aaa`).
+- **CLOSED** — `#GP(0)` on `GETSEC` at CPL≠0 was verified by code reading only
+  (`smx_helper.c:67-75`). `test-smx-getsec.c` step 14 now drops to ring 3
+  through a real `iret` (its own GDT with ring-3 descriptors, a TSS for the
+  ring-0 handler stack, a `#GP` gate recording the error code, and a DPL-3
+  return gate at vector 0x80) and asserts three things: `GETSEC` at CPL3
+  raises `#GP` with error code **0**, `SENTER` at CPL3 faults before the
+  chipset sees anything (`TXT.ERRORCODE` keeps the zero written beforehand),
+  and with `CR4.SMXE` clear the `#UD` still takes precedence. The `#GP`
+  arriving at all is what proves the `iret` changed CPL — at ring 0 those
+  leaves do not fault.
+- **CLOSED, with a scoped result** — the AAA-opcode regression argument for
+  the GETSEC decode entry was by-construction, never run.
+
+  Running it first exposed an unrelated bug this work had introduced: the
+  `i386-linux-user` target did not link, because `helper_getsec()` calls
+  `intel_txt_senter()` under `#ifdef CONFIG_TPM` while `hw/i386/intel_txt.c`
+  is only built for system emulation. The `--target-list=i386-softmmu` tree
+  this work was developed in could never have shown it. Fixed by compiling
+  the `GETSEC_LEAF_SENTER` case out under `!CONFIG_USER_ONLY` (user mode is
+  always CPL 3, so the leaf is unreachable there anyway).
+
+  With that fixed, a `--target-list=i386-linux-user` tree gives
+  `make check-tcg` → **72/72 Ok, 0 Fail**, including `test-i386`, whose
+  `test_bcd()` executes `daa`/`das`/`aaa`/`aas` with no `SIGILL`/`#UD` and no
+  decode failures.
+
+  Scope of that evidence: `TEST_BCD` only *prints* its `A=/R=/CCIN=/CC=`
+  values — there is no in-test assertion and no `.ref` file for `test-i386`
+  in the linux-user suite. So the pass shows the BCD opcodes neighbouring
+  the new `0F 37` entry still **decode and execute without faulting**, which
+  is the decode-level regression that was actually at issue; it is not a
+  value-level check of BCD semantics.
 
 ## 6. References
 - M2 commit `c372060105`; M2 review run `d99ea234` (verdict `mergeable`)

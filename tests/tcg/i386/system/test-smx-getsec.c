@@ -115,6 +115,16 @@
 #define TEST_SINIT_BASE        0xE10000ULL
 #define TEST_SINIT_SIZE        0x2000ULL
 #define TEST_HEAP_BASE         0xE20000ULL
+/*
+ * Step-c inputs, all inside the same DPR range: a 3-page MLE page
+ * table (PDPT/PD/PT) and an 8 KiB MLE image mapped flat at linear 0.
+ * The MLE header sits at linear offset 0x100, i.e. inside the measured
+ * image, exactly as a real MLE carries it.
+ */
+#define TEST_MLE_PTAB          0xE30000ULL
+#define TEST_MLE_BASE          0xE40000ULL
+#define TEST_MLE_SIZE          0x2000ULL
+#define TEST_MLE_HDR_OFF       0x100ULL
 #define TEST_HEAP_SIZE         0x1000ULL
 #define TEST_DPR               (TXT_DPR_TOP(0x1000000) | TXT_DPR_SIZE(2) | \
                                  TXT_DPR_LOCK)
@@ -462,17 +472,28 @@ static void tpm2_startup(void)
 }
 
 /*
- * TPM2_PCR_Read of PCR 17 in the SHA-256 bank.
+ * TPM2_PCR_Read, reading one PCR in the SHA-256 bank.
  *
  *   tag TPM_ST_NO_SESSIONS, commandSize 20, TPM_CC_PCR_Read 0x17e,
  *   then a TPML_PCR_SELECTION of one TPMS_PCR_SELECTION:
- *   hashAlg SHA-256 (0x000b), sizeofSelect 3, pcrSelect 00 00 02
- *   (bit 1 of byte 2 == PCR 17).
+ *   hashAlg SHA-256 (0x000b), sizeofSelect 3, and a 3-byte pcrSelect
+ *   bitmap that pcr_read() fills in before each transmit (bit n%8 of
+ *   byte n/8 selects PCR n, e.g. PCR 17 = 00 00 02).
+ *
+ * The readback takes the last 32 bytes of the response: with the
+ * SHA-1 and SHA-256 banks active that is the SHA-256 digest.
  */
-static const uint8_t tpm2_pcrread17_cmd[20] = {
+
+/* MLE_HDR_UUID (tboot include/mle.h) in wire order. */
+static const uint8_t mle_hdr_uuid[16] = {
+    0x5a, 0xac, 0x82, 0x90, 0x6f, 0x47, 0xa7, 0x74,
+    0x0f, 0x5c, 0x55, 0xa2, 0xcb, 0x51, 0xb6, 0x42,
+};
+
+static uint8_t tpm2_pcrread_cmd[20] = {
     0x80, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
     0x01, 0x7e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0b,
-    0x03, 0x00, 0x00, 0x02,
+    0x03, 0x00, 0x00, 0x00,
 };
 
 /*
@@ -496,6 +517,33 @@ static const uint8_t pcr17_expected[32] = {
     0x99, 0xcf, 0x22, 0xa2, 0x8c, 0xc7, 0x6b, 0xa7,
     0x90, 0xef, 0xa3, 0xa2, 0xe0, 0x5e, 0xfe, 0xe7,
     0x3b, 0x5e, 0x6c, 0xc4, 0xd7, 0x89, 0xc7, 0x41,
+};
+
+/*
+ * Expected PCR 18 (SHA-256 bank): the MLE hash, extended from zero
+ * because _TPM_Hash_Start zeroes PCR 18 as well as PCR 17.  The image
+ * is mle[i] = (i ^ 0x5A) with the MLE header overwritten at
+ * TEST_MLE_HDR_OFF, so the digest covers the header bytes too -- which
+ * is correct: the header lives inside the measured image.
+ *
+ * Reproduce with:
+ *   python3 - <<'EOF'
+ *   import hashlib, struct
+ *   img = bytearray((i ^ 0x5A) & 0xFF for i in range(0x2000))
+ *   uuid = bytes([0x5a,0xac,0x82,0x90,0x6f,0x47,0xa7,0x74,
+ *                 0x0f,0x5c,0x55,0xa2,0xcb,0x51,0xb6,0x42])
+ *   hdr = uuid + struct.pack('<9I', 0x34, 0x00020001, 0x200, 0,
+ *                            0, 0x2000, 0x227, 0, 0)
+ *   img[0x100:0x100+len(hdr)] = hdr
+ *   print(hashlib.sha256(bytes(32) +
+ *         hashlib.sha256(bytes(img)).digest()).hexdigest())
+ *   EOF
+ */
+static const uint8_t pcr18_expected[32] = {
+    0x48, 0xf9, 0x98, 0x67, 0x42, 0xb8, 0xc2, 0x73,
+    0xae, 0x33, 0x8f, 0xf5, 0xb9, 0x1d, 0xbe, 0x73,
+    0x6f, 0xea, 0x75, 0x23, 0x52, 0xe1, 0x2e, 0xbc,
+    0x56, 0x5f, 0xf6, 0x6f, 0x13, 0xa0, 0x3f, 0xe7,
 };
 
 /*
@@ -558,23 +606,105 @@ static uint32_t tis_transmit(const uint8_t *cmd, uint32_t cmd_len,
  * TPM2_PCR_Read response tail is the 32-byte digest, so it is taken
  * from the end of the response rather than by walking the structure.
  */
-static int pcr17_read(uint8_t *digest)
+/*
+ * Build the step-c launch inputs in guest RAM: an MLE image with its
+ * header, a 3-level page table mapping that image flat at linear 0, and
+ * a TXT heap whose os_sinit_data points at both.
+ *
+ * Heap layout, each section preceded by a u64 size that includes the
+ * size word itself (tboot include/txt/heap.h):
+ *   [bios_data_size=0x10][8 bytes]
+ *   [os_mle_data_size=0x10][8 bytes]
+ *   [os_sinit_data_size=0x28][version, flags, mle_ptab, mle_size,
+ *                             mle_hdr_base]
+ */
+static void setup_mle(void)
+{
+    volatile uint8_t *mle = (volatile uint8_t *)(uintptr_t)TEST_MLE_BASE;
+    volatile uint64_t *pdpt = (volatile uint64_t *)(uintptr_t)TEST_MLE_PTAB;
+    volatile uint64_t *pd =
+        (volatile uint64_t *)(uintptr_t)(TEST_MLE_PTAB + 0x1000);
+    volatile uint64_t *pt =
+        (volatile uint64_t *)(uintptr_t)(TEST_MLE_PTAB + 0x2000);
+    volatile uint8_t *heap = (volatile uint8_t *)(uintptr_t)TEST_HEAP_BASE;
+    volatile uint64_t *os_sinit;
+    volatile uint32_t *hdr;
+    uint32_t i;
+
+    /* MLE image: a recognisable pattern, distinct from the ACM's. */
+    for (i = 0; i < (uint32_t)TEST_MLE_SIZE; i++) {
+        mle[i] = (uint8_t)(i ^ 0x5A);
+    }
+
+    /* MLE header at linear TEST_MLE_HDR_OFF, inside the measured image. */
+    for (i = 0; i < 16; i++) {
+        mle[TEST_MLE_HDR_OFF + i] = mle_hdr_uuid[i];
+    }
+    hdr = (volatile uint32_t *)(uintptr_t)(TEST_MLE_BASE +
+                                           TEST_MLE_HDR_OFF + 16);
+    hdr[0] = 0x34;               /* length */
+    hdr[1] = 0x00020001;         /* version 2.1 */
+    hdr[2] = 0x200;              /* entry_point */
+    hdr[3] = 0;                  /* first_valid_page */
+    hdr[4] = 0;                  /* mle_start_off */
+    hdr[5] = (uint32_t)TEST_MLE_SIZE; /* mle_end_off */
+    hdr[6] = 0x00000227;         /* capabilities */
+    hdr[7] = 0;                  /* cmdline_start_off */
+    hdr[8] = 0;                  /* cmdline_end_off */
+
+    /* Flat mapping: linear 0 -> TEST_MLE_BASE.  Present bit only. */
+    for (i = 0; i < 0x200; i++) {
+        pdpt[i] = 0;
+        pd[i] = 0;
+        pt[i] = 0;
+    }
+    pdpt[0] = (TEST_MLE_PTAB + 0x1000) | 1;
+    pd[0] = (TEST_MLE_PTAB + 0x2000) | 1;
+    for (i = 0; i < (uint32_t)(TEST_MLE_SIZE / 0x1000); i++) {
+        pt[i] = (TEST_MLE_BASE + (uint64_t)i * 0x1000) | 1;
+    }
+
+    /* Heap sections. */
+    for (i = 0; i < 0x48; i++) {
+        heap[i] = 0;
+    }
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x00) = 0x10;
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x10) = 0x10;
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x20) = 0x28;
+
+    os_sinit = (volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x28);
+    *(volatile uint32_t *)os_sinit = 6;                 /* version */
+    *((volatile uint32_t *)os_sinit + 1) = 0;           /* flags */
+    os_sinit[1] = TEST_MLE_PTAB;                        /* mle_ptab */
+    os_sinit[2] = TEST_MLE_SIZE;                        /* mle_size */
+    os_sinit[3] = TEST_MLE_HDR_OFF;                     /* mle_hdr_base */
+
+    ml_printf("smx: MLE image, page table and heap built\n");
+}
+
+static int pcr_read(int pcr, uint8_t *digest)
 {
     uint8_t resp[128];
-    uint32_t n = tis_transmit(tpm2_pcrread17_cmd,
-                              sizeof(tpm2_pcrread17_cmd),
-                              resp, sizeof(resp));
+    uint32_t n;
+
+    /* pcrSelect is a 3-byte bitmap; PCR n is bit n%8 of byte n/8. */
+    tpm2_pcrread_cmd[17] = 0;
+    tpm2_pcrread_cmd[18] = 0;
+    tpm2_pcrread_cmd[19] = 0;
+    tpm2_pcrread_cmd[17 + pcr / 8] = (uint8_t)(1u << (pcr % 8));
+    n = tis_transmit(tpm2_pcrread_cmd, sizeof(tpm2_pcrread_cmd),
+                     resp, sizeof(resp));
     uint32_t rc;
     uint32_t i;
 
     if (n < 10 + 32) {
-        ml_printf("smx: PCR_Read returned %u bytes\n", n);
+        ml_printf("smx: PCR%d_Read returned %u bytes\n", pcr, n);
         return 0;
     }
     rc = ((uint32_t)resp[6] << 24) | ((uint32_t)resp[7] << 16) |
          ((uint32_t)resp[8] << 8) | (uint32_t)resp[9];
     if (rc != 0) {
-        ml_printf("smx: PCR_Read rc=0x%x\n", rc);
+        ml_printf("smx: PCR%d_Read rc=0x%x\n", pcr, rc);
         return 0;
     }
     for (i = 0; i < 32; i++) {
@@ -583,7 +713,7 @@ static int pcr17_read(uint8_t *digest)
     return 1;
 }
 
-static int pcr17_is(const uint8_t *digest, const uint8_t *want)
+static int pcr_is(const uint8_t *digest, const uint8_t *want)
 {
     int i;
 
@@ -595,11 +725,11 @@ static int pcr17_is(const uint8_t *digest, const uint8_t *want)
     return 1;
 }
 
-static void pcr17_print(const char *what, const uint8_t *d)
+static void pcr_print(const char *what, const uint8_t *d)
 {
     int i;
 
-    ml_printf("smx: PCR17 %s:", what);
+    ml_printf("smx: PCR %s:", what);
     for (i = 0; i < 32; i++) {
         ml_printf(" %x", d[i]);
     }
@@ -780,6 +910,8 @@ int main(void)
     {
         volatile uint8_t *acm = (volatile uint8_t *)TEST_SINIT_BASE;
 
+        setup_mle();
+
         txt_write64(TXT_OFF_DPR, TEST_DPR);
         if (txt_read64(TXT_OFF_DPR) != TEST_DPR) {
             fail_msg("DPR readback mismatch after programming", 64);
@@ -843,19 +975,39 @@ int main(void)
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         };
 
-        if (!pcr17_read(d)) {
+        if (!pcr_read(17, d)) {
             fail_msg("PCR 17 could not be read back", 256);
-        } else if (pcr17_is(d, all_ones)) {
-            pcr17_print("after SENTER", d);
+        } else if (pcr_is(d, all_ones)) {
+            pcr_print("17 after SENTER", d);
             fail_msg("PCR 17 still all-ones: the DRTM hash sequence "
                      "did not take effect", 256);
-        } else if (!pcr17_is(d, pcr17_expected)) {
-            pcr17_print("after SENTER", d);
-            pcr17_print("expected    ", pcr17_expected);
+        } else if (!pcr_is(d, pcr17_expected)) {
+            pcr_print("17 after SENTER", d);
+            pcr_print("17 expected   ", pcr17_expected);
             fail_msg("PCR 17 does not match the expected DRTM value", 256);
         } else {
             ml_printf("PASS: PCR 17 holds the expected DRTM "
                       "measurement\n");
+        }
+    }
+
+    /*
+     * 10. PCR 18 must hold the MLE hash (spec step c), extended from
+     *     zero because _TPM_Hash_Start zeroed it along with PCR 17.
+     *     This is the measurement of the image the page table maps,
+     *     not of the SINIT region checked in step 9.
+     */
+    {
+        uint8_t d[32];
+
+        if (!pcr_read(18, d)) {
+            fail_msg("PCR 18 could not be read back", 512);
+        } else if (!pcr_is(d, pcr18_expected)) {
+            pcr_print("18 after SENTER", d);
+            pcr_print("18 expected   ", pcr18_expected);
+            fail_msg("PCR 18 does not match the expected MLE hash", 512);
+        } else {
+            ml_printf("PASS: PCR 18 holds the expected MLE hash\n");
         }
     }
 

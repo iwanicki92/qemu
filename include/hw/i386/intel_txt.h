@@ -125,6 +125,17 @@
 #define TXT_ERRORCODE_MEASURE_FAILED \
     (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
      TXT_ERRORCODE_PROGRESS_CODE(0x05))
+/*
+ * SENTER precondition: the region TXT.SINIT_BASE/SIZE points at does
+ * not describe a SINIT ACM for this chipset -- bad ACM header,
+ * missing or malformed info table, or a chipset id list that does
+ * not cover TXT.DIDVID.  On real hardware the ACM is also
+ * cryptographically authenticated; QEMU only checks the structure
+ * (see the deviations in docs/specs/intel-txt.rst).
+ */
+#define TXT_ERRORCODE_ACM_INVALID \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x06))
 
 /*
  * Placeholder for TXT.PUBLIC_KEY (on real hardware, a hash of

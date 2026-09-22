@@ -414,6 +414,52 @@ enum {
 #define MLE_HDR_OFF_FIRST_VALID   0x1c   /* u32 */
 #define MLE_HDR_MIN_SIZE          0x30
 
+/*
+ * SINIT ACM header (tboot tboot/include/txt/acmod.h, acm_hdr_t).
+ * Offsets are bytes from the ACM base; header_len, scratch_size and
+ * size are counts of 32-bit words, not bytes.
+ */
+#define ACM_HDR_OFF_MODULE_TYPE     0x00   /* u16 */
+#define ACM_HDR_OFF_MODULE_SUBTYPE  0x02   /* u16 */
+#define ACM_HDR_OFF_HEADER_LEN      0x04   /* u32, dwords */
+#define ACM_HDR_OFF_MODULE_VENDOR   0x10   /* u32 */
+#define ACM_HDR_OFF_SIZE            0x18   /* u32, dwords */
+#define ACM_HDR_OFF_ENTRY_POINT     0x34   /* u32 */
+#define ACM_HDR_OFF_SCRATCH_SIZE    0x7c   /* u32, dwords */
+/* Through the RSA-2048 signature and the 143-dword scratch area. */
+#define ACM_HDR_MIN_SIZE            0x4c0
+
+#define ACM_TYPE_CHIPSET            0x02
+#define ACM_SUBTYPE_SINIT           0x00
+#define ACM_VENDOR_INTEL            0x8086
+
+/* ACM info table (acm_info_table_t), at (header_len + scratch_size) * 4 */
+#define ACM_INFO_OFF_UUID             0x00   /* 16 bytes */
+#define ACM_INFO_OFF_CHIPSET_ACM_TYPE 0x10   /* u8 */
+#define ACM_INFO_OFF_VERSION          0x11   /* u8 */
+#define ACM_INFO_OFF_CHIPSET_ID_LIST  0x14   /* u32, offset from ACM base */
+/* Through the version-3 fields (capabilities, acm_ver, reserved). */
+#define ACM_INFO_MIN_SIZE             0x28
+
+#define ACM_CHIPSET_TYPE_SINIT      0x01
+#define ACM_INFO_MIN_VERSION        3
+
+/* acm_chipset_id_list_t: a u32 count followed by acm_chipset_id_t */
+#define ACM_CHIPSET_ID_LIST_OFF_COUNT 0x00   /* u32 */
+#define ACM_CHIPSET_ID_LIST_HDR_SIZE  0x04
+#define ACM_CHIPSET_ID_SIZE           0x10
+#define ACM_CHIPSET_ID_OFF_FLAGS      0x00   /* u32, bit 0: revision mask */
+#define ACM_CHIPSET_ID_OFF_VENDOR     0x04   /* u16 */
+#define ACM_CHIPSET_ID_OFF_DEVICE     0x06   /* u16 */
+#define ACM_CHIPSET_ID_OFF_REVISION   0x08   /* u16 */
+#define ACM_CHIPSET_ID_FLAG_REV_MASK  0x1
+
+/* ACM_UUID_V3 from tboot include/txt/acmod.h, in wire order */
+static const uint8_t intel_txt_acm_uuid[16] = {
+    0xaa, 0x3a, 0xc0, 0x7f, 0xa7, 0x46, 0xdb, 0x18,
+    0x2e, 0xac, 0x69, 0x8f, 0x8d, 0x41, 0x7f, 0x5a,
+};
+
 /* MLE_HDR_UUID from tboot include/mle.h, in wire (little-endian) order */
 static const uint8_t intel_txt_mle_uuid[16] = {
     0x5a, 0xac, 0x82, 0x90, 0x6f, 0x47, 0xa7, 0x74,
@@ -878,6 +924,180 @@ out:
     return ret;
 }
 
+/*
+ * SENTER precondition 3: check that @acm, the @size bytes at
+ * TXT.SINIT_BASE, structurally describes a SINIT ACM for the
+ * chipset TXT.DIDVID reports.  Returns 0 if it does, -1 with @errp
+ * set otherwise; the caller turns that into
+ * TXT_ERRORCODE_ACM_INVALID.
+ *
+ * The checks mirror tboot's is_acmod() / is_sinit_acmod() /
+ * does_acmod_match_platform() (tboot/txt/acmod.c), which is what a
+ * loader applies to the same blob before handing it to SENTER, so a
+ * blob tboot accepts is accepted here too.
+ *
+ * What is deliberately not checked: the RSA signature and the
+ * public-key hash in TXT.PUBLIC_KEY (QEMU authenticates nothing --
+ * deviation 1 in docs/specs/intel-txt.rst), the processor id list
+ * (there is no meaningful emulated platform id to match), and the
+ * SINIT/MLE capability intersection and MLE_JOIN segment selectors,
+ * which belong to the MLE-transfer slice that consumes them.
+ */
+static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
+                                  uint64_t size, Error **errp)
+{
+    uint32_t hdr_size, header_len, scratch_size, entry_point;
+    uint32_t info_off, id_list_off, count, i;
+    uint16_t module_type, module_subtype;
+    uint16_t vendor, device, revision;
+    const uint8_t *info;
+
+    /* The whole fixed header, and ACMs are sized in 64-byte units. */
+    if (size < ACM_HDR_MIN_SIZE || (size % 64) != 0) {
+        error_setg(errp, "SINIT ACM size 0x%" PRIx64 " is below the 0x%x "
+                   "header minimum or not a multiple of 64 bytes", size,
+                   ACM_HDR_MIN_SIZE);
+        return -1;
+    }
+    /* The ACM must be page-aligned so SINIT can map it. */
+    if (s->sinit_base & 0xfff) {
+        error_setg(errp, "SINIT ACM base 0x%" PRIx64 " is not 4 KiB "
+                   "aligned", s->sinit_base);
+        return -1;
+    }
+
+    hdr_size = ldl_le_p(acm + ACM_HDR_OFF_SIZE);
+    if ((uint64_t)hdr_size * 4 != size) {
+        error_setg(errp, "SINIT ACM header size %u dwords (0x%" PRIx64
+                   " bytes) does not match TXT.SINIT_SIZE 0x%" PRIx64,
+                   hdr_size, (uint64_t)hdr_size * 4, size);
+        return -1;
+    }
+
+    module_type = lduw_le_p(acm + ACM_HDR_OFF_MODULE_TYPE);
+    module_subtype = lduw_le_p(acm + ACM_HDR_OFF_MODULE_SUBTYPE);
+    if (module_type != ACM_TYPE_CHIPSET) {
+        error_setg(errp, "ACM module_type 0x%x is not a chipset ACM (0x%x)",
+                   module_type, ACM_TYPE_CHIPSET);
+        return -1;
+    }
+    /*
+     * Subtype 1 is a reset ACM (ACM_SUBTYPE_RESET): it is entered on
+     * the TXT reset path, not by SENTER, so pointing SINIT_BASE at
+     * one is a loader error rather than a usable launch input.
+     */
+    if (module_subtype != ACM_SUBTYPE_SINIT) {
+        error_setg(errp, "ACM module_subtype 0x%x is not a SINIT ACM "
+                   "(0x%x)", module_subtype, ACM_SUBTYPE_SINIT);
+        return -1;
+    }
+    if (ldl_le_p(acm + ACM_HDR_OFF_MODULE_VENDOR) != ACM_VENDOR_INTEL) {
+        error_setg(errp, "ACM module_vendor 0x%x is not Intel (0x%x)",
+                   ldl_le_p(acm + ACM_HDR_OFF_MODULE_VENDOR),
+                   ACM_VENDOR_INTEL);
+        return -1;
+    }
+
+    entry_point = ldl_le_p(acm + ACM_HDR_OFF_ENTRY_POINT);
+    if (entry_point == 0 || entry_point >= size) {
+        error_setg(errp, "ACM entry_point 0x%x is zero or outside the "
+                   "0x%" PRIx64 " byte module", entry_point, size);
+        return -1;
+    }
+
+    /*
+     * The info table follows the header and its scratch area.  Both
+     * lengths come from the (untrusted) header, so compute the offset
+     * in 64 bits and bound it against the module.
+     */
+    header_len = ldl_le_p(acm + ACM_HDR_OFF_HEADER_LEN);
+    scratch_size = ldl_le_p(acm + ACM_HDR_OFF_SCRATCH_SIZE);
+    if ((uint64_t)header_len + scratch_size > size / 4 ||
+        ((uint64_t)header_len + scratch_size) * 4 + ACM_INFO_MIN_SIZE >
+        size) {
+        error_setg(errp, "ACM info table at dword %" PRIu64 " does not fit "
+                   "in the 0x%" PRIx64 " byte module",
+                   (uint64_t)header_len + scratch_size, size);
+        return -1;
+    }
+    info_off = (header_len + scratch_size) * 4;
+    info = acm + info_off;
+
+    if (memcmp(info + ACM_INFO_OFF_UUID, intel_txt_acm_uuid,
+               sizeof(intel_txt_acm_uuid)) != 0) {
+        error_setg(errp, "no ACM info table UUID at offset 0x%x", info_off);
+        return -1;
+    }
+    if (info[ACM_INFO_OFF_CHIPSET_ACM_TYPE] != ACM_CHIPSET_TYPE_SINIT) {
+        error_setg(errp, "ACM chipset_acm_type 0x%x is not SINIT (0x%x)",
+                   info[ACM_INFO_OFF_CHIPSET_ACM_TYPE],
+                   ACM_CHIPSET_TYPE_SINIT);
+        return -1;
+    }
+    if (info[ACM_INFO_OFF_VERSION] < ACM_INFO_MIN_VERSION) {
+        error_setg(errp, "ACM info table version %u is below the minimum "
+                   "%u", info[ACM_INFO_OFF_VERSION], ACM_INFO_MIN_VERSION);
+        return -1;
+    }
+
+    /*
+     * The chipset id list decides whether this ACM is for this
+     * chipset at all: one entry must match TXT.DIDVID.
+     */
+    id_list_off = ldl_le_p(info + ACM_INFO_OFF_CHIPSET_ID_LIST);
+    if (id_list_off < info_off ||
+        (uint64_t)id_list_off + ACM_CHIPSET_ID_LIST_HDR_SIZE > size) {
+        error_setg(errp, "ACM chipset id list offset 0x%x is outside the "
+                   "0x%" PRIx64 " byte module", id_list_off, size);
+        return -1;
+    }
+    count = ldl_le_p(acm + id_list_off + ACM_CHIPSET_ID_LIST_OFF_COUNT);
+    if (count == 0 ||
+        (uint64_t)id_list_off + ACM_CHIPSET_ID_LIST_HDR_SIZE +
+        (uint64_t)count * ACM_CHIPSET_ID_SIZE > size) {
+        error_setg(errp, "ACM chipset id list of %u entries at 0x%x is "
+                   "empty or does not fit in the module", count,
+                   id_list_off);
+        return -1;
+    }
+
+    vendor = s->didvid & 0xffff;
+    device = (s->didvid >> 16) & 0xffff;
+    revision = (s->didvid >> 32) & 0xffff;
+    for (i = 0; i < count; i++) {
+        const uint8_t *id = acm + id_list_off + ACM_CHIPSET_ID_LIST_HDR_SIZE +
+                            (uint64_t)i * ACM_CHIPSET_ID_SIZE;
+        uint32_t flags = ldl_le_p(id + ACM_CHIPSET_ID_OFF_FLAGS);
+        uint16_t id_rev = lduw_le_p(id + ACM_CHIPSET_ID_OFF_REVISION);
+
+        if (lduw_le_p(id + ACM_CHIPSET_ID_OFF_VENDOR) != vendor ||
+            lduw_le_p(id + ACM_CHIPSET_ID_OFF_DEVICE) != device) {
+            continue;
+        }
+        /*
+         * flags bit 0 makes revision_id a mask (any common bit
+         * matches); otherwise it is compared for equality.  Same rule
+         * as tboot's does_acmod_match_platform().
+         */
+        if (flags & ACM_CHIPSET_ID_FLAG_REV_MASK) {
+            if (revision & id_rev) {
+                break;
+            }
+        } else if (revision == id_rev) {
+            break;
+        }
+    }
+    if (i == count) {
+        error_setg(errp, "no ACM chipset id entry matches TXT.DIDVID "
+                   "0x%" PRIx64 " (vendor 0x%x, device 0x%x, revision "
+                   "0x%x)", s->didvid, vendor, device, revision);
+        return -1;
+    }
+
+    trace_txt_acm_validated(size, entry_point, count);
+    return 0;
+}
+
 void intel_txt_senter(IntelTxtState *s)
 {
     uint64_t dpr_size;
@@ -916,12 +1136,27 @@ void intel_txt_senter(IntelTxtState *s)
     }
 
     /*
-     * Precondition 3 (ACM header sanity) is deliberately not checked
-     * here: it needs the synthetic SINIT ACM fixture, which is a
-     * later slice (docs/plans/intel-txt-m3-plan.md section 3.5).
-     *
+     * Precondition 3: the region must actually hold a SINIT ACM for
+     * this chipset.  Read it once here -- the same buffer is what
+     * gets measured below, so validation and measurement cannot
+     * disagree about the bytes even if the guest rewrites the region
+     * in between.
+     */
+    acm = g_malloc(s->sinit_size);
+    if (address_space_read(&address_space_memory, s->sinit_base,
+                           MEMTXATTRS_UNSPECIFIED, acm,
+                           s->sinit_size) != MEMTX_OK) {
+        error_setg(&err, "cannot read the SINIT ACM region at 0x%" PRIx64,
+                   s->sinit_base);
+        goto fail_measure;
+    }
+    if (intel_txt_validate_acm(s, acm, s->sinit_size, &err) < 0) {
+        goto fail_acm;
+    }
+
+    /*
      * Precondition 4: TXT.HEAP_BASE/SIZE set, the region below
-     * 4 GiB.  The heap contents are not parsed yet (spec steps c/e).
+     * 4 GiB.  The heap contents are parsed by step c below.
      */
     if (s->heap_base == 0 || s->heap_size == 0 ||
         s->heap_base >= INTEL_TXT_GUEST_32BIT_LIMIT ||
@@ -950,15 +1185,6 @@ void intel_txt_senter(IntelTxtState *s)
      * its content is the MLE hash, which needs the heap parsing of
      * step c.
      */
-    acm = g_malloc(s->sinit_size);
-    if (address_space_read(&address_space_memory, s->sinit_base,
-                           MEMTXATTRS_UNSPECIFIED, acm,
-                           s->sinit_size) != MEMTX_OK) {
-        error_setg(&err, "cannot read the SINIT ACM region at 0x%" PRIx64,
-                   s->sinit_base);
-        goto fail_measure;
-    }
-
     ret = intel_txt_drtm_hash_measure(s, acm, s->sinit_size, &err);
     if (ret < 0) {
         goto fail_measure;
@@ -988,7 +1214,19 @@ fail_sinit_dpr:
     trace_txt_senter_errorcode(s->errorcode);
     return;
 fail_heap:
+    g_free(acm);
     s->errorcode = TXT_ERRORCODE_HEAP_INVALID;
+    trace_txt_senter_errorcode(s->errorcode);
+    return;
+fail_acm:
+    /*
+     * A precondition failure, so nothing has been measured: report
+     * which structural check the blob failed and leave the PCRs
+     * alone.
+     */
+    error_report_err(err);
+    g_free(acm);
+    s->errorcode = TXT_ERRORCODE_ACM_INVALID;
     trace_txt_senter_errorcode(s->errorcode);
     return;
 fail_measure:

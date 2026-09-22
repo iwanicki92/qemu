@@ -1058,6 +1058,10 @@ static bool G_GNUC_UNUSED intel_txt_write_sinit_mle_data(IntelTxtState *s,
      */
     heap_end = s->heap_base + s->heap_size;
     region = s->heap_base + bios_sz + os_mle_sz + os_sinit_sz;
+    if (region > heap_end || heap_end - region < sizeof(uint64_t)) {
+        error_setg(errp, "no room for sinit_mle_data size in TXT heap");
+        return false;
+    }
     if (!intel_txt_gread_u64(region, &region_size, errp)) {
         return false;
     }
@@ -1101,7 +1105,8 @@ static bool G_GNUC_UNUSED intel_txt_write_sinit_mle_data(IntelTxtState *s,
         return false;
     }
 
-    buf = g_malloc0(mdr_end);
+    /* mdr_end includes the loader's size prefix; the buffer does not. */
+    buf = g_malloc0(mdr_end - sizeof(uint64_t));
     stl_le_p(buf + SINIT_MLE_OFF_VERSION, SINIT_MLE_VERSION);
     /*
      * rlp_wakeup_addr stays zero: the emulation uses the
@@ -1113,7 +1118,7 @@ static bool G_GNUC_UNUSED intel_txt_write_sinit_mle_data(IntelTxtState *s,
     stl_le_p(buf + SINIT_MLE_OFF_MDRS_OFF, mdr_off);
 
     {
-        uint64_t off = mdr_off;
+        uint64_t off = mdr_off - sizeof(uint64_t);
 
         for (i = 0; i < nr_entries; i++) {
             uint64_t addr, len;
@@ -1128,8 +1133,8 @@ static bool G_GNUC_UNUSED intel_txt_write_sinit_mle_data(IntelTxtState *s,
         }
     }
 
-    if (!intel_txt_gwrite(region + sizeof(uint64_t), buf, mdr_end,
-                          errp)) {
+    if (!intel_txt_gwrite(region + sizeof(uint64_t), buf,
+                          mdr_end - sizeof(uint64_t), errp)) {
         g_free(buf);
         return false;
     }

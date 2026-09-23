@@ -1771,6 +1771,11 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             txt_read64(TXT_OFF_DPR) != dpr) {
             fail_msg("SEXIT cleared launch configuration registers", 32768);
         }
+        /* volatile: the closed private TXT MMIO alias must not leak. */
+        if (*(volatile uint32_t *)(TXT_PRIVATE_BASE + TXT_OFF_HEAP_BASE) !=
+            UINT32_MAX) {
+            fail_msg("private TXT MMIO remained readable after SEXIT", 32768);
+        }
         if (!main_fail) {
             ml_printf("PASS: GETSEC[SEXIT] left the measured environment "
                       "and returned\n");

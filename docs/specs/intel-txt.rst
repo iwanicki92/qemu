@@ -207,8 +207,10 @@ by the SINIT ACM while the private space is open
 (``STS.private_open`` = 1). The semantic SENTER does not need it for
 its function; the device implements:
 
-- reads returning the same register set as public space (some
-  loaders poke private registers during bring-up debugging),
+- pre-launch reads returning the same register set as public space
+  (some loaders poke private registers during bring-up debugging),
+- after launch, reads return all ones when private space is closed,
+  including after SEXIT; public config remains accessible,
 - writes ignored except ``TXT.MLE_JOIN`` when ``STS.SENTER_DONE`` and
   ``STS.PRIVATE_OPEN`` are both set (the MLE publishes its AP entry),
 - ``TXT.CMD_CLOSE_PRIVATE`` closes it.

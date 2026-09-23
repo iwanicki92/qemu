@@ -316,8 +316,19 @@ static uint64_t intel_txt_private_read(void *opaque, hwaddr addr,
                                        unsigned size)
 {
     IntelTxtState *s = INTEL_TXT(opaque);
-    uint64_t val = intel_txt_reg_read(s, addr, size);
+    uint64_t val;
 
+    /*
+     * The pre-launch mirror remains accessible to firmware.  Once a
+     * launch has closed private space, do not leak its register values
+     * through the alias (including after SEXIT).  SENTER reopens it.
+     */
+    if (!(s->sts & TXT_STS_PRIVATE_OPEN) &&
+        (s->sts & (TXT_STS_SENTER_DONE | TXT_STS_SEXIT_DONE))) {
+        val = size == 4 ? UINT32_MAX : UINT64_MAX;
+    } else {
+        val = intel_txt_reg_read(s, addr, size);
+    }
     trace_txt_reg_read("private", addr, val);
     return val;
 }

@@ -536,11 +536,15 @@ enum {
 #define INTEL_TXT_GUEST_32BIT_LIMIT (1ull << 32)
 
 /*
- * Max ACM size, in bytes: the value GETSEC[PARAMETERS] reports
- * (0x8000 in 32-byte units).  Bounds the SINIT region read rather
- * than allocating whatever the guest asked for.
+ * Max ACM size, in bytes.  Must match the AC execution area that
+ * GETSEC[PARAMETERS] advertises (GETSEC_PARAM_MAX_ACM_SIZE): the SDG
+ * tells system software to check the module against that value, so a
+ * loader that honors it must not then be refused here.  Bounds the
+ * SINIT region read rather than allocating whatever the guest asked
+ * for.  Production SINIT ACMs run from roughly 53 KiB (SNB/IVB) to
+ * 132 KiB (TGL), so 32 KiB rejected every real module.
  */
-#define INTEL_TXT_MAX_ACM_SIZE 0x8000
+#define INTEL_TXT_MAX_ACM_SIZE 0x40000
 
 /*
  * MLE measurement (spec step c).
@@ -2347,6 +2351,7 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
                       uint32_t acm_size, IntelTxtMleEntry *entry)
 {
     uint64_t dpr_size, dpr_top, cs_addr, ds_addr;
+    uint32_t gdt_off;
     uint32_t cs_flags, ds_flags;
     uint8_t *acm = NULL;
     IntelTxtPmrs pmrs;
@@ -2417,20 +2422,29 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     if (intel_txt_validate_acm(s, acm, acm_size, &err) < 0) {
         goto fail_acm;
     }
-    entry->gdt_base = ldl_le_p(acm + ACM_HDR_OFF_GDT_BASE);
     entry->gdt_limit = ldl_le_p(acm + ACM_HDR_OFF_GDT_LIMIT);
     entry->seg_sel = ldl_le_p(acm + ACM_HDR_OFF_SEG_SEL);
-    cs_addr = (uint64_t)entry->gdt_base + entry->seg_sel;
+    /*
+     * GDTBasePtr is not an address: the SDG's ACM header description
+     * defines it as "an offset from the authenticated code module base
+     * address", the same convention as EntryPoint.  So the GDT lives
+     * inside the measured module -- every production SINIT ACM puts it
+     * a few KiB in -- and the descriptors come out of the image while
+     * the CPU gets the resolved address to load into GDTR.
+     */
+    gdt_off = ldl_le_p(acm + ACM_HDR_OFF_GDT_BASE);
+    cs_addr = (uint64_t)gdt_off + entry->seg_sel;
     ds_addr = cs_addr + 8;
-    if (cs_addr >= INTEL_TXT_GUEST_32BIT_LIMIT ||
-        ds_addr > INTEL_TXT_GUEST_32BIT_LIMIT - 8 ||
-        !intel_txt_gread_u64(cs_addr, &entry->cs_desc, &err) ||
-        !intel_txt_gread_u64(ds_addr, &entry->ds_desc, &err)) {
-        if (!err) {
-            error_setg(&err, "ACM GDT descriptors exceed 32-bit memory");
-        }
+    if ((uint64_t)gdt_off + entry->gdt_limit >= acm_size ||
+        ds_addr + 8 > acm_size) {
+        error_setg(&err, "ACM GDT at module offset 0x%x (limit 0x%x, "
+                   "selector 0x%x) does not fit in the 0x%x byte module",
+                   gdt_off, entry->gdt_limit, entry->seg_sel, acm_size);
         goto fail_acm;
     }
+    entry->gdt_base = acm_base + gdt_off;
+    entry->cs_desc = ldq_le_p(acm + cs_addr);
+    entry->ds_desc = ldq_le_p(acm + ds_addr);
     cs_flags = entry->cs_desc >> 32;
     ds_flags = entry->ds_desc >> 32;
     /*

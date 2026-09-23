@@ -61,8 +61,16 @@
  */
 #define GETSEC_PARAM_ACM_MEMORY_TYPE_UC       0x100
 #define GETSEC_PARAM_TXT_EXT_PROCESSOR_SCRTM  BIT(5)
-/* 32 KiB maximum ACM execution area, in bytes (EAX bits [31:5]). */
-#define GETSEC_PARAM_MAX_ACM_SIZE             0x8000
+/*
+ * Maximum ACM execution area, in bytes (EAX bits [31:5]).  Keep in
+ * step with INTEL_TXT_MAX_ACM_SIZE, which is what SENTER enforces:
+ * the SDG has system software size-check the SINIT module against
+ * this leaf, so advertising less than SENTER accepts would make
+ * loaders reject modules the model can measure, and advertising more
+ * would invite the opposite.  256 KiB covers production SINIT ACMs
+ * (roughly 53 KiB to 132 KiB).
+ */
+#define GETSEC_PARAM_MAX_ACM_SIZE             0x40000
 
 #if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TPM)
 static void getsec_load_mle_seg(CPUX86State *env, int reg, uint32_t selector,

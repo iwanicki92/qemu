@@ -287,8 +287,11 @@ GETSEC[PARAMETERS] (EAX=6, EBX=index)
   QEMU reports:
 
   - ACM version mask 0xFFFFFFFF, version 0
-  - max ACM size 32 KiB (EAX masked with ~0x1f is 0x8000 bytes),
-    acquirable memory UC
+  - max ACM size 256 KiB (EAX masked with ~0x1f is 0x40000 bytes),
+    acquirable memory UC.  This is the AC execution area the SDG has
+    system software size-check the SINIT module against, so it is
+    kept equal to the limit SENTER enforces; production SINIT ACMs
+    run from roughly 53 KiB to 132 KiB
   - SENTER controls 0
   - TXT extensions: processor-based SCRTM (bit 5) supported
 
@@ -507,7 +510,9 @@ return without a machine reset (a QEMU semantic deviation):
      field is not used for this.
 
    The ACM ``seg_sel`` and ``gdt_limit`` are checked before the
-   transfer; the ACM GDT describes the BSP's entry selectors. Not
+   transfer, and the GDT they describe must lie inside the module,
+   since ``gdt_base`` is a module-relative offset; the ACM GDT
+   describes the BSP's entry selectors. Not
    checked: RSA signature and public-key fields, the processor id
    list (no emulated platform id), or SINIT/MLE capability intersection.
    ``MLE_JOIN`` is for later AP wakeup, not the BSP entry.
@@ -704,7 +709,11 @@ MLE entry CPU state (BSP), per MLE Dev Guide:
   kernel, so this is the normal case, not a corner case.)
 - GDTR from the **SINIT ACM header** (``gdt_base`` at offset 0x2c,
   ``gdt_limit`` at 0x28), CS = the ACM header's ``seg_sel`` (0x30,
-  32-bit code, RPL0), DS/ES/SS = seg_sel+8,
+  32-bit code, RPL0), DS/ES/SS = seg_sel+8.  ``gdt_base`` is an
+  offset from the ACM base, not an address (the SDG describes
+  GDTBasePtr as "an offset from the authenticated code module base
+  address", matching ``entry_point``), so the GDT is part of the
+  measured module and GDTR gets ``sinit_base + gdt_base``,
 - EIP = the physical address resolved from the MLE header's
   ``entry_point`` through the MLE page tables (CS.base = 0, PG=0),
 - EBX = that physical entry address, ECX = physical address of

@@ -81,9 +81,9 @@ struct IntelTxtState {
 };
 
 /*
- * All TXT configuration registers are 64 bits wide and must be
- * accessed with aligned quadword reads and writes; other access
- * sizes are rejected by the memory core, like on real hardware.
+ * TXT configuration registers are 64 bits wide. Accept aligned quadword
+ * accesses or aligned 32-bit accesses to either half for 32-bit firmware;
+ * smaller or misaligned accesses are rejected by the memory core.
  */
 
 static uint64_t intel_txt_reg_read64(IntelTxtState *s, hwaddr addr)
@@ -233,11 +233,59 @@ static void intel_txt_reg_write64(IntelTxtState *s, hwaddr addr,
     }
 }
 
+static uint64_t intel_txt_reg_read(IntelTxtState *s, hwaddr addr,
+                                   unsigned size)
+{
+    uint64_t val = intel_txt_reg_read64(s, addr & ~7);
+
+    return size == 4 ? (val >> ((addr & 4) * 8)) & UINT32_MAX : val;
+}
+
+static void intel_txt_reg_write(IntelTxtState *s, hwaddr addr,
+                                uint64_t val, unsigned size)
+{
+    hwaddr reg = addr & ~7;
+    unsigned shift = (addr & 4) * 8;
+    uint64_t mask;
+
+    if (size == 8) {
+        intel_txt_reg_write64(s, addr, val);
+        return;
+    }
+    if (addr & 4) {
+        /* High halves of command registers do not execute commands. */
+        switch (reg) {
+        case TXT_CMD_RESET:
+        case TXT_CMD_CLOSE_PRIVATE:
+        case TXT_CMD_UNLOCK_MEM:
+        case TXT_CMD_OPEN_LOCALITY1:
+        case TXT_CMD_CLOSE_LOCALITY1:
+        case TXT_CMD_OPEN_LOCALITY2:
+        case TXT_CMD_CLOSE_LOCALITY2:
+        case TXT_CMD_SECRETS:
+        case TXT_CMD_NO_SECRETS:
+            trace_txt_reg_write_ignored("public", addr, val);
+            return;
+        default:
+            break;
+        }
+    }
+    if (reg == TXT_ESTS) {
+        /* Preserve write-one-to-clear semantics, not the old status. */
+        intel_txt_reg_write64(s, reg, val << shift);
+        return;
+    }
+
+    mask = UINT64_C(0xffffffff) << shift;
+    val = (intel_txt_reg_read64(s, reg) & ~mask) | ((val << shift) & mask);
+    intel_txt_reg_write64(s, reg, val);
+}
+
 static uint64_t intel_txt_public_read(void *opaque, hwaddr addr,
                                       unsigned size)
 {
     IntelTxtState *s = INTEL_TXT(opaque);
-    uint64_t val = intel_txt_reg_read64(s, addr);
+    uint64_t val = intel_txt_reg_read(s, addr, size);
 
     trace_txt_reg_read("public", addr, val);
     return val;
@@ -249,14 +297,14 @@ static void intel_txt_public_write(void *opaque, hwaddr addr,
     IntelTxtState *s = INTEL_TXT(opaque);
 
     trace_txt_reg_write("public", addr, val);
-    intel_txt_reg_write64(s, addr, val);
+    intel_txt_reg_write(s, addr, val, size);
 }
 
 static uint64_t intel_txt_private_read(void *opaque, hwaddr addr,
                                        unsigned size)
 {
     IntelTxtState *s = INTEL_TXT(opaque);
-    uint64_t val = intel_txt_reg_read64(s, addr);
+    uint64_t val = intel_txt_reg_read(s, addr, size);
 
     trace_txt_reg_read("private", addr, val);
     return val;
@@ -278,11 +326,11 @@ static const MemoryRegionOps intel_txt_public_ops = {
     .read = intel_txt_public_read,
     .write = intel_txt_public_write,
     .impl = {
-        .min_access_size = 8,
+        .min_access_size = 4,
         .max_access_size = 8,
     },
     .valid = {
-        .min_access_size = 8,
+        .min_access_size = 4,
         .max_access_size = 8,
         .unaligned = false,
     },
@@ -1564,11 +1612,11 @@ static const MemoryRegionOps intel_txt_private_ops = {
     .read = intel_txt_private_read,
     .write = intel_txt_private_write,
     .impl = {
-        .min_access_size = 8,
+        .min_access_size = 4,
         .max_access_size = 8,
     },
     .valid = {
-        .min_access_size = 8,
+        .min_access_size = 4,
         .max_access_size = 8,
         .unaligned = false,
     },

@@ -67,6 +67,26 @@ static void txt_test_sinit(void)
     g_assert_cmpuint(txt_read(TXT_HEAP_SIZE), ==, 0xf0000);
 }
 
+static void txt_test_32bit_access(void)
+{
+    const uint64_t base = INTEL_TXT_PUBLIC_BASE;
+
+    writel(base + TXT_SINIT_BASE, 0x3e200000);
+    writel(base + TXT_SINIT_BASE + 4, 1);
+    g_assert_cmphex(txt_read(TXT_SINIT_BASE), ==, 0x13e200000ULL);
+    g_assert_cmphex(readl(base + TXT_SINIT_BASE), ==, 0x3e200000);
+    g_assert_cmphex(readl(base + TXT_SINIT_BASE + 4), ==, 1);
+    g_assert_cmphex(readl(base + TXT_PUBLIC_KEY + 4), ==,
+                    TXT_PUBLIC_KEY_PLACEHOLDER >> 32);
+
+    writel(base + TXT_SINIT_BASE + 4, 0);
+    writel(base + TXT_SINIT_BASE, 0);
+
+    /* A write to the upper half must not trigger a command. */
+    writel(base + TXT_CMD_SECRETS + 4, 1);
+    g_assert_cmphex(txt_read(TXT_E2STS) & TXT_E2STS_SECRET_STS, ==, 0);
+}
+
 static void txt_test_dpr_lock(void)
 {
     /*
@@ -80,6 +100,8 @@ static void txt_test_dpr_lock(void)
 
     /* ignored after lock, even an attempt to unlock */
     txt_write(TXT_DPR, 0);
+    g_assert_cmpuint(txt_read(TXT_DPR), ==, dpr & TXT_DPR_MASK);
+    writel(INTEL_TXT_PUBLIC_BASE + TXT_DPR, 0);
     g_assert_cmpuint(txt_read(TXT_DPR), ==, dpr & TXT_DPR_MASK);
 }
 
@@ -157,7 +179,10 @@ static void txt_test_ests_w1c(void)
     g_assert_cmphex(txt_read(TXT_ESTS) & TXT_ESTS_TXT_RESET_STS,
                     ==, TXT_ESTS_TXT_RESET_STS);
 
-    txt_write(TXT_ESTS, TXT_ESTS_TXT_RESET_STS);
+    writel(INTEL_TXT_PUBLIC_BASE + TXT_ESTS + 4, 0xffffffff);
+    g_assert_cmphex(txt_read(TXT_ESTS) & TXT_ESTS_TXT_RESET_STS,
+                    ==, TXT_ESTS_TXT_RESET_STS);
+    writel(INTEL_TXT_PUBLIC_BASE + TXT_ESTS, TXT_ESTS_TXT_RESET_STS);
     g_assert_cmphex(txt_read(TXT_ESTS) & TXT_ESTS_TXT_RESET_STS, ==, 0);
 }
 
@@ -254,6 +279,7 @@ int main(int argc, char **argv)
     qtest_add_func("/txt/test_didvid", txt_test_didvid);
     qtest_add_func("/txt/test_ver_fsbif", txt_test_ver_fsbif);
     qtest_add_func("/txt/test_sinit", txt_test_sinit);
+    qtest_add_func("/txt/test_32bit_access", txt_test_32bit_access);
     qtest_add_func("/txt/test_dpr_lock", txt_test_dpr_lock);
     qtest_add_func("/txt/test_private_space", txt_test_private_space);
     qtest_add_func("/txt/test_locality", txt_test_locality);

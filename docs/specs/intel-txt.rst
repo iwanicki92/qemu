@@ -65,12 +65,22 @@ Notes:
   guest's own TPM driver.
 - Under ``-machine txt=on`` the machine requires a TPM backend
   (tpm-tis + swtpm); instantiation fails otherwise.
+- ``-machine q35,txt=on,txt-vmx-compat=on`` is an explicit single-vCPU
+  bring-up option: it advertises ``CPUID.1.ECX.VMX`` only on that TXT
+  machine, so real tboot can pass its prelaunch VMX capability check.
+  TCG **does not execute VMX instructions**. The option rejects
+  ``txt=off``, more than one possible vCPU, or a CPU without SMX; it
+  is unsafe for general guest use. Default: off.
 
 TXT public config register map
 ===============================
 
-All registers are 64-bit unless noted. Offsets from
-``0xFED30000`` (public) and ``0xFED20000`` (private).
+All registers are 64-bit unless noted. Aligned 64-bit accesses and aligned
+32-bit accesses to either half are supported: 32-bit coreboot firmware
+emits separate low/high accesses. Writes to the high halves of command
+registers do not execute those commands; W1C and DPR-lock behavior also
+applies to 32-bit writes. Offsets from ``0xFED30000`` (public) and
+``0xFED20000`` (private).
 
 ===== ========================= ============= ===========================================
 Off   Name                      Access        Semantics (QEMU)
@@ -375,20 +385,18 @@ MLE's own decision (in tboot, the ``ap_wake_mwait`` command-line
 option).  The distinction matters to this emulation because the two
 parking strategies have very different requirements:
 
-- MONITOR/MWAIT parking is a polling loop over a shared trigger word
-  with MWAIT as a power hint.  Under TCG MWAIT on an AP resolves to
-  ``helper_pause()``, which yields to the main loop without halting
-  the vCPU, so the loop still makes progress and the mechanism works.
+- MONITOR/MWAIT AP parking needs monitored-address wake semantics,
+  which TCG does not model. It is not the selected tboot path.
 - Parking APs in a VMX mini-guest (tboot's default) executes VMXON,
   VMPTRLD, a long run of VMWRITEs and VMLAUNCH, and relies on
-  intercepting INIT/SIPI.  **QEMU TCG implements no VMX at all**, so
-  that path faults on the first VMXON.
+  intercepting INIT/SIPI. **QEMU TCG implements no VMX instructions**.
 
-Measured launch under this model therefore expects an MLE configured
-for MONITOR/MWAIT parking (for tboot, ``ap_wake_mwait=true``).  Note
-that an MLE which gates on ``CPUID.1.ECX.VMX`` before it gets that
-far will still refuse to launch; tboot skips its VMX check entirely
-when MWAIT parking is selected.
+The bring-up target is instead **one vCPU** with tboot's default VMX
+path: tboot checks the CPUID and feature-control bits but does not run
+its AP VMX code when there are no APs. Use the explicit
+``txt-vmx-compat=on`` setting for that capability check only. SENTER
+rejects more than one vCPU before measuring anything; AP sleep and
+GETSEC[WAKEUP] integration are still unimplemented.
 
 Semantic measured launch (GETSEC[SENTER])
 =========================================

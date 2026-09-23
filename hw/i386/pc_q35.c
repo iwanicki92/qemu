@@ -155,6 +155,13 @@ static void pc_q35_init(MachineState *machine)
 
     assert(pcmc->pci_enabled);
 
+    if (pcms->txt_vmx_compat &&
+        (!pcms->txt_enabled || machine->smp.max_cpus != 1)) {
+        error_report("txt-vmx-compat=on requires txt=on and exactly "
+                     "one possible vCPU");
+        exit(1);
+    }
+
     /* Check whether RAM fits below 4G (leaving 1/2 GByte for IO memory
      * and 256 Mbytes for PCI Express Enhanced Configuration Access Mapping
      * also known as MMCFG).
@@ -361,7 +368,29 @@ static void pc_q35_init(MachineState *machine)
              * the GETSEC helper can report chipset presence.
              */
             CPU_FOREACH(cs) {
-                X86_CPU(cs)->txt_state = INTEL_TXT(txt);
+                X86CPU *cpu = X86_CPU(cs);
+
+                cpu->txt_state = INTEL_TXT(txt);
+                if (pcms->txt_vmx_compat) {
+                    if (!(cpu->env.features[FEAT_1_ECX] & CPUID_EXT_SMX)) {
+                        error_report("txt-vmx-compat=on requires a CPU "
+                                     "with SMX");
+                        exit(1);
+                    }
+                    /*
+                     * A single-vCPU tboot checks VMX capability before
+                     * GETSEC[SENTER], but never executes AP VMX code.  TCG
+                     * does not implement VMX instructions: opt in to the
+                     * CPUID bit for that narrow integration run only.
+                     * Do not add VMX to TCG_EXT_FEATURES globally.
+                     */
+                    cpu->env.features[FEAT_1_ECX] |= CPUID_EXT_VMX;
+                }
+            }
+            if (pcms->txt_vmx_compat) {
+                warn_report("txt-vmx-compat advertises VMX without VMX "
+                            "instruction support; use only for single-vCPU "
+                            "TXT bring-up");
             }
         }
 #else
@@ -392,6 +421,17 @@ static void pc_q35_machine_set_txt(Object *o, bool value, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(o);
     pcms->txt_enabled = value;
+}
+
+static bool pc_q35_machine_get_txt_vmx_compat(Object *o, Error **errp)
+{
+    return PC_MACHINE(o)->txt_vmx_compat;
+}
+
+static void pc_q35_machine_set_txt_vmx_compat(Object *o, bool value,
+                                               Error **errp)
+{
+    PC_MACHINE(o)->txt_vmx_compat = value;
 }
 
 static bool pc_q35_machine_get_wdat(Object *o, Error **errp)
@@ -446,6 +486,12 @@ static void pc_q35_machine_options(MachineClass *m)
     object_class_property_set_description(oc, "txt",
         "Enable Intel TXT (Trusted Execution Technology) support. "
         "Default: off");
+    object_class_property_add_bool(oc, "txt-vmx-compat",
+        pc_q35_machine_get_txt_vmx_compat,
+        pc_q35_machine_set_txt_vmx_compat);
+    object_class_property_set_description(oc, "txt-vmx-compat",
+        "Advertise VMX for single-vCPU TXT integration only; VMX "
+        "instructions are not implemented by TCG. Default: off");
 
     compat_props_add(m->compat_props,
                      pc_q35_compat_defaults, pc_q35_compat_defaults_len);

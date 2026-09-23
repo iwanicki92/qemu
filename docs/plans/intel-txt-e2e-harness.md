@@ -167,8 +167,8 @@ recorded above. The boot is not a successful TXT launch.
   locked/enabled feature-control MSR and required GETSEC capabilities. It
   requires VMX unless `use_mwait()` is true. **Selected path: tboot's default
   VMX/GETSEC[WAKEUP], scoped to one vCPU.** A TXT-machine-specific VMX
-  capability opt-in may be needed, despite TCG not executing VMXON: at one
-  vCPU tboot checks CPUID/MSR bits but never runs the AP's VMX code. Do not
+  capability opt-in is available as ``txt-vmx-compat=on``; at one vCPU
+  tboot checks CPUID/MSR bits but never runs the AP's VMX code. Do not
   add VMX to all TCG guests. The MWAIT path is not the chosen escape hatch:
   tboot's README warns that AP parking needs OS cooperation, and TCG does
   not model the monitored-address wake semantics. Current SENTER rejects
@@ -193,11 +193,14 @@ recorded above. The boot is not a successful TXT launch.
 ### q35 coreboot firmware spike (2026-09-23)
 
 The separate coreboot worktree `/home/michal/qemu-txt-work/coreboot-q35-txt`
-(branch `qemu-txt-firmware`, commit `2c1f14972b`) adds an **opt-in first slice**:
-`CONFIG_QEMU_Q35_TXT_FIRMWARE_INIT` locks `IA32_FEATURE_CONTROL` with all SENTER
-localities and the VMX-in-SMX bit, only if the CPU advertises SMX. It does not
-advertise VMX, execute a BIOS ACM, or set up SINIT, heap or DPR. The original
-coreboot checkout has unrelated local changes and was not modified.
+(branch `qemu-txt-firmware`, starting at commit `2c1f14972b`) adds an **opt-in
+firmware path**: `CONFIG_QEMU_Q35_TXT_FIRMWARE_INIT` locks
+`IA32_FEATURE_CONTROL` with all SENTER localities and the VMX-in-SMX bit,
+only if the CPU advertises SMX. Its next increment reserves 4 MiB of guest
+RAM as DPR, initializes a version-3 BIOS Data region in a 1 MiB TXT heap,
+and programs TXT.SINIT and TXT.HEAP. It does not execute a BIOS ACM or ship a
+SINIT module; the guest still needs to supply one. The original coreboot
+checkout has unrelated local changes and was not modified.
 
 The unmodified q35 coreboot/SeaBIOS payload and the opt-in variant both built
 successfully with `coreboot/coreboot-sdk:testing` (image digest
@@ -221,11 +224,26 @@ support VMX`**. It also reported zero SINIT base/size and no SINIT ACM before
 falling back to an unmeasured Linux kernel. Thus the firmware MSR gate is
 observably passed, but the boot is **not** a measured-launch pass.
 
+A further run with `-machine q35,txt=on,txt-vmx-compat=on` and the same
+`-apic` diagnostic CPU (`run-20260923-083753/`) reports `CPU is VMX-capable`.
+The property is off by default and rejects non-TXT and multi-vCPU machines;
+it does not implement VMX instructions or imply measured-boot success.
+
+Coreboot's 32-bit compiler emits two 32-bit MMIO transactions for each
+64-bit TXT register access. QEMU initially rejected both, so the first
+firmware run halted at DPR readback. The TXT MMIO device now supports aligned
+low/high 32-bit accesses as well as 64-bit accesses, with W1C and DPR lock
+semantics retained (qtest covers both widths). With this change, the
+`run-20260923-084726/` serial log shows DPR `[3e000000,3e400000)`, SINIT
+`3e200000/40000`, heap `3e300000/100000`, and tboot's E820 marks all 4 MiB
+reserved. Tboot passes the VMX check, reads the nonzero SINIT base/size, and
+stops at **`SINIT ACM not provided`**. It falls back to unmeasured Linux.
+The SINIT fixture and a heap-validating tboot launch remain untested.
+
 Next: diagnose/fix the coreboot/SeaBIOS virtual-wire/APIC handoff so the normal
-CPU configuration boots. A TXT-scoped VMX CPUID compatibility mode is now
-justified by the actual tboot diagnostic; never enable VMX for all TCG guests.
-Then reserve/program SINIT and heap regions, fill BIOS Data, program DPR and
-verify matching DMAR/VT-d. Generic coreboot TXT cannot simply be enabled for
+CPU configuration boots. Supply a SINIT module that passes real tboot's
+validation, exercise its heap checks, and verify matching DMAR/VT-d. Generic
+coreboot TXT cannot simply be enabled for
 q35: it expects platform DRAM-clear/reset features and a BIOS ACM that QEMU
 does not execute. A TXT-enabled Linux kernel and purpose-built initramfs
 remain necessary for full acceptance.

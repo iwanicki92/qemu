@@ -368,12 +368,37 @@ copy SINIT stashes in the TXT heap, at
 (`arch/x86/kernel/tboot.c`, `tboot_get_dmar_table()`). QEMU was writing
 `num_vtd_dmars = 0`, so the kernel got NULL and died.
 
-SENTER now locates the guest DMAR (RSDP scan of 0xE0000-0xFFFFF, then
+SENTER now locates the guest DMAR (EBDA + 0xE0000-0xFFFFF RSDP scan, then
 RSDT/XSDT walk) and appends a copy after the MDRs. tboot now reports
 `num_vtd_dmars: 1`, `vtd_dmars_off: 0xb0`, and the kernel brings VT-d up:
 `DMAR: Forcing Intel-IOMMU to enabled`, `DMAR: dmar0: reg_base_addr
 fed90000`, `DMAR: Intel(R) Virtualization Technology for Directed I/O`.
 Guests without intel-iommu have no DMAR and the fields stay zero.
+
+The discovery path validates before it trusts: the RSDP (20-byte and, for
+revision 2+, extended checksum), the RSDT/XSDT and the DMAR are all
+checksum-checked, and the EBDA is searched as well as the BIOS area. A
+DMAR that fails validation is reported as absent rather than copied, with a
+`txt_dmar_rejected` trace point.
+
+Coverage: the TCG guest test now runs with `-device intel-iommu`, so the
+machine publishes a real DMAR and the test asserts SENTER copied it --
+`num_vtd_dmars == 1`, `vtd_dmars_off` immediately after the MDRs, a `DMAR`
+signature, a length that fits the section, and a zero ACPI checksum over
+the copy. Two mutations confirm the assertions bite rather than pass
+vacuously: forcing `have_dmar = false` fails with `num_vtd_dmars=0
+vtd_dmars_off=0x0 (expected 1 and 0xb0)`, and flipping one byte of the
+copied table fails the checksum assertion.
+
+**Still open (the real remaining VT-d gap): PMRs are not implemented.**
+tboot supplies `vtd_pmr_lo_base=0x0`, `vtd_pmr_lo_size=0x3e000000` (and a
+zero `hi` pair) in os_sinit_data, and real SINIT both validates those and
+programs the VT-d Protected Memory Registers so the range is genuinely DMA
+protected. QEMU reads neither and programs nothing. So the DMAR copy Linux
+trusts *because* the TXT heap is supposed to be DMA protected is not in
+fact protected here. That is a functional-only deviation, consistent with
+the unsigned SINIT fixture: this harness demonstrates the measured-launch
+flow, not its DMA security properties.
 
 ### Virtual-wire ExtINT: why `-apic` was needed, and the fix (2026-09-23)
 

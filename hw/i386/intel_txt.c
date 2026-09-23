@@ -535,6 +535,8 @@ enum {
 /* sinit_mdr_t: u64 base, u64 length, u8 mem_type, 7 reserved bytes */
 /* ACPI 6.x "Description Header", common to RSDT/XSDT/DMAR. */
 #define ACPI_TABLE_HEADER_SIZE          36
+/* Sanity bound on any ACPI table this code will read or checksum. */
+#define INTEL_TXT_MAX_ACPI_TABLE        (1024 * 1024)
 
 #define SINIT_MDR_SIZE                  0x18
 #define SINIT_MDR_OFF_BASE              0x00  /* u64 */
@@ -1272,27 +1274,86 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
  * no DMAR is present -- which is not an error: a guest without
  * intel-iommu legitimately has none.
  */
+/*
+ * True when the @len bytes at @addr sum to zero modulo 256, the
+ * validity rule for every ACPI structure.  Without this any stray
+ * "RSD PTR " string in the BIOS area would be taken for a real RSDP.
+ */
+static bool intel_txt_acpi_csum_ok(uint64_t addr, uint32_t len)
+{
+    g_autofree uint8_t *buf = NULL;
+    uint8_t sum = 0;
+    uint32_t i;
+
+    if (len == 0 || len > INTEL_TXT_MAX_ACPI_TABLE) {
+        return false;
+    }
+    buf = g_malloc(len);
+    if (!intel_txt_gread(addr, buf, len, NULL)) {
+        return false;
+    }
+    for (i = 0; i < len; i++) {
+        sum += buf[i];
+    }
+    return sum == 0;
+}
+
+/* Find a checksum-valid RSDP in [@start, @start + @size). */
+static uint64_t intel_txt_scan_rsdp(uint64_t start, uint64_t size)
+{
+    uint64_t scan;
+
+    /* The ACPI spec requires 16 byte alignment for the signature. */
+    for (scan = start; scan + 20 <= start + size; scan += 16) {
+        uint8_t sig[8];
+        uint8_t rev;
+        uint32_t ext_len;
+
+        if (!intel_txt_gread(scan, sig, sizeof(sig), NULL)) {
+            return 0;
+        }
+        if (memcmp(sig, "RSD PTR ", sizeof(sig)) != 0) {
+            continue;
+        }
+        /* ACPI 1.0 checksum covers the first 20 bytes. */
+        if (!intel_txt_acpi_csum_ok(scan, 20)) {
+            continue;
+        }
+        /* Revision 2+ adds an extended checksum over the whole table. */
+        if (!intel_txt_gread(scan + 15, &rev, 1, NULL)) {
+            return 0;
+        }
+        if (rev >= 2) {
+            if (!intel_txt_gread_u32(scan + 20, &ext_len, NULL) ||
+                ext_len < 20 || !intel_txt_acpi_csum_ok(scan, ext_len)) {
+                continue;
+            }
+        }
+        return scan;
+    }
+    return 0;
+}
+
 static bool intel_txt_find_dmar(uint64_t *addr, uint32_t *len)
 {
-    uint64_t rsdp = 0, sdt;
+    uint64_t rsdp, sdt;
     uint8_t sig[8];
     uint32_t sdt_len;
     bool xsdt;
-    uint64_t scan;
+    uint16_t ebda_seg = 0;
 
     /*
-     * Scan the BIOS area for "RSD PTR " on the 16 byte boundaries the
-     * ACPI spec mandates.  coreboot puts its tables high and leaves the
-     * pointer here, which is also where tboot and Linux look.
+     * The RSDP lives either in the first KiB of the EBDA or in
+     * 0xE0000-0xFFFFF (ACPI spec 5.2.5.1); check both, as tboot and
+     * Linux do.  coreboot puts its tables high and the pointer in the
+     * BIOS area, SeaBIOS uses the EBDA.
      */
-    for (scan = 0xe0000; scan < 0x100000; scan += 16) {
-        if (!intel_txt_gread(scan, sig, sizeof(sig), NULL)) {
-            return false;
-        }
-        if (memcmp(sig, "RSD PTR ", sizeof(sig)) == 0) {
-            rsdp = scan;
-            break;
-        }
+    if (intel_txt_gread(0x40e, &ebda_seg, sizeof(ebda_seg), NULL)) {
+        ebda_seg = le16_to_cpu(ebda_seg);
+    }
+    rsdp = ebda_seg ? intel_txt_scan_rsdp((uint64_t)ebda_seg << 4, 1024) : 0;
+    if (rsdp == 0) {
+        rsdp = intel_txt_scan_rsdp(0xe0000, 0x20000);
     }
     if (rsdp == 0) {
         return false;
@@ -1333,7 +1394,8 @@ static bool intel_txt_find_dmar(uint64_t *addr, uint32_t *len)
     }
     if (memcmp(sig, xsdt ? "XSDT" : "RSDT", 4) != 0 ||
         sdt_len < ACPI_TABLE_HEADER_SIZE ||
-        sdt_len > INTEL_TXT_GUEST_32BIT_LIMIT - sdt) {
+        sdt_len > INTEL_TXT_GUEST_32BIT_LIMIT - sdt ||
+        !intel_txt_acpi_csum_ok(sdt, sdt_len)) {
         return false;
     }
 
@@ -1369,10 +1431,20 @@ static bool intel_txt_find_dmar(uint64_t *addr, uint32_t *len)
             if (memcmp(sig, "DMAR", 4) != 0) {
                 continue;
             }
+            /*
+             * A DMAR that does not validate is reported as absent
+             * rather than copied: the MLE is told what was found, and
+             * garbage here would be worse than nothing.  The trace
+             * point keeps the rejection visible.
+             */
             if (tbl_len < ACPI_TABLE_HEADER_SIZE ||
-                tbl_len > INTEL_TXT_GUEST_32BIT_LIMIT - tbl) {
+                tbl_len > INTEL_TXT_GUEST_32BIT_LIMIT - tbl ||
+                tbl_len > INTEL_TXT_MAX_ACPI_TABLE ||
+                !intel_txt_acpi_csum_ok(tbl, tbl_len)) {
+                trace_txt_dmar_rejected(tbl, tbl_len);
                 return false;
             }
+            trace_txt_dmar_found(tbl, tbl_len);
             *addr = tbl;
             *len = tbl_len;
             return true;

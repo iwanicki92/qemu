@@ -478,8 +478,16 @@ d. Extend the first PCR17 component at **TIS locality 4** through
 e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
    E820_RAM entries, and append a copy of the guest's DMAR ACPI
    table after the MDRs, setting ``num_vtd_dmars``/``vtd_dmars_off``.
-   The DMAR is located by scanning 0xE0000-0xFFFFF for the ACPI RSDP
-   and walking its RSDT/XSDT.  This copy is not optional for a VT-d
+   The DMAR is located the way firmware and SINIT do: scan the first
+   KiB of the EBDA (segment at 0x40E) and then 0xE0000-0xFFFFF for a
+   checksum-valid ACPI RSDP, then walk its RSDT or XSDT.  The RSDP
+   (both the 20-byte and, for revision 2+, the extended checksum),
+   the RSDT/XSDT and the DMAR are all checksum-validated before
+   anything is copied, so a stray ``RSD PTR `` string cannot be
+   mistaken for a real one.  A DMAR that fails validation is reported
+   as *absent* rather than copied -- handing the MLE garbage would be
+   worse than handing it nothing -- and the rejection is visible via
+   the ``txt_dmar_rejected`` trace point.  This copy is not optional for a VT-d
    guest: Linux under tboot deliberately ignores the firmware DMAR,
    because the ACPI tables are not DMA protected, and reads the
    measured copy out of the TXT heap instead
@@ -491,6 +499,13 @@ e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
 f. ``TXT.MLE_JOIN`` is written by the MLE; the single-vCPU
    GETSEC[WAKEUP] is a no-op. AP wakeup remains unimplemented.
 g. VT-d PMR-equivalent protection on the MLE range remains deferred.
+   The MLE supplies ``vtd_pmr_lo_base``/``size`` and the ``hi``
+   pair in os_sinit_data (tboot's ``set_vtd_pmrs()``), and real SINIT
+   both validates them and programs the VT-d Protected Memory
+   Registers so the range is genuinely DMA protected.  QEMU reads
+   neither and programs nothing.  The practical consequence is that
+   the DMAR copy in step e, which Linux trusts *because* the TXT heap
+   is supposed to be DMA protected, is not actually protected here.
 h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).

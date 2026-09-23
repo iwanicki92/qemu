@@ -1399,6 +1399,40 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         fail_msg("MLE entry SINIT-MLE MDR is missing", 16384);
     }
 
+    /*
+     * The machine runs with -device intel-iommu, so the guest has a
+     * DMAR ACPI table and SENTER must have copied it in right after
+     * the MDRs.  Linux under tboot reads VT-d configuration only from
+     * here (arch/x86/kernel/tboot.c, tboot_get_dmar_table()), so a
+     * missing or malformed copy is a launch bug, not a cosmetic one.
+     */
+    {
+        uint32_t ndmar = guest_le(section + 8 + 0x88, 4);
+        uint32_t dmar_off = guest_le(section + 8 + 0x8c, 4);
+        uint32_t dmar_len, i;
+        uint8_t sum = 0;
+
+        if (ndmar != 1 || dmar_off != off + count * 0x18) {
+            ml_printf("smx: num_vtd_dmars=%u vtd_dmars_off=0x%x "
+                      "(expected 1 and 0x%x)\n", ndmar, dmar_off,
+                      off + count * 0x18);
+            fail_msg("SINIT-MLE DMAR is missing or misplaced", 16384);
+        }
+        dmar_len = guest_le(section + dmar_off + 4, 4);
+        if (section[dmar_off] != 'D' || section[dmar_off + 1] != 'M' ||
+            section[dmar_off + 2] != 'A' || section[dmar_off + 3] != 'R' ||
+            dmar_len < 36 || guest_le(section, 8) < dmar_off + dmar_len) {
+            fail_msg("SINIT-MLE DMAR copy is not a sane DMAR table", 16384);
+        }
+        /* A correctly copied ACPI table still checksums to zero. */
+        for (i = 0; i < dmar_len; i++) {
+            sum += section[dmar_off + i];
+        }
+        if (sum != 0) {
+            fail_msg("SINIT-MLE DMAR copy fails its ACPI checksum", 16384);
+        }
+    }
+
     /* Post-launch SMCTRL and single-vCPU WAKEUP must not #UD. */
     asm volatile(".byte 0x0f, 0x37" : : "a"(7), "b"(0) : "memory");
     asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");

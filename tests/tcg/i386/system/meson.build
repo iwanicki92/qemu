@@ -55,8 +55,12 @@ if 'qemu-system-i386' in emulators
     'test-smx-getsec.c': {
       'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
                           '-fno-stack-protector', '-msse'],
+      # intel-iommu makes the machine publish a DMAR ACPI table, which
+      # SENTER must copy into sinit_mle_data for the MLE; the test
+      # checks that copy, so the device is load-bearing here.
       'qemu_args': ['-machine', 'q35,txt=on',
                     '-cpu', 'qemu32,smx,sse',
+                    '-device', 'intel-iommu',
                     '-chardev',
                     'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
                     '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',

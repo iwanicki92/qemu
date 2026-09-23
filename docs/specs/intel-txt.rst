@@ -476,8 +476,18 @@ d. Extend the first PCR17 component at **TIS locality 4** through
    the TPM backend. The remaining launch-policy/context digests
    (including PCR19) are not yet implemented.
 e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
-   E820_RAM entries. The other hash/policy fields and DMAR count
-   currently remain zero.
+   E820_RAM entries, and append a copy of the guest's DMAR ACPI
+   table after the MDRs, setting ``num_vtd_dmars``/``vtd_dmars_off``.
+   The DMAR is located by scanning 0xE0000-0xFFFFF for the ACPI RSDP
+   and walking its RSDT/XSDT.  This copy is not optional for a VT-d
+   guest: Linux under tboot deliberately ignores the firmware DMAR,
+   because the ACPI tables are not DMA protected, and reads the
+   measured copy out of the TXT heap instead
+   (``arch/x86/kernel/tboot.c``, ``tboot_get_dmar_table()``, which
+   computes ``sinit_mle_data + vtd_dmars_off - sizeof(u64)``).
+   Without it such a guest panics with "tboot: Failed to initialize
+   DMAR table".  A guest with no intel-iommu has no DMAR and the
+   fields stay zero.  The remaining hash/policy fields remain zero.
 f. ``TXT.MLE_JOIN`` is written by the MLE; the single-vCPU
    GETSEC[WAKEUP] is a no-op. AP wakeup remains unimplemented.
 g. VT-d PMR-equivalent protection on the MLE range remains deferred.

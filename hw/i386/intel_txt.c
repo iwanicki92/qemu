@@ -533,6 +533,9 @@ enum {
 #define SINIT_MLE_VERSION               6
 
 /* sinit_mdr_t: u64 base, u64 length, u8 mem_type, 7 reserved bytes */
+/* ACPI 6.x "Description Header", common to RSDT/XSDT/DMAR. */
+#define ACPI_TABLE_HEADER_SIZE          36
+
 #define SINIT_MDR_SIZE                  0x18
 #define SINIT_MDR_OFF_BASE              0x00  /* u64 */
 #define SINIT_MDR_OFF_LENGTH            0x08  /* u64 */
@@ -1089,12 +1092,16 @@ out:
  * which is exactly what tboot's gap walk requires.
  *
  */
+static bool intel_txt_find_dmar(uint64_t *addr, uint32_t *len);
+
 static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
 {
     uint64_t bios_sz, os_mle_sz, os_sinit_sz;
     uint64_t heap_end, region, region_size;
-    uint64_t mdr_off, mdr_end;
-    bool new_section;
+    uint64_t mdr_off, mdr_end, total_end;
+    uint64_t dmar_addr = 0;
+    uint32_t dmar_len = 0, dmar_off = 0;
+    bool new_section, have_dmar;
     int nr_entries, nr_ram = 0, i;
     uint8_t *buf;
 
@@ -1176,17 +1183,40 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
         return false;
     }
 
-    /* mdr_end includes the loader's size prefix; the buffer does not. */
-    buf = g_malloc0(mdr_end - sizeof(uint64_t));
+    /*
+     * A measured copy of the DMAR follows the MDRs.  Linux under tboot
+     * reads VT-d configuration only from here, so without it an
+     * intel-iommu guest panics with "Failed to initialize DMAR table".
+     * A guest with no intel-iommu has no DMAR and needs none.
+     */
+    total_end = mdr_end;
+    have_dmar = intel_txt_find_dmar(&dmar_addr, &dmar_len);
+    if (have_dmar) {
+        dmar_off = mdr_end;
+        total_end = mdr_end + dmar_len;
+        if (total_end > region_size) {
+            error_setg(errp, "sinit_mle_data with %d MDRs and a 0x%x byte "
+                       "DMAR needs 0x%" PRIx64 " bytes, more than the "
+                       "0x%" PRIx64 " byte section",
+                       nr_ram, dmar_len, total_end, region_size);
+            return false;
+        }
+    }
+
+    /* total_end includes the loader's size prefix; the buffer does not. */
+    buf = g_malloc0(total_end - sizeof(uint64_t));
     stl_le_p(buf + SINIT_MLE_OFF_VERSION, SINIT_MLE_VERSION);
     /*
      * rlp_wakeup_addr stays zero: the emulation uses the
-     * GETSEC[WAKEUP] rendezvous, not the MONITOR mechanism.  All the
-     * TPM 1.2 hash and policy fields and the VT-d DMAR fields stay
-     * zero as well.
+     * GETSEC[WAKEUP] rendezvous, not the MONITOR mechanism.  The TPM
+     * 1.2 hash and policy fields stay zero as well.
      */
     stl_le_p(buf + SINIT_MLE_OFF_NUM_MDRS, nr_ram);
     stl_le_p(buf + SINIT_MLE_OFF_MDRS_OFF, mdr_off);
+    if (have_dmar) {
+        stl_le_p(buf + SINIT_MLE_OFF_NUM_VTD_DMARS, 1);
+        stl_le_p(buf + SINIT_MLE_OFF_VTD_DMARS_OFF, dmar_off);
+    }
 
     {
         uint64_t off = mdr_off - sizeof(uint64_t);
@@ -1204,15 +1234,22 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
         }
     }
 
+    if (have_dmar &&
+        !intel_txt_gread(dmar_addr, buf + dmar_off - sizeof(uint64_t),
+                         dmar_len, errp)) {
+        g_free(buf);
+        return false;
+    }
+
     if (!intel_txt_gwrite(region + sizeof(uint64_t), buf,
-                          mdr_end - sizeof(uint64_t), errp)) {
+                          total_end - sizeof(uint64_t), errp)) {
         g_free(buf);
         return false;
     }
     if (new_section) {
         uint8_t size_bytes[sizeof(uint64_t)];
 
-        stq_le_p(size_bytes, mdr_end);
+        stq_le_p(size_bytes, total_end);
         if (!intel_txt_gwrite(region, size_bytes, sizeof(size_bytes), errp)) {
             g_free(buf);
             return false;
@@ -1222,6 +1259,126 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
     trace_txt_sinit_mle_data((uint32_t)nr_ram, region - s->heap_base);
     g_free(buf);
     return true;
+}
+
+/*
+ * Locate the guest's DMAR ACPI table so SENTER can stash a copy in
+ * sinit_mle_data.  Real SINIT does this because the ACPI tables live in
+ * memory that is not DMA protected: Linux under tboot deliberately
+ * ignores the firmware DMAR and reads the measured copy out of the TXT
+ * heap instead (arch/x86/kernel/tboot.c, tboot_get_dmar_table()).
+ *
+ * Returns the guest address in @addr and length in @len, or false when
+ * no DMAR is present -- which is not an error: a guest without
+ * intel-iommu legitimately has none.
+ */
+static bool intel_txt_find_dmar(uint64_t *addr, uint32_t *len)
+{
+    uint64_t rsdp = 0, sdt;
+    uint8_t sig[8];
+    uint32_t sdt_len;
+    bool xsdt;
+    uint64_t scan;
+
+    /*
+     * Scan the BIOS area for "RSD PTR " on the 16 byte boundaries the
+     * ACPI spec mandates.  coreboot puts its tables high and leaves the
+     * pointer here, which is also where tboot and Linux look.
+     */
+    for (scan = 0xe0000; scan < 0x100000; scan += 16) {
+        if (!intel_txt_gread(scan, sig, sizeof(sig), NULL)) {
+            return false;
+        }
+        if (memcmp(sig, "RSD PTR ", sizeof(sig)) == 0) {
+            rsdp = scan;
+            break;
+        }
+    }
+    if (rsdp == 0) {
+        return false;
+    }
+
+    /*
+     * Revision 0 has only the 32-bit RSDT; revision 2+ adds the 64-bit
+     * XSDT, which takes precedence when non-zero.
+     */
+    {
+        uint8_t rev;
+        uint32_t rsdt_addr = 0;
+        uint64_t xsdt_addr = 0;
+
+        if (!intel_txt_gread(rsdp + 15, &rev, 1, NULL) ||
+            !intel_txt_gread_u32(rsdp + 16, &rsdt_addr, NULL)) {
+            return false;
+        }
+        if (rev >= 2 &&
+            !intel_txt_gread_u64(rsdp + 24, &xsdt_addr, NULL)) {
+            return false;
+        }
+        if (rev >= 2 && xsdt_addr != 0) {
+            sdt = xsdt_addr;
+            xsdt = true;
+        } else {
+            sdt = rsdt_addr;
+            xsdt = false;
+        }
+    }
+    if (sdt == 0 || sdt >= INTEL_TXT_GUEST_32BIT_LIMIT) {
+        return false;
+    }
+
+    if (!intel_txt_gread(sdt, sig, 4, NULL) ||
+        !intel_txt_gread_u32(sdt + 4, &sdt_len, NULL)) {
+        return false;
+    }
+    if (memcmp(sig, xsdt ? "XSDT" : "RSDT", 4) != 0 ||
+        sdt_len < ACPI_TABLE_HEADER_SIZE ||
+        sdt_len > INTEL_TXT_GUEST_32BIT_LIMIT - sdt) {
+        return false;
+    }
+
+    {
+        uint32_t entry_size = xsdt ? 8 : 4;
+        uint32_t i, nr = (sdt_len - ACPI_TABLE_HEADER_SIZE) / entry_size;
+
+        for (i = 0; i < nr; i++) {
+            uint64_t off = sdt + ACPI_TABLE_HEADER_SIZE +
+                           (uint64_t)i * entry_size;
+            uint64_t tbl = 0;
+            uint32_t tbl_len;
+
+            if (xsdt) {
+                if (!intel_txt_gread_u64(off, &tbl, NULL)) {
+                    return false;
+                }
+            } else {
+                uint32_t tbl32 = 0;
+
+                if (!intel_txt_gread_u32(off, &tbl32, NULL)) {
+                    return false;
+                }
+                tbl = tbl32;
+            }
+            if (tbl == 0 || tbl >= INTEL_TXT_GUEST_32BIT_LIMIT) {
+                continue;
+            }
+            if (!intel_txt_gread(tbl, sig, 4, NULL) ||
+                !intel_txt_gread_u32(tbl + 4, &tbl_len, NULL)) {
+                return false;
+            }
+            if (memcmp(sig, "DMAR", 4) != 0) {
+                continue;
+            }
+            if (tbl_len < ACPI_TABLE_HEADER_SIZE ||
+                tbl_len > INTEL_TXT_GUEST_32BIT_LIMIT - tbl) {
+                return false;
+            }
+            *addr = tbl;
+            *len = tbl_len;
+            return true;
+        }
+    }
+    return false;
 }
 
 /*

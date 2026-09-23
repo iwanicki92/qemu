@@ -314,17 +314,66 @@ initramfs, which cannot find a root filesystem here. That panic is a
 harness-payload gap, not a TXT failure -- but it does mean **there is still
 no validated Linux-side measured boot**.
 
-### PCR verification status
+### PCR verification: established (2026-09-23)
 
-Not yet established. PCRs 17-22 are volatile TPM state and were not
-recoverable from the finished runs: swtpm only persists them via its
-control channel, and the runs killed it. `run-baseline.py` now shuts swtpm
-down through `swtpm_ioctl` and `read-pcrs.py` reloads the saved state, but
-swtpm did not produce a `tpm2-00.volatilestate` in practice, so this path
-is **currently non-working** and must not be cited as evidence. The
-intended primary evidence is instead an in-guest read of
-`/sys/class/tpm/tpm0/pcr-sha1|sha256/<17..22>` from a purpose-built
-initramfs, which reports the values as the OS observes them after launch.
+Measured launch is now observed **from inside the booted OS**.
+
+A purpose-built payload replaced the host kernel/initramfs the ISO had been
+carrying: Linux **6.12.111** x86_64 with `CONFIG_INTEL_TXT=y`,
+`CONFIG_TCG_TPM=y`, `CONFIG_TCG_TIS=y`, plus a ~13 KB `-nostdlib` static
+`/init` that mounts `/proc`, `/sys`, `/dev`, dumps the DRTM PCRs and powers
+off. (`/init` must avoid AVX: this host's GCC targets `x86-64-v3`, which
+`SIGILL`s on the `Nehalem` model the harness uses.) Artifacts and a
+`README.md` with every URL/SHA256 live in
+`/home/michal/qemu-txt-work/linux-txt/`.
+
+The kernel confirms the launch independently:
+`tboot: found shared page at phys addr 0x843000`. In-guest sysfs reports:
+
+- PCR 17 sha1 `24A461E9F450FEC827BDECA80EADF8C073DFABED`,
+  sha256 `6FA805A6...F7C14344`
+- PCR 18 sha1 `E537EEC63168D8CB48AD7AC95B4E39BAD4991B6A`,
+  sha256 `190DF146...BB020170`
+- PCR 19-22 all zero
+
+That shape is itself evidence of a DRTM: 17-22 read all-ones before any
+launch, `_TPM_Hash_Start` resets them to zero, and only 17 and 18 are then
+extended -- which is exactly what this implementation extends.
+
+Two checks establish the values are real rather than constant:
+
+- **Deterministic**: two independent runs of identical inputs produced
+  byte-identical PCR 17/18 in both banks
+  (`run-20260923-103351/`, `run-20260923-103451/`).
+- **Sensitive, and bound to the right input**: flipping a single byte at
+  offset 8000 inside the SINIT ACM changed **PCR 17** (sha1
+  `0DA6F132...`, sha256 `D32634A6...`) while leaving **PCR 18** bit-identical
+  (`run-20260923-103550/`). PCR 17 covers the SINIT ACM and PCR 18 covers
+  the MLE, so only PCR 17 should move when the ACM changes. It did.
+
+A full digest replay against tboot's TCG event log has **not** been done;
+the above is behavioural evidence, not an independent recomputation.
+
+The post-hoc swtpm route (`read-pcrs.py`) remains **non-working** -- swtpm
+did not emit `tpm2-00.volatilestate` even after `swtpm_ioctl -v`/`-s` -- and
+must not be cited. The in-guest read supersedes it.
+
+### VT-d / DMAR (2026-09-23)
+
+The first run of the TXT-enabled kernel panicked with `tboot: Failed to
+initialize DMAR table`. Linux under tboot deliberately ignores the firmware
+DMAR (the ACPI tables are not DMA protected) and instead reads the measured
+copy SINIT stashes in the TXT heap, at
+`sinit_mle_data + vtd_dmars_off - sizeof(u64)`
+(`arch/x86/kernel/tboot.c`, `tboot_get_dmar_table()`). QEMU was writing
+`num_vtd_dmars = 0`, so the kernel got NULL and died.
+
+SENTER now locates the guest DMAR (RSDP scan of 0xE0000-0xFFFFF, then
+RSDT/XSDT walk) and appends a copy after the MDRs. tboot now reports
+`num_vtd_dmars: 1`, `vtd_dmars_off: 0xb0`, and the kernel brings VT-d up:
+`DMAR: Forcing Intel-IOMMU to enabled`, `DMAR: dmar0: reg_base_addr
+fed90000`, `DMAR: Intel(R) Virtualization Technology for Directed I/O`.
+Guests without intel-iommu have no DMAR and the fields stay zero.
 
 ### Virtual-wire ExtINT: why `-apic` was needed, and the fix (2026-09-23)
 

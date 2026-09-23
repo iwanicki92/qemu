@@ -667,8 +667,11 @@ Implemented (``intel_txt_sexit()``).
 - Clears secrets (QEMU: clears ``E2STS.SECRET_STS``), closes private
   space, clears ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK`` and the
   locality-open bits, and sets ``STS.SEXIT_DONE``.
-- DPR and PMR enforcement release is a no-op here, because neither is
-  enforced in the first place (deviation 3).
+- Disables the VT-d PMRs so device DMA into the former PMR windows is
+  permitted again. DPR stays programmed and locked; DPR DMA exclusion
+  is not yet implemented (deviation 3).
+- Releases SMI inhibition and redelivers held SMIs if SMCTRL did not
+  already release them.
 
 An MLE normally arrives at SEXIT having already issued
 ``CMD_NO_SECRETS``, ``CMD_UNLOCK_MEM_CONFIG`` and

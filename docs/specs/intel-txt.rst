@@ -552,7 +552,17 @@ backend that does not implement it.
 
 PCR 17 remains only the first component of the eventual composite;
 launch-context digests are not yet extended, so it is not final or
-attestable. PCR 18 receives the measured MLE hash. Invalid ACM inputs
+attestable. PCR 18 receives the measured MLE hash.
+
+Neither input digest is observable from the guest: the ACM digest is
+computed inside the TPM by the ``_TPM_Hash_*`` sequence and never
+returned, and the MLE digest is consumed directly by the extend.  The
+``txt_drtm_digest`` trace point reports both, which makes a PCR value
+reproducible offline -- replaying ``Extend()`` from zero over these
+plus the MLE's own TCG event log must yield exactly what the guest
+reads back from ``/sys/class/tpm/tpm0/pcr-sha1|sha256/<N>``.  That is
+an internal-consistency check, not attestation: the fixture is
+unsigned and no signature is verified (deviation 1). Invalid ACM inputs
 and unsupported SMP are rejected before TPM commands; malformed MLE
 or missing SINIT-MLE heap data may be rejected after DRTM measurement,
 with STS.SENTER_DONE clear. A successful single-vCPU launch clears

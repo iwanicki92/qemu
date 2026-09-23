@@ -812,6 +812,36 @@ static int intel_txt_drtm_hash_measure(IntelTxtState *s, const uint8_t *data,
     return 0;
 }
 
+/*
+ * Trace the digests that go into the DRTM PCRs.  They are otherwise
+ * unobservable: the ACM digest is computed inside the TPM by the
+ * _TPM_Hash_* sequence and never returned, and the MLE digest is
+ * consumed directly by the extend.  Exposing both makes a PCR value
+ * reproducible offline -- replay Extend() from zero over these and
+ * the MLE's own event log and the result must equal what the guest
+ * reads back from sysfs.
+ */
+static void intel_txt_trace_digest(const char *what,
+                                   const uint8_t *sha1, size_t sha1_len,
+                                   const uint8_t *sha256, size_t sha256_len)
+{
+    g_autofree char *h1 = NULL;
+    g_autofree char *h256 = NULL;
+
+    if (!trace_event_get_state_backends(TRACE_TXT_DRTM_DIGEST)) {
+        return;
+    }
+    h1 = g_malloc0(sha1_len * 2 + 1);
+    h256 = g_malloc0(sha256_len * 2 + 1);
+    for (size_t i = 0; i < sha1_len; i++) {
+        sprintf(h1 + i * 2, "%02x", sha1[i]);
+    }
+    for (size_t i = 0; i < sha256_len; i++) {
+        sprintf(h256 + i * 2, "%02x", sha256[i]);
+    }
+    trace_txt_drtm_digest(what, h1, h256);
+}
+
 /* Read @len bytes of guest memory, reporting the failing address. */
 static bool intel_txt_gread(uint64_t addr, void *buf, size_t len, Error **errp)
 {
@@ -1062,6 +1092,7 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
     };
 
     trace_txt_measure_mle(ptab, mle_size, hdr_base);
+    intel_txt_trace_digest("MLE", sha1, sha1_len, sha256, sha256_len);
     ret = intel_txt_drtm_extend_pcr(s, INTEL_TXT_DRTM_PCR_MLE, digests, 2,
                                    errp);
     if (ret == 0) {
@@ -1794,6 +1825,24 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     ret = intel_txt_drtm_hash_measure(s, acm, acm_size, &err);
     if (ret < 0) {
         goto fail_measure;
+    }
+    /*
+     * The TPM computed that digest internally and does not return it,
+     * so recompute it host-side purely for the trace.  A mismatch
+     * against a PCR replay would mean the backend hashed something
+     * other than what was handed to it.
+     */
+    if (trace_event_get_state_backends(TRACE_TXT_DRTM_DIGEST)) {
+        g_autofree uint8_t *a1 = NULL;
+        g_autofree uint8_t *a256 = NULL;
+        size_t a1_len = 0, a256_len = 0;
+
+        if (qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA1, (char *)acm,
+                               acm_size, &a1, &a1_len, NULL) == 0 &&
+            qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256, (char *)acm,
+                               acm_size, &a256, &a256_len, NULL) == 0) {
+            intel_txt_trace_digest("ACM", a1, a1_len, a256, a256_len);
+        }
     }
 
     /*

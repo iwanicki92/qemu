@@ -351,8 +351,42 @@ Two checks establish the values are real rather than constant:
   (`run-20260923-103550/`). PCR 17 covers the SINIT ACM and PCR 18 covers
   the MLE, so only PCR 17 should move when the ACM changes. It did.
 
-A full digest replay against tboot's TCG event log has **not** been done;
-the above is behavioural evidence, not an independent recomputation.
+**Update: the digest replay has now been done and passes.** The evidence
+below is no longer merely behavioural.
+
+`verify-pcrs.py <run-dir>` recomputes all four values from first
+principles and compares against what the guest read from sysfs:
+
+```
+PCR17 sha1   replayed=24a461e9... observed=24a461e9... events=3 MATCH
+PCR18 sha1   replayed=e537eec6... observed=e537eec6... events=1 MATCH
+PCR17 sha256 replayed=6fa805a6... observed=6fa805a6... events=0 MATCH
+PCR18 sha256 replayed=190df146... observed=190df146... events=0 MATCH
+
+4/4 PCR values independently recomputed and matched
+```
+
+The replay starts from `Extend(0, <QEMU digest>)` -- the SINIT ACM digest
+for PCR 17, the MLE digest for PCR 18 -- and then applies tboot's own TCG
+event-log entries in order. Neither QEMU digest is observable from the
+guest, so they are taken from the new `txt_drtm_digest` trace point, which
+`run-baseline.py` now enables by default (`TXT_TRACE=0` disables).
+
+The `events=0` on the SHA-256 rows is a real finding, not a gap: tboot's
+event log here carries SHA-1 digests only (`count: 1`, `SHA1:`), so the
+SHA-256 bank holds QEMU's contribution alone. Both banks reproduce exactly
+under that model.
+
+Verified non-vacuous by mutation: corrupting QEMU's traced MLE digest makes
+PCR 18 mismatch, and corrupting a tboot event digest makes PCR 17 mismatch;
+both exit non-zero. Note the event digests appear three times each in the
+serial log (tboot also prints current PCR contents), so a single-occurrence
+edit is not sufficient to test this.
+
+What this does **not** establish: these values are still not attestable.
+The SINIT fixture is unsigned, QEMU verifies no signature, and PCR 17 is
+still only the first component of the real composite. The replay proves
+internal consistency of the chain, not equivalence to real hardware.
 
 The post-hoc swtpm route (`read-pcrs.py`) remains **non-working** -- swtpm
 did not emit `tpm2-00.volatilestate` even after `swtpm_ioctl -v`/`-s` -- and

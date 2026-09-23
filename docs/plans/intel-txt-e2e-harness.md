@@ -358,13 +358,24 @@ below is no longer merely behavioural.
 principles and compares against what the guest read from sysfs:
 
 ```
-PCR17 sha1   replayed=24a461e9... observed=24a461e9... events=3 MATCH
+PCR17 sha1   replayed=81c4749e... observed=81c4749e... events=3 MATCH
 PCR18 sha1   replayed=e537eec6... observed=e537eec6... events=1 MATCH
 PCR17 sha256 replayed=6fa805a6... observed=6fa805a6... events=0 MATCH
 PCR18 sha256 replayed=190df146... observed=190df146... events=0 MATCH
 
 4/4 PCR values independently recomputed and matched
 ```
+
+PCR 17 sha1 was `24a461e9...` before the initramfs was rebuilt (see the
+`/init` fix below) and is `81c4749e...` after. That change is **correct**,
+not drift: tboot's default policy is `EXTEND_PCR17`, which extends every
+loaded module -- including the initramfs -- into PCR 17
+(`tboot/common/policy.c`). PCR 18 measures the MLE (tboot itself) and is
+bit-identical across the change, and PCR 17 *sha256* is also identical,
+because tboot extends only the SHA-1 bank and the SINIT ACM did not
+change. The verifier tracked the new value automatically from the new
+event log, which is good evidence it genuinely recomputes rather than
+recognising a known constant.
 
 The replay starts from `Extend(0, <QEMU digest>)` -- the SINIT ACM digest
 for PCR 17, the MLE digest for PCR 18 -- and then applies tboot's own TCG
@@ -388,9 +399,35 @@ The SINIT fixture is unsigned, QEMU verifies no signature, and PCR 17 is
 still only the first component of the real composite. The replay proves
 internal consistency of the chain, not equivalence to real hardware.
 
-The post-hoc swtpm route (`read-pcrs.py`) remains **non-working** -- swtpm
-did not emit `tpm2-00.volatilestate` even after `swtpm_ioctl -v`/`-s` -- and
-must not be cited. The in-guest read supersedes it.
+The post-hoc swtpm route has been **removed**. `read-pcrs.py` never
+worked -- swtpm did not emit `tpm2-00.volatilestate` even after
+`swtpm_ioctl -v`/`-s`, so PCRs 17-22 are simply not recoverable from a
+finished run -- and leaving it in place was a trap, since it looked like a
+verification path. `run-baseline.py` still shuts swtpm down through its
+control channel rather than killing it, but only as hygiene; the docstring
+no longer claims that preserves anything. The in-guest read plus
+`verify-pcrs.py` supersede it entirely.
+
+### `/init` label corruption (2026-09-23)
+
+The payload's PCR lines were emitted as `PCR sha1\x0017 <hex>` and
+`PCR sha256217 <hex>` -- a NUL where the separator belonged in one case and
+a stray digit in the other. The cause was not `\r` as first assumed.
+`dump_pcr()` composed the label in a local buffer while the caller held its
+own path buffer; the same function compiled in isolation is correct at both
+`-O0` and `-O2`, so the two buffers appear to overlap once it is inlined
+into `dump_pcrs()`. Rather than chase that in a debug payload, the label is
+now emitted as a sequence of NUL-terminated `w()` writes with no shared
+length bookkeeping, which cannot exhibit it. The link was also relying on
+the linker happening to place `main` first (`cannot find entry symbol
+_start`); it now passes `-Wl,-e,main` explicitly.
+
+This mattered beyond cosmetics: the malformed labels silently defeated a
+naive parse of the PCR lines and produced a misleading "2/2 matched" before
+being noticed. `verify-pcrs.py` therefore anchors on the digest -- exactly
+40 or 64 hex characters -- and reads the two decimal digits immediately
+before it as the index, which parses both the old and new spellings; both
+are covered by regression runs.
 
 ### VT-d / DMAR (2026-09-23)
 

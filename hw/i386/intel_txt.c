@@ -1094,6 +1094,7 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
     uint64_t bios_sz, os_mle_sz, os_sinit_sz;
     uint64_t heap_end, region, region_size;
     uint64_t mdr_off, mdr_end;
+    bool new_section;
     int nr_entries, nr_ram = 0, i;
     uint8_t *buf;
 
@@ -1117,9 +1118,9 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
     }
 
     /*
-     * The sinit_mle_data section starts after the first three.  Its
-     * size prefix is set by the loader, and the whole section, prefix
-     * included, must fit in the heap.
+     * The sinit_mle_data section starts after the first three. A real
+     * loader leaves its size prefix zero: SINIT writes it on launch.
+     * Also accept a preallocated nonzero section for diagnostic guests.
      */
     heap_end = s->heap_base + s->heap_size;
     region = s->heap_base + bios_sz + os_mle_sz + os_sinit_sz;
@@ -1130,7 +1131,9 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
     if (!intel_txt_gread_u64(region, &region_size, errp)) {
         return false;
     }
-    if (region_size < sizeof(uint64_t) || region_size > heap_end - region) {
+    new_section = region_size == 0;
+    if (!new_section && (region_size < sizeof(uint64_t) ||
+                         region_size > heap_end - region)) {
         error_setg(errp, "sinit_mle_data section of 0x%" PRIx64
                    " bytes at heap offset 0x%" PRIx64 " does not fit "
                    "in the 0x%" PRIx64 " byte heap",
@@ -1163,6 +1166,9 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
      */
     mdr_off = sizeof(uint64_t) + SINIT_MLE_FIXED_SIZE;
     mdr_end = mdr_off + (uint64_t)nr_ram * SINIT_MDR_SIZE;
+    if (new_section) {
+        region_size = heap_end - region;
+    }
     if (mdr_end > region_size) {
         error_setg(errp, "sinit_mle_data with %d MDRs needs 0x%" PRIx64
                    " bytes, more than the 0x%" PRIx64 " byte section",
@@ -1202,6 +1208,15 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
                           mdr_end - sizeof(uint64_t), errp)) {
         g_free(buf);
         return false;
+    }
+    if (new_section) {
+        uint8_t size_bytes[sizeof(uint64_t)];
+
+        stq_le_p(size_bytes, mdr_end);
+        if (!intel_txt_gwrite(region, size_bytes, sizeof(size_bytes), errp)) {
+            g_free(buf);
+            return false;
+        }
     }
 
     trace_txt_sinit_mle_data((uint32_t)nr_ram, region - s->heap_base);
@@ -1255,7 +1270,7 @@ static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
     hdr_size = ldl_le_p(acm + ACM_HDR_OFF_SIZE);
     if ((uint64_t)hdr_size * 4 != size) {
         error_setg(errp, "SINIT ACM header size %u dwords (0x%" PRIx64
-                   " bytes) does not match TXT.SINIT_SIZE 0x%" PRIx64,
+                   " bytes) does not match GETSEC[SENTER] ECX 0x%" PRIx64,
                    hdr_size, (uint64_t)hdr_size * 4, size);
         return -1;
     }
@@ -1415,7 +1430,8 @@ static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
     return 0;
 }
 
-bool intel_txt_senter(IntelTxtState *s, IntelTxtMleEntry *entry)
+bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
+                      uint32_t acm_size, IntelTxtMleEntry *entry)
 {
     uint64_t dpr_size, dpr_top, cs_addr, ds_addr;
     uint32_t cs_flags, ds_flags;
@@ -1441,14 +1457,16 @@ bool intel_txt_senter(IntelTxtState *s, IntelTxtMleEntry *entry)
     }
 
     /*
-     * Precondition 2: TXT.SINIT_BASE/SIZE.  Non-zero, the region
-     * entirely below 4 GiB (which also bounds the read below), and
-     * not larger than the max ACM size GETSEC[PARAMETERS] reports.
+     * Precondition 2: EBX/ECX name the actual ACM, while firmware's
+     * TXT.SINIT_BASE/SIZE describe a potentially larger reserved slot.
+     * Limit the measured ACM (not the slot) to the GETSEC[PARAMETERS]
+     * execution-area maximum, and bound it inside the reserved slot.
      */
     if (s->sinit_base == 0 || s->sinit_size == 0 ||
         s->sinit_base >= INTEL_TXT_GUEST_32BIT_LIMIT ||
         s->sinit_size > INTEL_TXT_GUEST_32BIT_LIMIT - s->sinit_base ||
-        s->sinit_size > INTEL_TXT_MAX_ACM_SIZE) {
+        acm_base != s->sinit_base || acm_size == 0 ||
+        acm_size > s->sinit_size || acm_size > INTEL_TXT_MAX_ACM_SIZE) {
         goto fail_sinit_region;
     }
 
@@ -1474,15 +1492,15 @@ bool intel_txt_senter(IntelTxtState *s, IntelTxtMleEntry *entry)
      * disagree about the bytes even if the guest rewrites the region
      * in between.
      */
-    acm = g_malloc(s->sinit_size);
-    if (address_space_read(&address_space_memory, s->sinit_base,
+    acm = g_malloc(acm_size);
+    if (address_space_read(&address_space_memory, acm_base,
                            MEMTXATTRS_UNSPECIFIED, acm,
-                           s->sinit_size) != MEMTX_OK) {
+                           acm_size) != MEMTX_OK) {
         error_setg(&err, "cannot read the SINIT ACM region at 0x%" PRIx64,
                    s->sinit_base);
         goto fail_measure;
     }
-    if (intel_txt_validate_acm(s, acm, s->sinit_size, &err) < 0) {
+    if (intel_txt_validate_acm(s, acm, acm_size, &err) < 0) {
         goto fail_acm;
     }
     entry->gdt_base = ldl_le_p(acm + ACM_HDR_OFF_GDT_BASE);
@@ -1544,7 +1562,7 @@ bool intel_txt_senter(IntelTxtState *s, IntelTxtMleEntry *entry)
      * launch-context digests are not yet extended, so PCR 17 is not
      * final or attestable.  PCR 18 receives the MLE hash below.
      */
-    ret = intel_txt_drtm_hash_measure(s, acm, s->sinit_size, &err);
+    ret = intel_txt_drtm_hash_measure(s, acm, acm_size, &err);
     if (ret < 0) {
         goto fail_measure;
     }
@@ -1604,6 +1622,32 @@ fail_measure:
     s->errorcode = TXT_ERRORCODE_MEASURE_FAILED;
     trace_txt_senter_errorcode(s->errorcode);
     return false;
+}
+
+bool intel_txt_smctrl(IntelTxtState *s, uint32_t control)
+{
+    /*
+     * GETSEC[SMCTRL] with EBX=0 releases SMI inhibition after SINIT
+     * exits. QEMU does not yet inhibit SMIs during SENTER; accept only
+     * the post-launch request rather than claiming full SMI isolation.
+     */
+    return control == 0 && (s->sts & TXT_STS_SENTER_DONE);
+}
+
+bool intel_txt_wakeup(IntelTxtState *s)
+{
+    CPUState *cpu;
+
+    if (!(s->sts & TXT_STS_SENTER_DONE)) {
+        return false;
+    }
+    CPU_FOREACH(cpu) {
+        if (cpu != current_cpu) {
+            /* An AP must never be advertised as woken without parking. */
+            return false;
+        }
+    }
+    return true;
 }
 
 #endif /* CONFIG_TPM */

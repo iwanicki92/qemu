@@ -2,8 +2,8 @@
  * QEMU Intel TXT (Trusted Execution Technology)
  *
  * GETSEC (SMX) instruction emulation: static leaves and single-vCPU
- * semantic SENTER (see hw/i386/intel_txt.c). SEXIT/WAKEUP/SMCTRL/
- * ENTERACCS/EXITAC remain unimplemented.
+ * semantic SENTER (see hw/i386/intel_txt.c). Single-vCPU WAKEUP and
+ * post-launch SMCTRL are accepted; SEXIT/ENTERACCS/EXITAC are deferred.
  *
  * Copyright (c) 2026 Michał Kopeć <michal@nozomi.space>
  *
@@ -28,6 +28,8 @@
 #define GETSEC_LEAF_CAPABILITIES    0
 #define GETSEC_LEAF_SENTER          4
 #define GETSEC_LEAF_PARAMETERS      6
+#define GETSEC_LEAF_SMCTRL         7
+#define GETSEC_LEAF_WAKEUP         8
 
 /*
  * GETSEC[CAPABILITIES] leaf bitmap.  Bit 0 is raised only when the
@@ -44,10 +46,12 @@
  * entry value in the remaining EAX bits; EBX/ECX carry the value(s)
  * as well.  The table is terminated by an entry of type 0.
  *
- * The encodings match what TrenchBoot GRUB (grub-sl-2.12-v16,
- * include/grub/i386/txt.h) decodes:
- *  - GRUB_SMX_GET_MAX_ACM_SIZE() multiplies the value by 0x20, so the
- *    max ACM size is reported in 32-byte units (32 KiB -> 0x400);
+ * The parameter values occupy EAX bits [31:5] (the low five bits
+ * encode the type). The ACM maximum is a 32-byte-granularity field
+ * at that bit position; masking EAX with ~0x1f gives its byte count.
+ * Tboot's get_parameters() uses that mask, so 32 KiB is 0x8000, not
+ * 0x400. An older TrenchBoot GRUB macro erroneously multiplies the
+ * masked value by another 0x20; do not replicate that overestimate.
  *  - GRUB_SMX_GET_ACM_MEMORY_TYPES() keeps the high bits (UC -> 0x100);
  *  - GRUB_SMX_GET_SENTER_CONTROLS() extracts bits [15:8];
  *  - GRUB_SMX_GET_TXT_EXT_FEATURES() keeps bits [6:5]
@@ -55,8 +59,8 @@
  */
 #define GETSEC_PARAM_ACM_MEMORY_TYPE_UC       0x100
 #define GETSEC_PARAM_TXT_EXT_PROCESSOR_SCRTM  BIT(5)
-/* 32 KiB max ACM size, in 32-byte units. */
-#define GETSEC_PARAM_MAX_ACM_SIZE             (0x8000 / 0x20)
+/* 32 KiB maximum ACM execution area, in bytes (EAX bits [31:5]). */
+#define GETSEC_PARAM_MAX_ACM_SIZE             0x8000
 
 #if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TPM)
 static void getsec_load_mle_seg(CPUX86State *env, int reg, uint32_t selector,
@@ -116,7 +120,7 @@ void helper_getsec(CPUX86State *env)
             ebx = 0xffffffff;
             break;
         case 1:
-            type = 2;  /* max ACM size, 32-byte units */
+            type = 2;  /* max ACM execution area, bytes */
             eax_value = ebx = GETSEC_PARAM_MAX_ACM_SIZE;
             break;
         case 2:
@@ -159,13 +163,16 @@ void helper_getsec(CPUX86State *env)
             IntelTxtMleEntry entry;
 
             trace_getsec_senter();
-            if (!intel_txt_senter(env_archcpu(env)->txt_state, &entry)) {
+            if (!intel_txt_senter(env_archcpu(env)->txt_state,
+                                  (uint32_t)env->regs[R_EBX],
+                                  (uint32_t)env->regs[R_ECX], &entry)) {
                 break;
             }
             /*
-             * The entry is a physical address, with an identity mapping
-             * supplied by the loader in its PAE page tables.  Install the
-             * new execution state before leaving the translated GETSEC TB.
+             * SINIT enters the MLE with paging off at the physical
+             * address resolved from the measured MLE mapping. Tboot's
+             * first instructions use absolute physical TXT MMIO and
+             * expect EBX to contain that same physical entry address.
              */
             cpu_x86_update_cr0(env, env->cr[0] & ~CR0_PG_MASK);
             cpu_x86_update_cr4(env, env->cr[4] | CR4_PAE_MASK);
@@ -187,17 +194,32 @@ void helper_getsec(CPUX86State *env)
             env->regs[R_ESP] = 0;
             cpu_load_eflags(env, 0x2, ~0u);
             env->eip = entry.entry_phys;
-            cpu_x86_update_cr0(env, env->cr[0] | CR0_PE_MASK | CR0_PG_MASK);
+            cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) &
+                                    ~CR0_PG_MASK);
             cpu_loop_exit(env_cpu(env));
         }
 #endif
         break;
+#ifdef CONFIG_TPM
+    case GETSEC_LEAF_SMCTRL:
+        if (!env_archcpu(env)->txt_state ||
+            !intel_txt_smctrl(env_archcpu(env)->txt_state,
+                              (uint32_t)env->regs[R_EBX])) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
+        break;
+    case GETSEC_LEAF_WAKEUP:
+        if (!env_archcpu(env)->txt_state ||
+            !intel_txt_wakeup(env_archcpu(env)->txt_state)) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
+        break;
+#endif
 #endif /* !CONFIG_USER_ONLY */
     default:
         /*
-         * ENTERACCS, EXITAC, SEXIT, SMCTRL and WAKEUP are not
-         * implemented yet; report the instruction as undefined so the
-         * decode path stays observable in the trace log.
+         * ENTERACCS, EXITAC and SEXIT are not implemented yet;
+         * report #UD so the missing leaf stays observable.
          */
         trace_getsec_unimpl(leaf);
         raise_exception_ra(env, EXCP06_ILLOP, GETPC());

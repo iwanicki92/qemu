@@ -196,7 +196,12 @@ typedef struct IntelTxtMleEntry {
  * and return true with the BSP entry state on success.  A rejected
  * launch records TXT.ERRORCODE and returns false without transferring.
  */
-bool intel_txt_senter(IntelTxtState *s, IntelTxtMleEntry *entry);
+bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
+                      uint32_t acm_size, IntelTxtMleEntry *entry);
+/* Post-launch SMCTRL; SMI masking is not modeled. */
+bool intel_txt_smctrl(IntelTxtState *s, uint32_t control);
+/* WAKEUP has no AP work in the supported single-vCPU launch. */
+bool intel_txt_wakeup(IntelTxtState *s);
 #endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

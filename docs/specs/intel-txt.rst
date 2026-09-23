@@ -179,7 +179,7 @@ TYPE_CODE = 1 (SINIT ACM); the reason is the PROGRESS_CODE):
   | Value       | Name                   | Meaning                                                        |
   +=============+========================+================================================================+
   | 0x80010001  | SINIT_REGION_INVALID   | TXT.SINIT_BASE/SIZE zero, region not below 4 GiB, overflowing, |
-  |             |                        | or size > max ACM size                                         |
+  |             |                        | or SENTER ACM size > reserved slot / max ACM size              |
   +-------------+------------------------+----------------------------------------------------------------+
   | 0x80020001  | SINIT_NOT_IN_DPR       | SINIT region not entirely inside the (nonzero) DPR range       |
   +-------------+------------------------+----------------------------------------------------------------+
@@ -270,32 +270,33 @@ GETSEC[PARAMETERS] (EAX=6, EBX=index)
   Returns the parameter table in EAX/EBX/ECX; terminated by entry type 0.
   (The index register is EBX per the SDM, matching tboot and GRUB; an
   earlier revision of this spec incorrectly said ECX.)
-  QEMU reports (GRUB defaults are a compatible baseline):
+  QEMU reports:
+
   - ACM version mask 0xFFFFFFFF, version 0
-  - max ACM size 32 KiB (encoded), acquirable memory UC
+  - max ACM size 32 KiB (EAX masked with ~0x1f is 0x8000 bytes),
+    acquirable memory UC
   - SENTER controls 0
   - TXT extensions: processor-based SCRTM (bit 5) supported
 
 GETSEC[SENTER] (EAX=4, EBX=SINIT ACM phys base, ECX=ACM size, EDX=0)
-  See *Semantic measured launch* below. On failure the machine
-  performs an TXT reset with ERRORCODE set (no return).
+  See *Semantic measured launch* below. QEMU currently records
+  ERRORCODE and returns on failure instead of a hardware TXT reset.
 
 GETSEC[SEXIT] (EAX=5)
-  Leaves the measured environment: platform reset (machine reset in
-  QEMU), ``STS.SEXIT_DONE`` set after reset.
+  Not implemented; the modeled teardown/reset behavior below is a
+  proposal, not a validated guest path.
 
 GETSEC[WAKEUP] (EAX=8)
-  RLP (AP) wakeup inside the measured environment: the AP resumes at
-  the entry point from the MLE_JOIN register with the documented RLP
-  register state.
+  Accepted only after SENTER on a single-vCPU machine (no AP to wake).
+  Real RLP sleep, MLE_JOIN consumption and AP wakeup are not implemented.
 
 GETSEC[EXITAC] (EAX=3, EBX=near jump target)
   Not needed for the semantic flow (no AC mode is entered); returns
   via the near jump, or #UD until Option B.
 
-GETSEC[SMCTRL] (EAX=7)
-  SMM-control; accepted as no-op in measured environment (SMM is
-  modeled as normal SMM in QEMU).
+GETSEC[SMCTRL] (EAX=7, EBX=0)
+  Accepted after SENTER; no SMI inhibition is modeled, so this only
+  satisfies the MLE's post-launch enable request.
 
 TXT heap
 ========
@@ -395,8 +396,8 @@ The bring-up target is instead **one vCPU** with tboot's default VMX
 path: tboot checks the CPUID and feature-control bits but does not run
 its AP VMX code when there are no APs. Use the explicit
 ``txt-vmx-compat=on`` setting for that capability check only. SENTER
-rejects more than one vCPU before measuring anything; AP sleep and
-GETSEC[WAKEUP] integration are still unimplemented.
+rejects more than one vCPU before measuring anything; AP sleep/wakeup
+are still unimplemented (single-vCPU WAKEUP is a post-launch no-op).
 
 Semantic measured launch (GETSEC[SENTER])
 =========================================
@@ -416,7 +417,8 @@ return without a machine reset (a QEMU semantic deviation):
 
    - sized at least the 0x4c0 fixed ACM header and a multiple of 64
      bytes; ``TXT.SINIT_BASE`` 4 KiB aligned; and the header's ``size``
-     field (in dwords) * 4 equal to ``TXT.SINIT_SIZE``.
+     field (in dwords) * 4 equal to the GETSEC[SENTER] ACM size, which
+     may be smaller than the firmware-reserved ``TXT.SINIT_SIZE``.
    - ``module_type`` = ``ACM_TYPE_CHIPSET`` (0x02),
      ``module_subtype`` = 0, and ``module_vendor`` = 0x8086. Note 0x02
      is used by *both* SINIT and BIOS ACMs — there is no
@@ -456,7 +458,8 @@ return without a machine reset (a QEMU semantic deviation):
    header's UUID matches ``MLE_HDR_UUID`` and its length fits in
    the image; ``entry_point`` is inside the image and resolves to a
    physical address below 4 GiB. The fourth size-prefixed section
-   (sinit_mle_data) must fit the heap and its GOOD memory descriptors.
+   (sinit_mle_data) is created when its prefix is zero and must fit
+   the heap together with its GOOD memory descriptors.
 
 SINIT-equivalent sequence (unimplemented portions noted):
 
@@ -475,8 +478,8 @@ d. Extend the first PCR17 component at **TIS locality 4** through
 e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
    E820_RAM entries. The other hash/policy fields and DMAR count
    currently remain zero.
-f. ``TXT.MLE_JOIN`` is written by the MLE and consumed by the later
-   GETSEC[WAKEUP] leaf; AP wakeup remains unimplemented.
+f. ``TXT.MLE_JOIN`` is written by the MLE; the single-vCPU
+   GETSEC[WAKEUP] is a no-op. AP wakeup remains unimplemented.
 g. VT-d PMR-equivalent protection on the MLE range remains deferred.
 h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
@@ -499,9 +502,9 @@ closed by the MLE or by a TXT reset.
 Current implementation: for a single vCPU, SENTER checks the launch
 inputs, measures the SINIT ACM and MLE, writes the SINIT-MLE heap section,
 sets the SENTER_DONE / MEM_CONFIG_LOCK / PRIVATE_OPEN status bits, and
-transfers BSP execution to the MLE entry with its PAE page tables.
-Multiple vCPUs are rejected *before measurement*: until GETSEC[WAKEUP]
-and AP sleep state are implemented, allowing an AP to continue running
+transfers BSP execution to the physical MLE entry with paging off.
+Multiple vCPUs are rejected *before measurement*: until AP sleep and
+real GETSEC[WAKEUP] are implemented, allowing an AP to continue running
 outside the measured environment would violate the DRTM boundary.
 The SINIT measurement uses the TIS ``_TPM_Hash_Start`` /
 ``_TPM_Hash_Data`` / ``_TPM_Hash_End`` signal sequence at locality 4.
@@ -531,15 +534,16 @@ TXT.ERRORCODE and enters the MLE instead of returning to the loader.
 
 MLE entry CPU state (BSP), per MLE Dev Guide:
 
-- 32-bit protected mode, paging enabled with the MLE page tables
-  (from ``os_sinit_data.mle_ptab``), EPT/``ecx_pgtbl`` variants
-  honored,
+- 32-bit protected mode with **CR0.PG clear**; SINIT uses the MLE
+  page tables (from ``os_sinit_data.mle_ptab``) to validate/measure
+  the image, but the first MLE instructions execute at physical
+  addresses until the MLE enables its own paging,
 - GDTR from the **SINIT ACM header** (``gdt_base`` at offset 0x2c,
   ``gdt_limit`` at 0x28), CS = the ACM header's ``seg_sel`` (0x30,
   32-bit code, RPL0), DS/ES/SS = seg_sel+8,
-- EIP = the MLE entry point, i.e. the physical address that the MLE
-  header's ``entry_point`` resolves to through the MLE page table,
-- EBX = that same physical entry address, ECX = physical address of
+- EIP = the physical address resolved from the MLE header's
+  ``entry_point`` through the MLE page tables (CS.base = 0, PG=0),
+- EBX = that physical entry address, ECX = physical address of
   the MLE page table, EDX = 0,
 - EFLAGS = 0x2, so interrupts are masked; the MLE installs its own
   IDT before enabling them.
@@ -606,8 +610,8 @@ Machine/device wiring
   holds a link to the TPM backend for locality-4 measurements.
 - MCH (q35): DPR config register + TXT-capable DIDVID reporting.
 - CPU: ``smx`` CPUID bit default-enabled on the TXT machine; GETSEC
-  decode in ``target/i386/tcg``; a CPU-state "measured environment"
-  flag gates SEXIT/WAKEUP/SMCTRL.
+  decode in ``target/i386/tcg``; chipset SENTER_DONE state gates
+  the implemented single-vCPU WAKEUP and SMCTRL requests.
 - Migration: blocked while a launch sequence is in progress
   (measured-environment flag set, SENTER not completed); VMState
   otherwise covers all registers.
@@ -632,7 +636,7 @@ Deviations from real hardware
    documented sequence).
 7. SENTER transfers a single BSP to the MLE after the partial DRTM
    measurement. Multiple vCPUs are rejected before measurement until
-   AP parking and GETSEC[WAKEUP] are implemented. The PCR 17 composite
+   AP parking and real GETSEC[WAKEUP] are implemented. The PCR 17 composite
    and VT-d enforcement remain incomplete: a successful transfer
    does not imply production-grade TXT attestation.
 8. SENTER takes the SINIT base/size from the pre-programmed

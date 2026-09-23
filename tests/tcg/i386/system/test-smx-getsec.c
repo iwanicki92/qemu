@@ -131,7 +131,7 @@
 #define TXT_ERR_ACM_INVALID          0x80060001ULL
 
 /*
- * Launch inputs for the SENTER cases: an 8 KiB SINIT ACM region at
+ * Launch inputs for SENTER: an 8 KiB ACM in a 16 KiB SINIT slot at
  * 0xE10000 and a 4 KiB heap at 0xE20000, both inside the DPR range
  * [0xE00000, 0x1000000) selected below.
  */
@@ -226,10 +226,8 @@ static uint64_t txt_read64(uint32_t off)
     uint64_t v;
 
     /*
-     * One 8-byte MMIO access: 32-bit mode has no 64-bit general-purpose
-     * registers, so the value is staged through an XMM register, which
-     * keeps the MMIO access a single aligned 8-byte read as the TXT
-     * space requires.
+     * Stage a single aligned 8-byte MMIO access through XMM in 32-bit
+     * mode. Firmware may also use separate aligned 32-bit halves.
      */
     asm volatile("movq %1, %%xmm0\n\t"
                  "movq %%xmm0, %0"
@@ -325,17 +323,22 @@ static void getsec_parameters(uint32_t index, uint32_t *eax, uint32_t *ebx,
                  : "0"(GETSEC_LEAF_PARAMETERS), "1"(index));
 }
 
-static void getsec_senter(void)
+static void getsec_senter_size(uint32_t acm_size)
 {
     /*
-     * SENTER is GETSEC[4]: opcode 0F 37 with the leaf index in EAX
-     * (0F 34 is SMI, not GETSEC).  With valid launch inputs this
-     * transfers to the MLE; rejected launches return with a defined
-     * TXT.ERRORCODE (see target/i386/tcg/smx_helper.c).
+     * SENTER is GETSEC[4]: EAX=leaf, EBX=ACM base, ECX=actual ACM
+     * size, EDX=0. Rejected launches return with TXT.ERRORCODE.
      */
     asm volatile(".byte 0x0f, 0x37"
                  :
-                 : "a"(GETSEC_LEAF_SENTER));
+                 : "a"(GETSEC_LEAF_SENTER), "b"((uint32_t)TEST_SINIT_BASE),
+                   "c"(acm_size), "d"(0)
+                 : "memory");
+}
+
+static void getsec_senter(void)
+{
+    getsec_senter_size(TEST_SINIT_SIZE);
 }
 
 static uint64_t msr_read64(uint32_t index)
@@ -1026,12 +1029,7 @@ static void setup_acm(void)
     }
 }
 
-/*
- * One §3.5 mutation: corrupt @width bytes of the fixture at @off with
- * @val.  @width 0 is the special case "leave the ACM alone and write
- * @val to TXT.SINIT_SIZE instead", which reaches the two size checks
- * that compare the register against the header.
- */
+/* One §3.5 mutation: corrupt @width bytes of the fixture at @off. */
 struct acm_mutation {
     const char *name;
     uint32_t off;
@@ -1076,16 +1074,11 @@ static const struct acm_mutation acm_mutations[] = {
     { "chipset id revision does not match DIDVID", ACM_ID_OFF_REVISION, 2,
       0x0003 },
     { "chipset id revision mask matches nothing", ACM_ID_OFF_FLAGS, 4, 1 },
-    { "SINIT_SIZE not a multiple of 64", 0, 0, 0x2008 },
-    { "SINIT_SIZE disagrees with the header size field", 0, 0, 0x1000 },
 };
 
 static void acm_mutate(const struct acm_mutation *m)
 {
     switch (m->width) {
-    case 0:
-        txt_write64(TXT_OFF_SINIT_SIZE, m->val);
-        break;
     case 1:
         /* Volatile: a store into guest RAM the device reads. */
         *(volatile uint8_t *)(uintptr_t)(TEST_SINIT_BASE + m->off) =
@@ -1120,8 +1113,6 @@ static void setup_mle(void)
         (volatile uint64_t *)(uintptr_t)(TEST_MLE_PTAB + 0x1000);
     volatile uint64_t *pt =
         (volatile uint64_t *)(uintptr_t)(TEST_MLE_PTAB + 0x2000);
-    /* volatile: SENTER consumes this guest page table outside C. */
-    volatile uint64_t *entry_pt = pt + 0x1000 / sizeof(*pt);
     volatile uint8_t *heap = (volatile uint8_t *)(uintptr_t)TEST_HEAP_BASE;
     volatile uint64_t *os_sinit;
     volatile uint32_t *hdr;
@@ -1148,26 +1139,18 @@ static void setup_mle(void)
     hdr[7] = 0;                  /* cmdline_start_off */
     hdr[8] = 0;                  /* cmdline_end_off */
 
-    /*
-     * Measurement uses linear offsets starting at zero.  On SENTER
-     * the BSP's EIP is the resolved physical entry address, however,
-     * so it also needs an identity mapping to fetch those same bytes
-     * with paging enabled.  The second PT covers TEST_MLE_BASE.
-     */
+    /* Only the MLE-linear image is mapped; entry runs with PG=0. */
     for (i = 0; i < 0x200; i++) {
         pdpt[i] = 0;
         pd[i] = 0;
         pt[i] = 0;
-        entry_pt[i] = 0;
     }
     pdpt[0] = (TEST_MLE_PTAB + 0x1000) | 1;
     pd[0] = (TEST_MLE_PTAB + 0x2000) | 1;
-    pd[TEST_MLE_BASE >> 21] = (TEST_MLE_PTAB + 0x3000) | 1;
     for (i = 0; i < (uint32_t)(TEST_MLE_SIZE / 0x1000); i++) {
         uint64_t phys = TEST_MLE_BASE + (uint64_t)i * 0x1000;
 
         pt[i] = phys | 1;
-        entry_pt[(phys >> 12) & 0x1ff] = phys | 1;
     }
 
     /* Heap sections. */
@@ -1177,6 +1160,8 @@ static void setup_mle(void)
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x00) = 0x10;
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x10) = 0x10;
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x20) = 0x28;
+    /* Keep launches rejected after measurement until the final entry test. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x48) = 0xffff;
 
     os_sinit = (volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x28);
     *(volatile uint32_t *)os_sinit = 6;                 /* version */
@@ -1384,7 +1369,7 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
 
     if (mle_seen_ebx != TEST_MLE_BASE + 0x200 ||
         mle_seen_ecx != TEST_MLE_PTAB || mle_seen_edx != 0 ||
-        mle_seen_eflags != 0x2 || !(mle_seen_cr0 & (1u << 31)) ||
+        mle_seen_eflags != 0x2 || (mle_seen_cr0 & (1u << 31)) ||
         (cr0 & (1u << 31)) || !(cr4 & (1u << 5)) ||
         cr3 != TEST_MLE_PTAB) {
         fail_msg("MLE entry register/paging state is wrong", 16384);
@@ -1401,11 +1386,16 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         fail_msg("MLE entry TXT status is wrong", 16384);
     }
     if (guest_le(section + 8, 4) != 6 ||
-        count == 0 || off != 0x98 || off + 0x18 > 0x400 ||
+        count == 0 || off != 0x98 ||
+        guest_le(section, 8) < off + 0x18 ||
         !guest_le(section + off + 8, 8) ||
         section[off + 0x10] != 0) {
         fail_msg("MLE entry SINIT-MLE MDR is missing", 16384);
     }
+
+    /* Post-launch SMCTRL and single-vCPU WAKEUP must not #UD. */
+    asm volatile(".byte 0x0f, 0x37" : : "a"(7), "b"(0) : "memory");
+    asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
 
     if (main_fail) {
         ml_printf("smx: MLE landing failed (0x%x)\n", main_fail);
@@ -1455,15 +1445,11 @@ static void setup_mle_entry(void)
     /* volatile: SENTER executes the bytes from guest physical RAM. */
     volatile uint8_t *code = (volatile uint8_t *)(uintptr_t)
         (TEST_MLE_BASE + 0x200);
-    /* volatile: the chipset reads this guest PAE page table. */
-    volatile uint64_t *pt = (volatile uint64_t *)(uintptr_t)
-        (TEST_MLE_PTAB + 0x2000);
     uint32_t stack = (uintptr_t)mle_entry_stack + sizeof(mle_entry_stack);
     uint32_t landing = (uintptr_t)mle_landing;
     uint32_t i;
 
-    /* The first pushfd runs while paging is still enabled. */
-    pt[((stack - 4) >> 12) & 0x1ff] = ((stack - 4) & ~0xfffULL) | 3;
+    /* SINIT enters with paging disabled; the stack is physical. */
     for (i = 0; i < sizeof(stub); i++) {
         code[i] = stub[i];
     }
@@ -1471,8 +1457,8 @@ static void setup_mle_entry(void)
         code[1 + i] = stack >> (8 * i);
         code[22 + i] = landing >> (8 * i);
     }
-    /* Complete the fourth size-prefixed heap section only at launch. */
-    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x48) = 0x400;
+    /* Let SINIT create the fourth section, as real tboot expects. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x48) = 0;
 }
 
 int main(void)
@@ -1542,9 +1528,9 @@ int main(void)
                 fail_msg("PARAMETERS index 0 (ACM versions) mismatch", 4);
             }
             break;
-        case 1: /* max ACM size: value in 32-byte units, * 0x20 */
+        case 1: /* max ACM size: EAX[31:5] is byte-positioned */
             if (type != GETSEC_PARAM_MAX_ACM_SIZE ||
-                (eax & ~GETSEC_PARAM_TYPE_MASK) * 0x20 != 0x8000) {
+                (eax & ~GETSEC_PARAM_TYPE_MASK) != 0x8000) {
                 fail_msg("PARAMETERS index 1 (max ACM size) mismatch", 4);
             }
             break;
@@ -1641,9 +1627,9 @@ int main(void)
     /*
      * 7. Program the launch inputs: the DPR range [0xE00000,
      *    0x1000000) (TOP 0x1000000, 2 MiB blocks, locked -- DPR is
-     *    write-once, so this is the one chance), the 4 KiB SINIT
-     *    ACM region at 0xE10000 (inside the DPR), and the 4 KiB heap
-     *    at 0xE11000.  The SINIT region gets the synthetic ACM
+     *    write-once, so this is the one chance), the 16 KiB SINIT
+     *    reserved region at 0xE10000 (inside the DPR), and the 4 KiB heap
+     *    at 0xE20000.  The SINIT region gets the synthetic ACM
      *    fixture, which precondition 3 must accept.
      */
     {
@@ -1656,18 +1642,25 @@ int main(void)
             fail_msg("DPR readback mismatch after programming", 64);
         }
         txt_write64(TXT_OFF_SINIT_BASE, TEST_SINIT_BASE);
-        txt_write64(TXT_OFF_SINIT_SIZE, TEST_SINIT_SIZE);
+        txt_write64(TXT_OFF_SINIT_SIZE, 2 * TEST_SINIT_SIZE);
         txt_write64(TXT_OFF_HEAP_BASE, TEST_HEAP_BASE);
         txt_write64(TXT_OFF_HEAP_SIZE, TEST_HEAP_SIZE);
     }
     ml_printf("smx: SINIT/HEAP/DPR programmed\n");
 
+    /* The ECX ACM size must match the header even inside a larger slot. */
+    txt_write64(TXT_OFF_ERRORCODE, 0);
+    getsec_senter_size(2 * TEST_SINIT_SIZE);
+    if (txt_read64(TXT_OFF_ERRORCODE) != TXT_ERR_ACM_INVALID) {
+        fail_msg("SENTER accepts ECX size that disagrees with ACM header", 64);
+    }
+
     /*
      * 8. SENTER with valid launch inputs: the preconditions pass, the
      *    DRTM is established over the SINIT region with the TIS hash
      *    signals (which reset PCRs 17-22 and extend PCR 17 with the
-     *    region's hash).  The fourth heap section is deliberately not
-     *    populated until the final entry test, so SENTER rejects it
+     *    region's hash).  The fourth heap section is deliberately
+     *    malformed until the final entry test, so SENTER rejects it
      *    with HEAP_INVALID after measuring, without transferring away
      *    from the remaining negative tests.  STS.SENTER_DONE stays clear.
      */

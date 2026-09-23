@@ -664,19 +664,51 @@ It queries ``TPM2_GetCapability(PCRS)`` for active PCR17/18 banks;
 SHA-1, SHA-256, SHA-384 and SHA-512 are supported and an active bank
 outside that set rejects the launch rather than yielding an incomplete
 log. SENTER writes a TCG ``EV_NO_ACTION`` Spec ID Event03 header and
-updates the heap element's first/next record offsets. Two
-``TCG_PCR_EVENT2`` records hold the actual ACM/PCR17 and MLE/PCR18
-digests in each active bank, so the model's measured extensions can
-be replayed from the log. These records use generic ``EV_ACTION`` and
-``QEMU TXT ACM`` / ``QEMU TXT MLE`` descriptions: they describe the
-*semantic QEMU measurements*, not all events a genuine SINIT ACM
-would have produced. A version-6 heap without the TPM2 pointer keeps
-its previous behavior. Too-small logs and malformed elements fail
+updates the heap element's first/next record offsets, followed by
+``TCG_PCR_EVENT2`` records carrying the SINIT event types of SDG
+Table 35, in extend order per PCR:
+
+===== ============================== ==================================
+PCR   Event type                     Digest / event data
+===== ============================== ==================================
+17    ``EVTYPE_HASH_START`` (0x402)  ACM hash, from the ``_TPM_Hash_*``
+                                     sequence; no event data
+18    ``EVTYPE_MLE_HASH`` (0x404)    MLE hash; no event data
+17    ``EVTYPE_MLE_HASH`` (0x404)    MLE hash (SDG Table 1 lists the
+                                     MLE among the PCR 17 details)
+17,18 ``EVTYPE_OSSINITDATA_CAP``     hash of the ``os_sinit_data``
+      (0x40F)                        capabilities DWORD, which is the
+                                     event data
+17,18 ``EVTYPE_CPU_SCRTM_STAT``      hash of the S-CRTM status DWORD
+      (0x40B)                        (1: processor-established, as
+                                     GETSEC[PARAMETERS] advertises)
+===== ============================== ==================================
+
+Every record's digest is the value actually extended, so replaying
+``Extend()`` over the log reproduces the PCRs exactly.
+
+This is a subset of a genuine SINIT's sequence, not a substitute for
+it.  The rest of Table 35 measures things this model has no inputs
+for and does not invent: the S-ACM registration data in the AUX index
+(``EVTYPE_BIOSAC_REG_DATA``), LCP policy details and authorities
+(``EVTYPE_LCP_DETAILS_HASH``, ``EVTYPE_LCP_AUTHORITIES_HASH``), TPM NV
+public info (``EVTYPE_NV_INFO_HASH``), the real ACM signer key
+(``EVTYPE_SINIT_PUBKEY_HASH``, which would be meaningless without
+deviation 1's signature check) and the Boot Guard manifests
+(``EVTYPE_KM_HASH``, ``EVTYPE_BPM_HASH``).  ``EVTYPE_HASH_START``
+likewise carries no event data, because the SDG's SinitHash+EDX pair
+comes from an authentication step QEMU does not perform.
+
+A version-6 heap without the TPM2 pointer keeps its previous
+behavior: only the ACM extend into PCR 17 and the MLE extend into
+PCR 18, with no log. Too-small logs and malformed elements fail
 before DRTM PCR reset.
 
-PCR 17 remains only the first component of the eventual composite;
-launch-context digests are not yet extended, so it is not final or
-attestable. PCR 18 receives the measured MLE hash.
+PCR 17 and PCR 18 therefore hold a launch-context composite, not just
+the two image hashes -- but still a partial one, so neither is
+attestable.  Note also that the SDG's current Details/Authorities
+mapping does not put the MLE digest in PCR 18 at all; QEMU keeps it
+there because that is the legacy mapping the loaders in use expect.
 
 Neither input digest is returned by the TPM: the ACM digest is
 computed inside the TPM by the ``_TPM_Hash_*`` sequence and never
@@ -836,10 +868,11 @@ Deviations from real hardware
 5. Only one TXT generation is modeled; the register map is the
    intersection documented above (FSB-era offsets + modern
    additions), pinned per generation as loaders require.
-6. DRTM PCR values reflect QEMU's semantic measurements, which can
-   differ from what a real SINIT would extend (exact per-generation
-   digest lists, e.g. for PCR17, are normalized to the MLE guide's
-   documented sequence).
+6. DRTM PCR values reflect QEMU's semantic measurements, which differ
+   from what a real SINIT would extend.  The event log uses the SDG's
+   own event types and its records match the extends exactly, but it
+   covers only the events this model has inputs for; see *TPM event
+   log* above for what is measured and what is deliberately absent.
 7. SMP APs must already be halted at SENTER. Both GETSEC[WAKEUP] and
    the MONITOR wake register join them to the MLE, but *guest*
    MONITOR/MWAIT does not track the monitored address: MWAIT

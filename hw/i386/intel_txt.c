@@ -588,7 +588,11 @@ enum {
 /* Page/table address bits of a 64-bit PDPTE/PDE/PTE. */
 #define INTEL_TXT_PTE_ADDR_MASK 0x000ffffffffff000ULL
 
-/* PCR 18 carries the MLE hash (MLE Dev Guide, DRTM PCR usage). */
+/*
+ * PCR 17 accumulates the launch "details" (SDG Table 1) and PCR 18
+ * carries the MLE hash (MLE Dev Guide, DRTM PCR usage).
+ */
+#define INTEL_TXT_DRTM_PCR_ACM 17
 #define INTEL_TXT_DRTM_PCR_MLE 18
 
 /* Offsets within os_sinit_data (tboot include/txt/heap.h, __packed) */
@@ -611,6 +615,22 @@ enum {
 #define TXT_EXT_LOG_SIZE         28      /* header + 20-byte descriptor */
 #define TXT_LOG_MAX_SIZE         (1024 * 1024)
 #define TXT_LOG_EV_ACTION        5       /* semantic QEMU measurements */
+
+/*
+ * SINIT event types (SDG "TPM Event Log", Table 35).  Only the ones
+ * whose inputs this model actually has are produced; the rest of the
+ * table describes LCP policy, the AUX index, TPM NV public info, the
+ * real ACM signer key and Boot Guard manifests, none of which QEMU
+ * models.  See docs/specs/intel-txt.rst.
+ */
+#define TXT_EVTYPE_BASE              0x400
+#define TXT_EVTYPE_HASH_START        (TXT_EVTYPE_BASE + 2)
+#define TXT_EVTYPE_MLE_HASH          (TXT_EVTYPE_BASE + 4)
+#define TXT_EVTYPE_CPU_SCRTM_STAT    (TXT_EVTYPE_BASE + 11)
+#define TXT_EVTYPE_OSSINITDATA_CAP   (TXT_EVTYPE_BASE + 15)
+
+/* EVTYPE_CPU_SCRTM_STAT event data: SCRTM was established by the CPU. */
+#define TXT_SCRTM_STAT_CPU       1
 #define TXT_LOG_NR_BANKS         4
 
 static const struct {
@@ -631,6 +651,11 @@ typedef struct IntelTxtEventLog {
     uint8_t banks;
     uint8_t acm[TXT_LOG_NR_BANKS][64];
     uint8_t mle[TXT_LOG_NR_BANKS][64];
+    /* Digests of the two DWORD events, over caps_data/scrtm_data. */
+    uint8_t caps[TXT_LOG_NR_BANKS][64];
+    uint8_t scrtm[TXT_LOG_NR_BANKS][64];
+    uint8_t caps_data[4];
+    uint8_t scrtm_data[4];
 } IntelTxtEventLog;
 
 /* os_sinit_data.capabilities bits (tboot include/mle.h, txt_caps_t) */
@@ -1379,6 +1404,23 @@ static bool intel_txt_event_log_prepare(IntelTxtState *s,
     if (version < 7) { /* TPM 1.2 and the existing version-6 fixture */
         return true;
     }
+    /*
+     * Event data for the two DWORD events, captured here so the log
+     * and the extends cannot disagree about them later.  The S-CRTM
+     * status is 1 because GETSEC[PARAMETERS] advertises processor
+     * SCRTM; the capabilities are whatever the MLE negotiated.
+     */
+    {
+        uint32_t caps = 0;
+
+        if (os_sinit_sz >= sizeof(uint64_t) + OS_SINIT_OFF_CAPABILITIES + 4 &&
+            !intel_txt_gread_u32(os_sinit + OS_SINIT_OFF_CAPABILITIES,
+                                 &caps, errp)) {
+            return false;
+        }
+        stl_le_p(log->caps_data, caps);
+        stl_le_p(log->scrtm_data, TXT_SCRTM_STAT_CPU);
+    }
     if (os_sinit_sz < sizeof(uint64_t) + OS_SINIT_OFF_EXT_DATA +
                         TXT_EXT_HEADER_SIZE) {
         error_setg(errp, "TPM2 os_sinit_data has no extended data");
@@ -1471,16 +1513,19 @@ static bool intel_txt_event_log_prepare(IntelTxtState *s,
     if (!intel_txt_event_log_banks(s, &log->banks, errp)) {
         return false;
     }
-    /* Both measurements and all selected digests must fit before PCR reset. */
+    /* Every record and its digests must fit before any PCR is reset. */
     {
+        /* ACM, MLE x2, then caps and S-CRTM for each of PCR 17 and 18. */
+        const size_t nr_records = 7;
         size_t needed = 60 + 4 * ctpop8(log->banks) + 1;
 
         for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
             if (log->banks & BIT(i)) {
-                needed += 2 * (2 + intel_txt_log_banks[i].len);
+                needed += nr_records * (2 + intel_txt_log_banks[i].len);
             }
         }
-        needed += 2 * (12 + 4 + sizeof("QEMU TXT ACM") - 1);
+        /* Per-record header and eventSize, plus the DWORD event data. */
+        needed += nr_records * (12 + 4) + 4 * sizeof(uint32_t);
         if (needed > log->size) {
             error_setg(errp, "TPM2 event log size %u is too small for "
                        "%zu bytes of measurements", log->size, needed);
@@ -1492,14 +1537,15 @@ static bool intel_txt_event_log_prepare(IntelTxtState *s,
 
 /* Append a TCG_PCR_EVENT2 whose digest matches the model's actual extend. */
 static size_t intel_txt_log_append(uint8_t *dst, uint32_t pcr,
+                                   uint32_t event_type,
                                    const IntelTxtEventLog *log,
                                    const uint8_t digests[TXT_LOG_NR_BANKS][64],
-                                   const char *description)
+                                   const void *event_data, size_t data_len)
 {
-    size_t off = 12, text_len = strlen(description);
+    size_t off = 12;
 
     stl_le_p(dst, pcr);
-    stl_le_p(dst + 4, TXT_LOG_EV_ACTION);
+    stl_le_p(dst + 4, event_type);
     stl_le_p(dst + 8, ctpop8(log->banks));
     for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
         if (!(log->banks & BIT(i))) {
@@ -1509,16 +1555,105 @@ static size_t intel_txt_log_append(uint8_t *dst, uint32_t pcr,
         memcpy(dst + off + 2, digests[i], intel_txt_log_banks[i].len);
         off += 2 + intel_txt_log_banks[i].len;
     }
-    stl_le_p(dst + off, text_len);
-    memcpy(dst + off + 4, description, text_len);
-    return off + 4 + text_len;
+    stl_le_p(dst + off, data_len);
+    if (data_len) {
+        memcpy(dst + off + 4, event_data, data_len);
+    }
+    return off + 4 + data_len;
+}
+
+/*
+ * Hash @data in every active bank into @out, then extend it into @pcr.
+ * The digests stored in @out are the ones the log will carry, so a
+ * replay of the log reproduces the PCR exactly.
+ */
+static int intel_txt_extend_event(IntelTxtState *s, IntelTxtEventLog *log,
+                                  uint32_t pcr, const void *data,
+                                  size_t len,
+                                  uint8_t out[TXT_LOG_NR_BANKS][64],
+                                  Error **errp)
+{
+    TPMDigestValue digests[TXT_LOG_NR_BANKS];
+    size_t nr = 0;
+
+    for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
+        g_autofree uint8_t *digest = NULL;
+        size_t dlen = 0;
+
+        if (!(log->banks & BIT(i))) {
+            continue;
+        }
+        if (qcrypto_hash_bytes(intel_txt_log_banks[i].crypto, data, len,
+                               &digest, &dlen, errp) < 0) {
+            return -1;
+        }
+        g_assert(dlen == intel_txt_log_banks[i].len);
+        memcpy(out[i], digest, dlen);
+        digests[nr++] = (TPMDigestValue) {
+            .alg = intel_txt_log_banks[i].alg,
+            .digest = out[i], .len = dlen,
+        };
+    }
+    if (nr == 0) {
+        return 0;
+    }
+    return intel_txt_drtm_extend_pcr(s, pcr, digests, nr, errp);
+}
+
+/*
+ * Step d, continued: the launch-context events this model can honestly
+ * produce.  PCR 17 also takes the MLE digest (SDG Table 1 lists the
+ * MLE among the PCR 17 "details"); PCR 18 already received it in
+ * intel_txt_measure_mle().  Both PCRs then take the OsSinitData
+ * capabilities DWORD and the processor S-CRTM status DWORD, which
+ * SDG Tables 1 and 2 extend to 17 and 18 alike.
+ */
+static int intel_txt_extend_context(IntelTxtState *s, IntelTxtEventLog *log,
+                                    Error **errp)
+{
+    TPMDigestValue mle_digests[TXT_LOG_NR_BANKS];
+    size_t nr = 0;
+
+    if (!log->banks) {
+        return 0; /* version-6 launch: no TPM2 log, keep the old PCR set */
+    }
+    for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
+        if (!(log->banks & BIT(i))) {
+            continue;
+        }
+        mle_digests[nr++] = (TPMDigestValue) {
+            .alg = intel_txt_log_banks[i].alg,
+            .digest = log->mle[i], .len = intel_txt_log_banks[i].len,
+        };
+    }
+    if (nr && intel_txt_drtm_extend_pcr(s, INTEL_TXT_DRTM_PCR_ACM,
+                                        mle_digests, nr, errp) < 0) {
+        return -1;
+    }
+    for (uint32_t pcr = INTEL_TXT_DRTM_PCR_ACM;
+         pcr <= INTEL_TXT_DRTM_PCR_MLE; pcr++) {
+        if (intel_txt_extend_event(s, log, pcr, log->caps_data,
+                                   sizeof(log->caps_data), log->caps,
+                                   errp) < 0 ||
+            intel_txt_extend_event(s, log, pcr, log->scrtm_data,
+                                   sizeof(log->scrtm_data), log->scrtm,
+                                   errp) < 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* Publish the complete bounded log first, then its offsets in the TXT heap. */
 static bool intel_txt_event_log_publish(const IntelTxtEventLog *log,
                                         Error **errp)
 {
-    uint8_t data[512] = { 0 }, offsets[8];
+    /*
+     * Worst case: a Spec ID header describing all four banks, then
+     * seven records each carrying four digests (20+32+48+64 bytes
+     * plus a 2-byte alg id each) and up to a DWORD of event data.
+     */
+    uint8_t data[2048] = { 0 }, offsets[8];
     size_t off = 60;
 
     if (!log->banks) {
@@ -1539,10 +1674,35 @@ static bool intel_txt_event_log_publish(const IntelTxtEventLog *log,
     }
     data[off++] = 0; /* vendorInfoSize */
     stl_le_p(data + 28, off - 32); /* TCG_PCR_EVENT eventSize */
-    off += intel_txt_log_append(data + off, 17, log, log->acm,
-                                "QEMU TXT ACM");
-    off += intel_txt_log_append(data + off, 18, log, log->mle,
-                                "QEMU TXT MLE");
+    /*
+     * Record order is extend order, per PCR:
+     *   PCR17: ACM (the _TPM_Hash_* sequence), MLE, caps, S-CRTM
+     *   PCR18: MLE, caps, S-CRTM
+     * EVTYPE_HASH_START carries no event data here: the SDG's
+     * SinitHash+EDX pair describes an authentication step this model
+     * does not perform (deviation 1), and inventing bytes for it
+     * would put a value in the log that nothing produced.
+     */
+    off += intel_txt_log_append(data + off, INTEL_TXT_DRTM_PCR_ACM,
+                                TXT_EVTYPE_HASH_START, log, log->acm,
+                                NULL, 0);
+    off += intel_txt_log_append(data + off, INTEL_TXT_DRTM_PCR_MLE,
+                                TXT_EVTYPE_MLE_HASH, log, log->mle,
+                                NULL, 0);
+    off += intel_txt_log_append(data + off, INTEL_TXT_DRTM_PCR_ACM,
+                                TXT_EVTYPE_MLE_HASH, log, log->mle,
+                                NULL, 0);
+    for (unsigned pcr = INTEL_TXT_DRTM_PCR_ACM; pcr <= INTEL_TXT_DRTM_PCR_MLE;
+         pcr++) {
+        off += intel_txt_log_append(data + off, pcr,
+                                    TXT_EVTYPE_OSSINITDATA_CAP, log,
+                                    log->caps, log->caps_data,
+                                    sizeof(log->caps_data));
+        off += intel_txt_log_append(data + off, pcr,
+                                    TXT_EVTYPE_CPU_SCRTM_STAT, log,
+                                    log->scrtm, log->scrtm_data,
+                                    sizeof(log->scrtm_data));
+    }
     g_assert(off <= sizeof(data));
     if (off > log->size ||
         !intel_txt_gwrite(log->addr, data, off, errp)) {
@@ -2591,6 +2751,15 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
      */
     ret = intel_txt_measure_mle(s, entry, &log, &err);
     if (ret < 0) {
+        goto fail_measure;
+    }
+    /*
+     * The remaining launch-context extends, in the order the log
+     * records them.  Must follow the MLE measurement: it supplies the
+     * digest PCR 17 takes here.
+     */
+    if (intel_txt_extend_context(s, &log, &err) < 0) {
+        ret = -1;
         goto fail_measure;
     }
     if (!intel_txt_write_sinit_mle_data(s, &err) ||

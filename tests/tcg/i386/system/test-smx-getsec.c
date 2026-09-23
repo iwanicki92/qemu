@@ -1078,12 +1078,38 @@ static uint8_t tpm2_pcrread_cmd[20] = {
  *         hashlib.sha256(bytes(b)).digest()).hexdigest())
  *   EOF
  */
+#ifdef TEST_TXT_TPM2_LOG
+/*
+ * A version-7 launch continues past the ACM hash with the rest of the
+ * SDG launch-context events, so PCR 17 is
+ *
+ *   E(E(E(E(0, H(acm)), H(mle)), H(caps)), H(scrtm))
+ *
+ * where E(a,b) = SHA256(a || b), caps is the os_sinit_data
+ * capabilities DWORD (3 here) and scrtm is the S-CRTM status DWORD
+ * (1, processor-established).  Append to the recipe above:
+ *   ext = lambda c, d: hashlib.sha256(c + d).digest()
+ *   h = lambda d: hashlib.sha256(d).digest()
+ *   p = ext(bytes(32), h(bytes(b)))
+ *   p = ext(p, h(bytes(img)))          # img from the PCR 18 recipe
+ *   p = ext(p, h(struct.pack('<I', 3)))
+ *   p = ext(p, h(struct.pack('<I', 1)))
+ *   print(p.hex())
+ */
+static const uint8_t pcr17_expected[32] = {
+    0xd4, 0x90, 0x94, 0x67, 0x22, 0x6d, 0x7d, 0xd1,
+    0x9e, 0xa2, 0xb1, 0x1c, 0x6f, 0x76, 0xc9, 0xe8,
+    0xd8, 0x4c, 0x36, 0x68, 0x1b, 0x24, 0x1b, 0x90,
+    0xe1, 0x80, 0x3e, 0xdb, 0xf4, 0x00, 0xf1, 0xbc,
+};
+#else
 static const uint8_t pcr17_expected[32] = {
     0x10, 0x02, 0x9f, 0xff, 0xe9, 0x12, 0xaa, 0x85,
     0x7e, 0x80, 0x08, 0x75, 0x28, 0x0c, 0x72, 0xb3,
     0xa7, 0xc7, 0x9b, 0x9d, 0x98, 0x4c, 0x08, 0x4a,
     0xa4, 0x30, 0x93, 0x74, 0xfe, 0x55, 0xa9, 0x04,
 };
+#endif
 
 /*
  * Expected PCR 18 (SHA-256 bank): the MLE hash, extended from zero
@@ -1107,7 +1133,15 @@ static const uint8_t pcr17_expected[32] = {
  *         hashlib.sha256(bytes(img)).digest()).hexdigest())
  *   EOF
  */
-#ifdef TEST_TXT_MLE_UNALIGNED
+#if defined(TEST_TXT_TPM2_LOG)
+/* As for PCR 17, but the chain is E(E(E(0, H(mle)), H(caps)), H(scrtm)). */
+static const uint8_t pcr18_expected[32] = {
+    0x85, 0xca, 0x0c, 0x70, 0x54, 0x13, 0x87, 0x69,
+    0x39, 0x28, 0x55, 0x47, 0x7b, 0xd9, 0x23, 0xd2,
+    0x47, 0xc9, 0xf2, 0x63, 0x62, 0x7e, 0xf8, 0x47,
+    0xab, 0x6f, 0x28, 0xc5, 0x79, 0x36, 0x0a, 0x89,
+};
+#elif defined(TEST_TXT_MLE_UNALIGNED)
 /* Same recipe as below with 0x1800 in both places. */
 static const uint8_t pcr18_expected[32] = {
     0x72, 0x18, 0xc5, 0x50, 0x90, 0x64, 0x59, 0x1a,
@@ -1666,11 +1700,40 @@ static void check_tpm2_event_log(void)
         fail_msg("TPM2 Spec ID payload invalid", 16384);
     }
     pos++;
-    for (pcr = 17; pcr <= 18; pcr++) {
+    /*
+     * The launch-context records, in extend order per PCR (SDG
+     * Table 35 event types).  Anything QEMU cannot derive -- LCP
+     * policy, the AUX index, NV public info, the real signer key --
+     * is absent, so this is the whole expected sequence.
+     */
+    static const struct {
+        uint32_t pcr;
+        uint32_t type;
+        uint32_t size;
+        uint32_t data;
+    } expected_events[] = {
+        { 17, 0x402, 0, 0 },  /* EVTYPE_HASH_START    */
+        { 18, 0x404, 0, 0 },  /* EVTYPE_MLE_HASH      */
+        { 17, 0x404, 0, 0 },  /* EVTYPE_MLE_HASH      */
+        { 17, 0x40f, 4, 3 },  /* EVTYPE_OSSINITDATA_CAP: capabilities */
+        { 17, 0x40b, 4, 1 },  /* EVTYPE_CPU_SCRTM_STAT: CPU S-CRTM   */
+        { 18, 0x40f, 4, 3 },
+        { 18, 0x40b, 4, 1 },
+    };
+
+#define NR_EXPECTED_EVENTS \
+    (sizeof(expected_events) / sizeof(expected_events[0]))
+
+    for (unsigned ev = 0; ev < NR_EXPECTED_EVENTS; ev++) {
         uint32_t event_banks, event_size;
 
+        pcr = expected_events[ev].pcr;
         if (guest_le(log + pos, 4) != pcr ||
-            guest_le(log + pos + 4, 4) != 5) {
+            guest_le(log + pos + 4, 4) != expected_events[ev].type) {
+            ml_printf("smx: event %u is PCR %u type 0x%x, want PCR %u "
+                      "type 0x%x\n", ev, guest_le(log + pos, 4),
+                      guest_le(log + pos + 4, 4), pcr,
+                      expected_events[ev].type);
             fail_msg("TXT measurement missing from TPM2 event log", 16384);
         }
         event_banks = guest_le(log + pos + 8, 4);
@@ -1702,15 +1765,22 @@ static void check_tpm2_event_log(void)
             pos += digest_len;
         }
         event_size = guest_le(log + pos, 4);
-        if (event_size != 12) {
-            fail_msg("TPM2 TXT event description missing", 16384);
+        if (event_size != expected_events[ev].size) {
+            fail_msg("TPM2 TXT event data size wrong", 16384);
         }
-        pos += 4 + event_size;
+        pos += 4;
+        if (event_size == 4 &&
+            guest_le(log + pos, 4) != expected_events[ev].data) {
+            fail_msg("TPM2 TXT event data wrong", 16384);
+        }
+        pos += event_size;
     }
     if (pos != next) {
         fail_msg("TPM2 next_record_offset does not follow events", 16384);
     }
-    ml_printf("PASS: TPM2 Spec ID and both measured event records\n");
+    ml_printf("PASS: TPM2 Spec ID and the %u SINIT event records\n",
+              (unsigned)NR_EXPECTED_EVENTS);
+#undef NR_EXPECTED_EVENTS
 }
 #endif
 

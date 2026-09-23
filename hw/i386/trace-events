@@ -165,7 +165,7 @@ txt_drtm_digest(const char *what, const char *sha1, const char *sha256) "DRTM: %
 txt_measure_mle(uint64_t ptab, uint64_t size, uint64_t hdr_off) "DRTM: MLE measured via ptab 0x%"PRIx64" size 0x%"PRIx64" hdr@0x%"PRIx64
 txt_acm_validated(uint64_t size, uint32_t entry_point, uint32_t chipset_ids) "GETSEC[SENTER]: SINIT ACM accepted, size 0x%"PRIx64" entry 0x%"PRIx32" %"PRIu32" chipset ids"
 txt_sinit_mle_data(uint32_t num_mdrs, uint64_t region_off) "sinit_mle_data written: %u MDRs at heap offset 0x%"PRIx64
-txt_event_log(uint64_t addr, uint32_t bytes, uint32_t banks) "TPM2 Spec ID and ACM/MLE events at 0x%"PRIx64", %u bytes, %u banks"
+txt_event_log(uint64_t addr, uint32_t bytes, uint32_t banks) "TPM2 Spec ID and SINIT launch events at 0x%"PRIx64", %u bytes, %u banks"
 txt_wakeup_rejected(const char *reason) "TXT RLP wake: %s"
 txt_wakeup_join(uint32_t gdt, uint32_t limit, uint32_t selector, uint32_t entry) "TXT MLE_JOIN: gdt 0x%"PRIx32" limit 0x%"PRIx32" cs 0x%"PRIx32" entry 0x%"PRIx32
 txt_wakeup_entry(uint32_t entry, uint32_t selector, uint32_t gdt, uint32_t limit) "TXT RLP wake: entry 0x%"PRIx32" cs 0x%"PRIx32" gdt 0x%"PRIx32" limit 0x%"PRIx32

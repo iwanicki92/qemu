@@ -31,9 +31,11 @@ Status: in progress. Upstream RFC is blocked until this work is implemented and 
    translated host-physical addresses in `vtd_iommu_translate()`, and forces
    the IOMMU path even with DMAR disabled via `vtd_switch_address_space()`.
    Extending that path to DPR would cover the modeled PCI test device but
-   **not necessarily ISA DMA or other direct `address_space_memory` users**.
-   Inventory these paths before calling DPR complete; otherwise narrow the
-   documented contract and get an explicit scope decision.
+   **does not cover ISA DMA**: Q35's `hw/isa/lpc_ich9.c` instantiates the
+   i8257, whose `hw/dma/i8257.c` read/write callbacks use
+   `physical_memory_read/write()` directly. Protect that path too, and
+   inventory other direct `address_space_memory` users before claiming DPR
+   complete; otherwise narrow the documented contract with explicit approval.
 2. Bind the TXT DPR source to the IOMMU without relying on `current_cpu`:
    DMA callbacks can run without a vCPU. On lock, refresh device address
    spaces and invalidate translations; ensure PMR and DPR coexist. Account

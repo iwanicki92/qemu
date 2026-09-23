@@ -534,17 +534,27 @@ TXT.ERRORCODE and enters the MLE instead of returning to the loader.
 
 MLE entry CPU state (BSP), per MLE Dev Guide:
 
-- 32-bit protected mode with **CR0.PG clear**; SINIT uses the MLE
-  page tables (from ``os_sinit_data.mle_ptab``) to validate/measure
-  the image, but the first MLE instructions execute at physical
-  addresses until the MLE enables its own paging,
+- 32-bit protected mode with **CR0.PG clear** (AM and WP clear too);
+  SINIT uses the MLE page tables (from ``os_sinit_data.mle_ptab``) to
+  validate/measure the image, but the first MLE instructions execute
+  at physical addresses until the MLE enables its own paging,
+- **CR4 = SMXE only** (0x4000).  SMXE has to survive because the MLE
+  issues its own GETSEC leaves after launch; everything else the MLE
+  wants (PAE, MCE, OSFXSR, ...) it must re-enable itself,
+- **long mode fully disabled**: clearing CR0.PG drops ``EFER.LMA``,
+  and QEMU also clears ``EFER.LME``.  This matters on a
+  64-bit-capable vCPU: if LME survived, the MLE's first ``CR0.PG``
+  write would enter long mode instead of the 32-bit paging it just
+  built.  (tboot is a 32-bit MLE even when it boots an x86_64
+  kernel, so this is the normal case, not a corner case.)
 - GDTR from the **SINIT ACM header** (``gdt_base`` at offset 0x2c,
   ``gdt_limit`` at 0x28), CS = the ACM header's ``seg_sel`` (0x30,
   32-bit code, RPL0), DS/ES/SS = seg_sel+8,
 - EIP = the physical address resolved from the MLE header's
   ``entry_point`` through the MLE page tables (CS.base = 0, PG=0),
 - EBX = that physical entry address, ECX = physical address of
-  the MLE page table, EDX = 0,
+  the MLE page table, EDX = 0.  Hardware leaves CR3 undefined; QEMU
+  hands over the MLE page table there as a defined value,
 - EFLAGS = 0x2, so interrupts are masked; the MLE installs its own
   IDT before enabling them.
 

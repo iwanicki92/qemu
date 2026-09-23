@@ -1363,6 +1363,12 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
     asm volatile("sgdt %0" : "=m"(gdtr));
     asm volatile("mov %%cs, %0" : "=r"(cs));
     asm volatile("mov %%ds, %0" : "=r"(ds));
+    /*
+     * SINIT hands over CR4 = SMXE only, so the SSE staging used by
+     * txt_read64() is disabled until the MLE turns it back on -- as a
+     * real MLE must re-establish whatever CR4 features it needs.
+     */
+    write_cr4(cr4 | CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK);
     sts = txt_read64(TXT_OFF_STS);
     count = guest_le(section + 8 + 0x80, 4);
     off = guest_le(section + 8 + 0x84, 4);
@@ -1370,7 +1376,7 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
     if (mle_seen_ebx != TEST_MLE_BASE + 0x200 ||
         mle_seen_ecx != TEST_MLE_PTAB || mle_seen_edx != 0 ||
         mle_seen_eflags != 0x2 || (mle_seen_cr0 & (1u << 31)) ||
-        (cr0 & (1u << 31)) || !(cr4 & (1u << 5)) ||
+        (cr0 & (1u << 31)) || cr4 != CR4_SMXE_MASK ||
         cr3 != TEST_MLE_PTAB) {
         fail_msg("MLE entry register/paging state is wrong", 16384);
     }

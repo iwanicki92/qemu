@@ -4,8 +4,12 @@ minilib_dir = meson.current_source_dir() / '..' / '..' / 'minilib'
 minilib_printf = files(minilib_dir / 'printf.c')[0]
 link_script = files('kernel.ld')[0]
 boot = files('boot.S')[0]
+# -fno-stack-protector: these are freestanding images with no libc, so a
+# toolchain configured with --enable-default-ssp would emit calls to an
+# undefined __stack_chk_fail.
 cflags = ['-nostdlib',
           '-ffreestanding',
+          '-fno-stack-protector',
           '-Wa,--noexecstack',
           '-I', minilib_dir, minilib_printf, boot,
           '-Wl,-T', link_script,

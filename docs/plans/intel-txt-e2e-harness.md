@@ -271,9 +271,64 @@ that label is stale for the tboot phase, but must **not** be interpreted as
 measured-boot acceptance. PCR17 composition, VT-d protection, SMI
 inhibition, SEXIT and the Linux TXT contract remain incomplete.
 
+### 64-bit (x86_64) harness (2026-09-23)
+
+The harness originally ran `qemu-system-i386` with `-cpu qemu32`, which
+forced a 32-bit guest kernel. That was an artifact of the emulator choice,
+not a TXT constraint: tboot must be a 32-bit MLE (SENTER enters in 32-bit
+protected mode), but it hands off to an ordinary Linux bzImage that may be
+x86_64, exactly as on real hardware. The harness now defaults to
+`qemu-system-x86_64`, and QEMU is configured with
+`--target-list=i386-softmmu,x86_64-softmmu`. The TXT device is built for
+both (it is gated on `CONFIG_Q35`), and `tests/qtest/txt-test` now runs on
+both targets (14 subtests each).
+
+Two real bugs were found by moving to 64 bits:
+
+1. **`EFER.LME` was never cleared on MLE entry.** Clearing `CR0.PG` drops
+   `LMA`, but with `LME` still set the MLE's first `CR0.PG` write would
+   have entered *long mode* instead of its own 32-bit paging. SENTER now
+   clears `LME`/`LMA` and the matching hflags. The entry state was also
+   corrected to `CR4 = SMXE` only and `CR0.AM/WP` clear, per the MLE Dev
+   Guide, instead of the previous "set CR4.PAE" behaviour. The guest test
+   asserts the new state, and its MLE landing code now re-enables
+   `CR4.OSFXSR` itself before using SSE-staged MMIO -- which is what a real
+   MLE has to do.
+2. **`qemu64` reports `AuthenticAMD`.** tboot's `supports_txt()` requires
+   `GenuineIntel`, so it bailed before enabling `CR4.SMXE` and failed with
+   `SMXE not enabled, can't read parameters`. The harness therefore uses an
+   Intel model (`Nehalem,smx,sse`). This was a harness bug, not a QEMU one.
+
+An unrelated pre-existing build break also surfaced: this host's GCC is
+configured with `--enable-default-ssp`, so the freestanding
+`tests/tcg/x86_64/system` images failed to link against `__stack_chk_fail`.
+Added `-fno-stack-protector` to those cflags, matching what the i386 SMX
+test already passed.
+
+With `-cpu Nehalem,-apic,smx,sse` on `qemu-system-x86_64`, real tboot again
+reaches `Post_launch started ...`, `GETSEC[WAKEUP] completed` and
+`transfering control to kernel` (`run-20260923-094048/`). The x86_64 host
+kernel that the ISO currently carries then panics with `Attempted to kill
+init!`, because that ISO reuses the host's `vmlinuz-linux` and host
+initramfs, which cannot find a root filesystem here. That panic is a
+harness-payload gap, not a TXT failure -- but it does mean **there is still
+no validated Linux-side measured boot**.
+
+### PCR verification status
+
+Not yet established. PCRs 17-22 are volatile TPM state and were not
+recoverable from the finished runs: swtpm only persists them via its
+control channel, and the runs killed it. `run-baseline.py` now shuts swtpm
+down through `swtpm_ioctl` and `read-pcrs.py` reloads the saved state, but
+swtpm did not produce a `tpm2-00.volatilestate` in practice, so this path
+is **currently non-working** and must not be cited as evidence. The
+intended primary evidence is instead an in-guest read of
+`/sys/class/tpm/tpm0/pcr-sha1|sha256/<17..22>` from a purpose-built
+initramfs, which reports the values as the OS observes them after launch.
+
 Next: fix or explain the coreboot/SeaBIOS virtual-wire/APIC handoff so the
-normal CPU configuration boots; validate DMAR/VT-d and a TXT-enabled Linux
-kernel with purpose-built initramfs, verify actual PCR values, and implement
-required teardown semantics. Generic coreboot TXT cannot simply be enabled
-for q35: it expects platform DRAM-clear/reset features and a BIOS ACM that
-QEMU does not execute.
+normal CPU configuration boots; finish the TXT-enabled x86_64 kernel and
+initramfs and read the PCRs from inside the guest; validate DMAR/VT-d; and
+implement required teardown semantics. Generic coreboot TXT cannot simply
+be enabled for q35: it expects platform DRAM-clear/reset features and a
+BIOS ACM that QEMU does not execute.

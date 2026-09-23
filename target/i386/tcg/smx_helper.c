@@ -173,9 +173,26 @@ void helper_getsec(CPUX86State *env)
              * address resolved from the measured MLE mapping. Tboot's
              * first instructions use absolute physical TXT MMIO and
              * expect EBX to contain that same physical entry address.
+             *
+             * Entry state per the MLE Dev Guide: 32-bit protected
+             * mode, CR0.PG/AM/WP clear, CR4 = SMXE only (SMXE must
+             * survive for the MLE's own post-launch GETSEC leaves).
              */
-            cpu_x86_update_cr0(env, env->cr[0] & ~CR0_PG_MASK);
-            cpu_x86_update_cr4(env, env->cr[4] | CR4_PAE_MASK);
+            cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) &
+                                    ~(CR0_PG_MASK | CR0_AM_MASK |
+                                      CR0_WP_MASK));
+            cpu_x86_update_cr4(env, CR4_SMXE_MASK);
+#ifdef TARGET_X86_64
+            /*
+             * Long mode is left fully disabled, not merely inactive.
+             * Clearing CR0.PG above already dropped EFER.LMA; LME has
+             * to go too, or the MLE's first CR0.PG write would enter
+             * long mode instead of the 32-bit paging it set up.
+             */
+            env->efer &= ~(MSR_EFER_LME | MSR_EFER_LMA);
+            env->hflags &= ~(HF_LMA_MASK | HF_CS64_MASK);
+#endif
+            /* Hardware leaves CR3 undefined; hand over the MLE ptab. */
             cpu_x86_update_cr3(env, entry.ptab);
             env->gdt.base = entry.gdt_base;
             env->gdt.limit = entry.gdt_limit;
@@ -194,8 +211,6 @@ void helper_getsec(CPUX86State *env)
             env->regs[R_ESP] = 0;
             cpu_load_eflags(env, 0x2, ~0u);
             env->eip = entry.entry_phys;
-            cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) &
-                                    ~CR0_PG_MASK);
             cpu_loop_exit(env_cpu(env));
         }
 #endif

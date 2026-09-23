@@ -570,8 +570,16 @@ enum {
  */
 #define INTEL_TXT_OS_SINIT_MIN_VER 4
 
-/* One page table covers 512 4 KiB pages; tboot assumes the same bound. */
-#define INTEL_TXT_MAX_MLE_SIZE (512 * 4096)
+/*
+ * Upper bound on the MLE.  The SDG defines os_sinit_data "MLE Size"
+ * in bytes and sets no architectural limit; TrenchBoot's MLEs far
+ * exceed the 2 MiB a single page table covers (Xen 0x3cfa20, Linux
+ * around 54 MiB), and intel_txt_mle_xlate() walks a PD with many
+ * page tables anyway.  64 MiB is a QEMU resource bound on the
+ * measurement buffer and the page-by-page read cost, not an
+ * architectural one.
+ */
+#define INTEL_TXT_MAX_MLE_SIZE (16384 * 4096)
 
 /* Page/table address bits of a 64-bit PDPTE/PDE/PTE. */
 #define INTEL_TXT_PTE_ADDR_MASK 0x000ffffffffff000ULL
@@ -1229,7 +1237,8 @@ static bool intel_txt_validate_pmrs(IntelTxtState *s, IntelTxtPmrs *pmr,
         (!pmr->hi_size && pmr->hi_base) ||
         ptab == 0 || (ptab & 0xfff) ||
         ptab >= INTEL_TXT_GUEST_32BIT_LIMIT ||
-        mle_size == 0 || (mle_size & 0xfff) ||
+        /* MLE Size is in bytes; no page alignment is required */
+        mle_size == 0 ||
         mle_size > INTEL_TXT_MAX_MLE_SIZE ||
         !intel_txt_pmr_covers(pmr, ptab, 4096)) {
         error_setg(errp, "invalid VT-d PMR ranges or MLE page tables "
@@ -1601,11 +1610,14 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
                    "not below 4 GiB", ptab);
         return -1;
     }
-    if (mle_size == 0 || (mle_size & 0xfff) ||
+    /*
+     * The SDG defines MLE Size in bytes: an unaligned size is legal
+     * and the final partial page is measured only up to MLE Size.
+     */
+    if (mle_size == 0 ||
         mle_size > INTEL_TXT_MAX_MLE_SIZE) {
-        error_setg(errp, "mle_size 0x%" PRIx64 " is zero, not page-aligned "
-                   "or larger than the 0x%x maximum", mle_size,
-                   INTEL_TXT_MAX_MLE_SIZE);
+        error_setg(errp, "mle_size 0x%" PRIx64 " is zero or larger than "
+                   "the 0x%x maximum", mle_size, INTEL_TXT_MAX_MLE_SIZE);
         return -1;
     }
     /*
@@ -1653,13 +1665,18 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
         return -1;
     }
 
-    /* Gather the MLE image page by page through the mapping. */
+    /*
+     * Gather the MLE image page by page through the mapping.  An
+     * unaligned MLE Size ends the final page early; only the
+     * remaining bytes belong to the measured image.
+     */
     mle = g_malloc(mle_size);
     for (off = 0; off < mle_size; off += 4096) {
         uint64_t page;
 
         if (!intel_txt_mle_xlate(ptab, off, &page, NULL, NULL, errp) ||
-            !intel_txt_gread(page, mle + off, 4096, errp)) {
+            !intel_txt_gread(page, mle + off,
+                             MIN((uint64_t)4096, mle_size - off), errp)) {
             goto out;
         }
     }

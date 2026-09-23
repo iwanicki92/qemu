@@ -506,9 +506,11 @@ return without a machine reset (a QEMU semantic deviation):
    the size-prefixed sections (bios_data, os_mle_data, os_sinit_data)
    parse and fit in HEAP_SIZE; os_sinit_data version in range (>= 4);
    ``mle_ptab``
-   non-zero, page-aligned, below 4 GiB; ``mle_size`` non-zero,
-   page-aligned and at most 2 MiB (one page table); ``mle_hdr_base``
-   leaves room for an MLE header inside ``[0, mle_size)``; the MLE
+   non-zero, page-aligned, below 4 GiB; ``mle_size`` non-zero and at
+   most 64 MiB (the SDG defines it in bytes; no page alignment is
+   required, so the final partial page is measured up to
+   ``mle_size``); ``mle_hdr_base`` leaves room for an MLE header
+   inside ``[0, mle_size)``; the MLE
    header's UUID matches ``MLE_HDR_UUID`` and its length fits in
    the image; ``entry_point`` is inside the image and resolves to a
    physical address below 4 GiB. The fourth size-prefixed section

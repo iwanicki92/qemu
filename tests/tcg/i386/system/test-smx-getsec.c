@@ -203,7 +203,15 @@
  */
 #define TEST_MLE_PTAB          0xE30000ULL
 #define TEST_MLE_BASE          0xE40000ULL
+#ifdef TEST_TXT_MLE_UNALIGNED
+/*
+ * Not page aligned: the SDG's MLE Size is in bytes and needs no
+ * alignment; the final partial page is measured up to MLE Size.
+ */
+#define TEST_MLE_SIZE          0x1800ULL
+#else
 #define TEST_MLE_SIZE          0x2000ULL
+#endif
 #define TEST_MLE_HDR_OFF       0x100ULL
 #define TEST_HEAP_SIZE         0x1000ULL
 #ifdef TEST_TXT_TPM2_LOG
@@ -1082,7 +1090,9 @@ static const uint8_t pcr17_expected[32] = {
  * because _TPM_Hash_Start zeroes PCR 18 as well as PCR 17.  The image
  * is mle[i] = (i ^ 0x5A) with the MLE header overwritten at
  * TEST_MLE_HDR_OFF, so the digest covers the header bytes too -- which
- * is correct: the header lives inside the measured image.
+ * is correct: the header lives inside the measured image.  For
+ * TEST_TXT_MLE_UNALIGNED the image is the first 0x1800 bytes and the
+ * mle_end_off header field is 0x1800.
  *
  * Reproduce with:
  *   python3 - <<'EOF'
@@ -1097,12 +1107,22 @@ static const uint8_t pcr17_expected[32] = {
  *         hashlib.sha256(bytes(img)).digest()).hexdigest())
  *   EOF
  */
+#ifdef TEST_TXT_MLE_UNALIGNED
+/* Same recipe as below with 0x1800 in both places. */
+static const uint8_t pcr18_expected[32] = {
+    0x72, 0x18, 0xc5, 0x50, 0x90, 0x64, 0x59, 0x1a,
+    0x02, 0x84, 0x81, 0x4e, 0x58, 0x47, 0xc7, 0xcc,
+    0x99, 0xb3, 0x81, 0x28, 0xc7, 0x75, 0xfb, 0xc4,
+    0xcb, 0x4a, 0x15, 0xbf, 0x4f, 0xcf, 0xc4, 0xae,
+};
+#else
 static const uint8_t pcr18_expected[32] = {
     0x48, 0xf9, 0x98, 0x67, 0x42, 0xb8, 0xc2, 0x73,
     0xae, 0x33, 0x8f, 0xf5, 0xb9, 0x1d, 0xbe, 0x73,
     0x6f, 0xea, 0x75, 0x23, 0x52, 0xe1, 0x2e, 0xbc,
     0x56, 0x5f, 0xf6, 0x6f, 0x13, 0xa0, 0x3f, 0xe7,
 };
+#endif
 
 /*
  * Run one TPM command through the TIS FIFO of the locality whose
@@ -1373,7 +1393,7 @@ static void setup_mle(void)
     }
     pdpt[0] = (TEST_MLE_PTAB + 0x1000) | 1;
     pd[0] = (TEST_MLE_PTAB + 0x2000) | 1;
-    for (i = 0; i < (uint32_t)(TEST_MLE_SIZE / 0x1000); i++) {
+    for (i = 0; i < (uint32_t)((TEST_MLE_SIZE + 0xfff) / 0x1000); i++) {
         uint64_t phys = TEST_MLE_BASE + (uint64_t)i * 0x1000;
 
         pt[i] = phys | 1;

@@ -463,7 +463,13 @@ enum {
 #define OS_SINIT_OFF_MLE_PTAB     0x08   /* u64 */
 #define OS_SINIT_OFF_MLE_SIZE     0x10   /* u64 */
 #define OS_SINIT_OFF_MLE_HDR_BASE 0x18   /* u64 */
+#define OS_SINIT_OFF_PMR_LO_BASE  0x20   /* u64 */
+#define OS_SINIT_OFF_PMR_LO_SIZE  0x28   /* u64 */
+#define OS_SINIT_OFF_PMR_HI_BASE  0x30   /* u64 */
+#define OS_SINIT_OFF_PMR_HI_SIZE  0x38   /* u64 */
 #define OS_SINIT_MIN_SIZE         0x20
+#define OS_SINIT_PMR_MIN_SIZE     0x40
+#define TXT_PMR_GRANULARITY      (2 * 1024 * 1024ULL)
 
 /* Offsets within the MLE header (tboot include/mle.h mle_hdr_t) */
 #define MLE_HDR_OFF_UUID          0x00   /* 16 bytes */
@@ -905,9 +911,11 @@ static bool intel_txt_gwrite(uint64_t addr, const void *buf, size_t len,
  * PD and PT are indexed properly so a larger MLE still resolves.
  */
 static bool intel_txt_mle_xlate(uint64_t ptab, uint64_t lin, uint64_t *phys,
+                                uint64_t *pd_phys, uint64_t *pt_phys,
                                 Error **errp)
 {
     uint64_t pdpte, pde, pte;
+    uint64_t pd = 0, pt = 0;
 
     if (!intel_txt_gread_u64(ptab, &pdpte, errp)) {
         return false;
@@ -916,8 +924,9 @@ static bool intel_txt_mle_xlate(uint64_t ptab, uint64_t lin, uint64_t *phys,
         error_setg(errp, "MLE page table: PDPT entry 0 not present");
         return false;
     }
-    if (!intel_txt_gread_u64((pdpte & INTEL_TXT_PTE_ADDR_MASK) +
-                             ((lin >> 21) & 0x1ff) * 8, &pde, errp)) {
+    pd = pdpte & INTEL_TXT_PTE_ADDR_MASK;
+    if (!intel_txt_gread_u64(pd + ((lin >> 21) & 0x1ff) * 8,
+                             &pde, errp)) {
         return false;
     }
     if (!(pde & 1)) {
@@ -925,8 +934,9 @@ static bool intel_txt_mle_xlate(uint64_t ptab, uint64_t lin, uint64_t *phys,
                    PRIx64, lin);
         return false;
     }
-    if (!intel_txt_gread_u64((pde & INTEL_TXT_PTE_ADDR_MASK) +
-                             ((lin >> 12) & 0x1ff) * 8, &pte, errp)) {
+    pt = pde & INTEL_TXT_PTE_ADDR_MASK;
+    if (!intel_txt_gread_u64(pt + ((lin >> 12) & 0x1ff) * 8,
+                             &pte, errp)) {
         return false;
     }
     if (!(pte & 1)) {
@@ -935,6 +945,12 @@ static bool intel_txt_mle_xlate(uint64_t ptab, uint64_t lin, uint64_t *phys,
         return false;
     }
     *phys = (pte & INTEL_TXT_PTE_ADDR_MASK) | (lin & 0xfff);
+    if (pd_phys) {
+        *pd_phys = pd;
+    }
+    if (pt_phys) {
+        *pt_phys = pt;
+    }
     return true;
 }
 
@@ -966,6 +982,90 @@ static bool intel_txt_heap_parse(IntelTxtState *s,
                    ", os_sinit 0x%" PRIx64 ", heap 0x%" PRIx64 ")",
                    *bios_sz, *os_mle_sz, *os_sinit_sz, s->heap_size);
         return false;
+    }
+    return true;
+}
+
+typedef struct IntelTxtPmrs {
+    uint64_t lo_base, lo_size, hi_base, hi_size;
+} IntelTxtPmrs;
+
+static bool intel_txt_pmr_covers(const IntelTxtPmrs *pmr,
+                                 uint64_t phys, uint64_t size)
+{
+    return (phys >= pmr->lo_base && size <= pmr->lo_size &&
+            phys - pmr->lo_base <= pmr->lo_size - size) ||
+           (pmr->hi_size && phys >= pmr->hi_base &&
+            size <= pmr->hi_size &&
+            phys - pmr->hi_base <= pmr->hi_size - size);
+}
+
+/*
+ * Check PMR inputs before any PCR is reset. An uncovered page of the
+ * MLE or its page tables would remain DMA-writable after launch.
+ */
+static bool intel_txt_validate_pmrs(IntelTxtState *s, IntelTxtPmrs *pmr,
+                                    uint64_t *errorcode, Error **errp)
+{
+    uint64_t bios_sz, os_mle_sz, os_sinit_sz, os_sinit;
+    uint64_t ptab, mle_size, phys, pd_phys, pt_phys;
+
+    *errorcode = TXT_ERRORCODE_PMR_INVALID;
+    if (!intel_txt_heap_parse(s, &bios_sz, &os_mle_sz, &os_sinit_sz,
+                              errp)) {
+        return false;
+    }
+    if (os_sinit_sz < sizeof(uint64_t) + OS_SINIT_PMR_MIN_SIZE) {
+        error_setg(errp, "os_sinit_data (0x%" PRIx64 ") at heap 0x%" PRIx64
+                   " too short for VT-d PMRs", os_sinit_sz, s->heap_base);
+        return false;
+    }
+    os_sinit = s->heap_base + bios_sz + os_mle_sz + sizeof(uint64_t);
+    if (!intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_MLE_PTAB,
+                             &ptab, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_MLE_SIZE,
+                             &mle_size, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_PMR_LO_BASE,
+                             &pmr->lo_base, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_PMR_LO_SIZE,
+                             &pmr->lo_size, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_PMR_HI_BASE,
+                             &pmr->hi_base, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_PMR_HI_SIZE,
+                             &pmr->hi_size, errp)) {
+        return false;
+    }
+    if (!pmr->lo_size ||
+        ((pmr->lo_base | pmr->lo_size | pmr->hi_base | pmr->hi_size) &
+         (TXT_PMR_GRANULARITY - 1)) ||
+        pmr->lo_base >= INTEL_TXT_GUEST_32BIT_LIMIT ||
+        pmr->lo_size > INTEL_TXT_GUEST_32BIT_LIMIT - pmr->lo_base ||
+        (pmr->hi_size &&
+         (pmr->hi_base < INTEL_TXT_GUEST_32BIT_LIMIT ||
+          pmr->hi_size > UINT64_MAX - pmr->hi_base)) ||
+        (!pmr->hi_size && pmr->hi_base) ||
+        ptab == 0 || (ptab & 0xfff) ||
+        ptab >= INTEL_TXT_GUEST_32BIT_LIMIT ||
+        mle_size == 0 || (mle_size & 0xfff) ||
+        mle_size > INTEL_TXT_MAX_MLE_SIZE ||
+        !intel_txt_pmr_covers(pmr, ptab, 4096)) {
+        error_setg(errp, "invalid VT-d PMR ranges or MLE page tables "
+                   "not protected");
+        return false;
+    }
+    for (uint64_t offset = 0; offset < mle_size; offset += 4096) {
+        if (!intel_txt_mle_xlate(ptab, offset, &phys, &pd_phys,
+                                 &pt_phys, errp)) {
+            *errorcode = TXT_ERRORCODE_MEASURE_FAILED;
+            return false;
+        }
+        if (!intel_txt_pmr_covers(pmr, pd_phys, 4096) ||
+            !intel_txt_pmr_covers(pmr, pt_phys, 4096) ||
+            !intel_txt_pmr_covers(pmr, phys, 4096)) {
+            error_setg(errp, "MLE page or page table at physical 0x%" PRIx64
+                       " is outside VT-d PMR protection", phys);
+            return false;
+        }
     }
     return true;
 }
@@ -1043,7 +1143,7 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
     }
 
     /* The MLE header identifies the image; check its UUID and length. */
-    if (!intel_txt_mle_xlate(ptab, hdr_base, &hdr_phys, errp) ||
+    if (!intel_txt_mle_xlate(ptab, hdr_base, &hdr_phys, NULL, NULL, errp) ||
         !intel_txt_gread(hdr_phys + MLE_HDR_OFF_UUID, uuid, sizeof(uuid),
                          errp) ||
         !intel_txt_gread_u32(hdr_phys + MLE_HDR_OFF_LENGTH, &hdr_len, errp) ||
@@ -1062,7 +1162,7 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
         return -1;
     }
     if (entry_off >= mle_size ||
-        !intel_txt_mle_xlate(ptab, entry_off, &entry_phys, errp)) {
+        !intel_txt_mle_xlate(ptab, entry_off, &entry_phys, NULL, NULL, errp)) {
         if (entry_off >= mle_size) {
             error_setg(errp, "MLE entry offset 0x%x is outside the "
                        "0x%" PRIx64 " byte image", entry_off, mle_size);
@@ -1080,7 +1180,7 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
     for (off = 0; off < mle_size; off += 4096) {
         uint64_t page;
 
-        if (!intel_txt_mle_xlate(ptab, off, &page, errp) ||
+        if (!intel_txt_mle_xlate(ptab, off, &page, NULL, NULL, errp) ||
             !intel_txt_gread(page, mle + off, 4096, errp)) {
             goto out;
         }
@@ -1711,6 +1811,8 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     uint64_t dpr_size, dpr_top, cs_addr, ds_addr;
     uint32_t cs_flags, ds_flags;
     uint8_t *acm = NULL;
+    IntelTxtPmrs pmrs;
+    uint64_t pmr_errorcode;
     CPUState *cpu;
     Error *err = NULL;
     int ret = 0;
@@ -1815,6 +1917,10 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
         goto fail_heap;
     }
 
+    if (!intel_txt_validate_pmrs(s, &pmrs, &pmr_errorcode, &err)) {
+        goto fail_pmr;
+    }
+
     /*
      * Steps a and d, as one hardware-faithful sequence.
      *
@@ -1882,6 +1988,12 @@ fail_sinit_region:
     return false;
 fail_sinit_dpr:
     s->errorcode = TXT_ERRORCODE_SINIT_NOT_IN_DPR;
+    trace_txt_senter_errorcode(s->errorcode);
+    return false;
+fail_pmr:
+    error_report_err(err);
+    g_free(acm);
+    s->errorcode = pmr_errorcode;
     trace_txt_senter_errorcode(s->errorcode);
     return false;
 fail_heap_data:

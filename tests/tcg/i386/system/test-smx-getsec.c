@@ -137,6 +137,7 @@
 #define TXT_ERR_SINIT_REGION_INVALID 0x80010001ULL
 #define TXT_ERR_HEAP_INVALID         0x80030001ULL
 #define TXT_ERR_MEASURE_FAILED       0x80050001ULL
+#define TXT_ERR_PMR_INVALID          0x80080001ULL
 #define TXT_ERR_ACM_INVALID          0x80060001ULL
 
 /*
@@ -1111,8 +1112,8 @@ static void acm_mutate(const struct acm_mutation *m)
  * size word itself (tboot include/txt/heap.h):
  *   [bios_data_size=0x10][8 bytes]
  *   [os_mle_data_size=0x10][8 bytes]
- *   [os_sinit_data_size=0x28][version, flags, mle_ptab, mle_size,
- *                             mle_hdr_base]
+ *   [os_sinit_data_size=0x48][version, flags, mle_ptab, mle_size,
+ *                             mle_hdr_base, low/high PMR base+size]
  */
 static void setup_mle(void)
 {
@@ -1163,14 +1164,15 @@ static void setup_mle(void)
     }
 
     /* Heap sections. */
-    for (i = 0; i < 0x50; i++) {
+    for (i = 0; i < 0x70; i++) {
         heap[i] = 0;
     }
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x00) = 0x10;
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x10) = 0x10;
-    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x20) = 0x28;
-    /* Keep launches rejected after measurement until the final entry test. */
-    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x48) = 0xffff;
+    /* Guest physical heap is read by the SENTER helper between writes. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x20) = 0x48;
+    /* Volatile: keep launches rejected until the final entry test. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x68) = 0xffff;
 
     os_sinit = (volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x28);
     *(volatile uint32_t *)os_sinit = 6;                 /* version */
@@ -1178,6 +1180,10 @@ static void setup_mle(void)
     os_sinit[1] = TEST_MLE_PTAB;                        /* mle_ptab */
     os_sinit[2] = TEST_MLE_SIZE;                        /* mle_size */
     os_sinit[3] = TEST_MLE_HDR_OFF;                     /* mle_hdr_base */
+    os_sinit[4] = 0;                                    /* lo base */
+    os_sinit[5] = 0x1000000;                            /* lo size: 16 MiB */
+    os_sinit[6] = 0;                                    /* empty hi base */
+    os_sinit[7] = 0;                                    /* empty hi size */
 
     ml_printf("smx: MLE image, page table and heap built\n");
 }
@@ -1377,7 +1383,7 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
     uint64_t sts;
     /* volatile: SINIT writes this guest heap outside the C flow. */
     volatile uint8_t *section = (volatile uint8_t *)(uintptr_t)
-        (TEST_HEAP_BASE + 0x48);
+        (TEST_HEAP_BASE + 0x68);
     uint32_t count, off;
 
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
@@ -1611,8 +1617,8 @@ static void setup_mle_entry(void)
         code[1 + i] = stack >> (8 * i);
         code[22 + i] = landing >> (8 * i);
     }
-    /* Let SINIT create the fourth section, as real tboot expects. */
-    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x48) = 0;
+    /* Volatile: SINIT reads the guest heap; create the fourth section. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x68) = 0;
 }
 
 int main(void)
@@ -1807,6 +1813,39 @@ int main(void)
     getsec_senter_size(2 * TEST_SINIT_SIZE);
     if (txt_read64(TXT_OFF_ERRORCODE) != TXT_ERR_ACM_INVALID) {
         fail_msg("SENTER accepts ECX size that disagrees with ACM header", 64);
+    }
+
+    /* Reject a PMR that leaves the MLE DMA-writable before resetting PCRs. */
+    {
+        /* Volatile: SENTER reads guest heap and page-table mutations. */
+        volatile uint64_t *lo_size = (volatile uint64_t *)(uintptr_t)
+            (TEST_HEAP_BASE + 0x28 + 0x28);
+        /* Volatile: SENTER translates the first MLE page after the write. */
+        volatile uint64_t *first_pte = (volatile uint64_t *)(uintptr_t)
+            (TEST_MLE_PTAB + 0x2000);
+        uint8_t before[32], after[32];
+        int read_before = pcr_read(17, before);
+
+        *lo_size = 0x200000; /* MLE is at TEST_MLE_BASE, above 2 MiB. */
+        txt_write64(TXT_OFF_ERRORCODE, 0);
+        getsec_senter();
+        if (txt_read64(TXT_OFF_ERRORCODE) != TXT_ERR_PMR_INVALID ||
+            !read_before || !pcr_read(17, after) || !pcr_is(before, after)) {
+            fail_msg("unprotected MLE was not rejected before DRTM", 64);
+        } else {
+            ml_printf("PASS: PMR excludes MLE: rejected before PCR reset\n");
+        }
+        *lo_size = 0x1000000;
+        *first_pte = 0x1200000 | 1; /* Page tables covered; MLE not. */
+        txt_write64(TXT_OFF_ERRORCODE, 0);
+        getsec_senter();
+        if (txt_read64(TXT_OFF_ERRORCODE) != TXT_ERR_PMR_INVALID ||
+            !pcr_read(17, after) || !pcr_is(before, after)) {
+            fail_msg("unprotected MLE mapping was not rejected", 64);
+        } else {
+            ml_printf("PASS: PMR excludes mapped MLE page: rejected\n");
+        }
+        *first_pte = TEST_MLE_BASE | 1;
     }
 
     /*

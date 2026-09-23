@@ -63,18 +63,6 @@ if 'qemu-system-i386' in emulators
                     '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
       'wrapper': [run_swtpm_test],
     },
-    'test-smx-getsec-smp.c': {
-      'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
-                          '-fno-stack-protector', '-msse'],
-      'qemu_args': ['-machine', 'q35,txt=on',
-                    '-cpu', 'qemu32,smx,sse', '-smp', '2',
-                    '-device', 'intel-iommu',
-                    '-chardev',
-                    'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
-                    '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
-                    '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
-      'wrapper': [run_swtpm_test],
-    },
     'test-smx-getsec.c': {
       'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
                           '-fno-stack-protector', '-msse'],
@@ -91,6 +79,23 @@ if 'qemu-system-i386' in emulators
       'wrapper': [run_swtpm_test],
     },
   }
+
+  # Compile from the same source with a different define. A wrapper .c
+  # that #includes the test is not reliably rebuilt by the TCG cross
+  # compiler's depfile when the included file changes.
+  tests += {'test-smx-getsec.c': {
+    'exe_name': 'test-smx-getsec-smp',
+    'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                        '-fno-stack-protector', '-msse', '-DTEST_TXT_SMP=1'],
+    'qemu_args': ['-machine', 'q35,txt=on',
+                  '-cpu', 'qemu32,smx,sse', '-smp', '2',
+                  '-device', 'intel-iommu',
+                  '-chardev',
+                  'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                  '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                  '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+    'wrapper': [run_swtpm_test],
+  }}
 
   tcg_tests += {
     'i386-softmmu': {

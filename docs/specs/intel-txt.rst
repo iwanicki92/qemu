@@ -196,6 +196,8 @@ TYPE_CODE = 1 (SINIT ACM); the reason is the PROGRESS_CODE):
   +-------------+------------------------+----------------------------------------------------------------+
   | 0x80070001  | APS_UNSUPPORTED        | An AP was not halted or could not enter TXT sleep              |
   +-------------+------------------------+----------------------------------------------------------------+
+  | 0x80080001  | PMR_INVALID            | VT-d PMR fields invalid, or an MLE page not protected          |
+  +-------------+------------------------+----------------------------------------------------------------+
 
 TXT private config space
 ========================
@@ -469,6 +471,13 @@ return without a machine reset (a QEMU semantic deviation):
    physical address below 4 GiB. The fourth size-prefixed section
    (sinit_mle_data) is created when its prefix is zero and must fit
    the heap together with its GOOD memory descriptors.
+5. PMR input validation (before any PCR reset): low/high base and size
+   must be 2 MiB aligned, non-overflowing and placed in their proper
+   32-bit/64-bit address ranges. The nonempty low window must cover
+   the MLE page tables and every physical page mapped by ``mle_ptab``
+   for the MLE. An uncovered page records ``PMR_INVALID`` (0x80080001).
+   An invalid MLE page-table entry records ``MEASURE_FAILED`` instead.
+   **This validates guest inputs only; it does not block DMA.**
 
 SINIT-equivalent sequence (unimplemented portions noted):
 
@@ -508,14 +517,13 @@ e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
 f. The MLE writes ``TXT.MLE_JOIN`` in private MMIO after SENTER;
    GETSEC[WAKEUP] validates that block and its GDT before joining
    every sleeping AP. It is a no-op on a single-vCPU machine.
-g. VT-d PMR-equivalent protection on the MLE range remains deferred.
-   The MLE supplies ``vtd_pmr_lo_base``/``size`` and the ``hi``
-   pair in os_sinit_data (tboot's ``set_vtd_pmrs()``), and real SINIT
-   both validates them and programs the VT-d Protected Memory
-   Registers so the range is genuinely DMA protected.  QEMU reads
-   neither and programs nothing.  The practical consequence is that
-   the DMAR copy in step e, which Linux trusts *because* the TXT heap
-   is supposed to be DMA protected, is not actually protected here.
+g. Programming and enforcing VT-d PMRs remains deferred. QEMU now
+   validates the ``os_sinit_data`` low/high PMR inputs before measuring,
+   but does **not** program the VT-d PMR registers or deny device DMA
+   into those windows. TXT heap protection (including the copied DMAR)
+   is provided by the separate DPR on hardware, not by the PMRs; QEMU
+   currently does not enforce DPR against DMA either. The measured
+   DMAR copy must therefore not be treated as hardware-protected.
 h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).
@@ -689,7 +697,8 @@ Deviations from real hardware
 2. SINIT executes as QEMU helper code, not from authenticated RAM;
    no GETSEC[ENTERACCS]/AC-mode. FIT, BootGuard and CBnT features
    are out of scope.
-3. VT-d PMR/SMM-monitor (MSEG/STM) enforcement is functional only.
+3. VT-d PMR inputs are validated, but VT-d PMR and DPR DMA exclusion
+   are not enforced. SMM-monitor (MSEG/STM) is not implemented.
 4. Private config space is largely a facade (see above).
 5. Only one TXT generation is modeled; the register map is the
    intersection documented above (FSB-era offsets + modern

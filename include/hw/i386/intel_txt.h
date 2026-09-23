@@ -122,6 +122,10 @@
 #define TXT_ERRORCODE_APS_UNSUPPORTED \
     (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
      TXT_ERRORCODE_PROGRESS_CODE(0x07))
+/* os_sinit_data VT-d PMRs do not cover the measured MLE. */
+#define TXT_ERRORCODE_PMR_INVALID \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x08))
 /*
  * SENTER precondition: the region TXT.SINIT_BASE/SIZE points at does
  * not describe a SINIT ACM for this chipset -- bad ACM header,

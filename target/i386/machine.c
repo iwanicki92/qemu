@@ -1804,6 +1804,24 @@ static const VMStateDescription vmstate_apx = {
 };
 #endif
 
+static bool txt_ap_sleep_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+
+    return cpu->txt_state != NULL;
+}
+
+static const VMStateDescription vmstate_txt_ap_sleep = {
+    .name = "cpu/txt-ap-sleep",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = txt_ap_sleep_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.txt_ap_parked, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_x86_cpu = {
     .name = "cpu",
     .version_id = 12,
@@ -1899,6 +1917,7 @@ const VMStateDescription vmstate_x86_cpu = {
         /* The above list is not sorted /wrt version numbers, watch out! */
     },
     .subsections = (const VMStateDescription * const []) {
+        &vmstate_txt_ap_sleep,
         &vmstate_exception_info,
         &vmstate_error_code,
         &vmstate_async_pf_msr,

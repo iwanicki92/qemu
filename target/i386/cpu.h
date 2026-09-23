@@ -2140,6 +2140,9 @@ typedef struct CPUArchState {
     uint64_t amd_tsc_scale_msr;
     uint64_t virt_ssbd;
 
+    /* TXT sleep persists across INIT; WAKEUP or machine reset releases it. */
+    bool txt_ap_parked;
+
     /* End of state preserved by INIT (dummy marker).  */
     struct {} end_init_save;
 

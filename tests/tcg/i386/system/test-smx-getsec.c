@@ -96,10 +96,12 @@
  * accessed with aligned quadword moves.
  */
 #define TXT_PUBLIC_BASE        0xFED30000U
+#define TXT_PRIVATE_BASE       0xFED20000U
 #define TXT_OFF_STS            0x000
 #define TXT_OFF_ERRORCODE      0x030
 #define TXT_OFF_SINIT_BASE     0x270
 #define TXT_OFF_SINIT_SIZE     0x278
+#define TXT_OFF_MLE_JOIN       0x290
 #define TXT_OFF_HEAP_BASE      0x300
 #define TXT_OFF_HEAP_SIZE      0x308
 #define TXT_OFF_DPR            0x330
@@ -1350,6 +1352,20 @@ static uint64_t guest_le(volatile uint8_t *p, unsigned int bytes)
     return value;
 }
 
+#ifdef TEST_TXT_SMP
+/* Volatile: AP writes this word concurrently with the BSP's spin wait. */
+static volatile uint32_t ap_joined;
+
+/* The AP has no stack on entry. Use no C prologue and a private stack. */
+static void __attribute__((naked, noreturn, used)) ap_landing(void)
+{
+    asm volatile("movl $0xe5f000, %%esp\n"
+                 "movl $1, ap_joined\n"
+                 "1: hlt\n"
+                 "jmp 1b\n" : : : "memory");
+}
+#endif
+
 static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
 {
     struct {
@@ -1440,9 +1456,59 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         }
     }
 
-    /* Post-launch SMCTRL and single-vCPU WAKEUP must not #UD. */
+    /*
+     * SMCTRL releases SMIs. The SMP variant provides a valid RLP
+     * join block, then verifies that its own AP landing code ran.
+     */
     asm volatile(".byte 0x0f, 0x37" : : "a"(7), "b"(0) : "memory");
+#ifdef TEST_TXT_SMP
+    {
+        /* Volatile: WAKEUP reads this stack block through guest RAM. */
+        volatile uint32_t join[4];
+        unsigned retries = 10000000;
+
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
+        if (gp_count != 1 || gp_err != 0 || ap_joined) {
+            fail_msg("WAKEUP without MLE_JOIN did not #GP safely", 16384);
+        }
+        join[0] = 7; /* too small to contain CS and DS */
+        join[1] = TEST_SINIT_BASE + ACM_GDT_OFF;
+        join[2] = ACM_SEG_SEL;
+        join[3] = (uint32_t)(uintptr_t)ap_landing;
+        /* Volatile: this is a guest MMIO register, not ordinary RAM. */
+        *(volatile uint32_t *)(TXT_PRIVATE_BASE + TXT_OFF_MLE_JOIN) =
+            (uint32_t)(uintptr_t)join;
+        gp_count = 0;
+        asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
+        if (gp_count != 1 || gp_err != 0 || ap_joined) {
+            fail_msg("WAKEUP with bad GDT partially released AP", 16384);
+        }
+        gp_count = 0;
+        asm volatile(".byte 0x0f, 0x37" : : "a"(5) : "memory");
+        if (gp_count != 1 || gp_err != 0 ||
+            !(txt_read64(TXT_OFF_STS) & TXT_STS_SENTER_DONE)) {
+            fail_msg("SEXIT abandoned a sleeping AP", 16384);
+        }
+        join[0] = ACM_GDT_LIMIT;
+        gp_count = 0;
+        asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
+        if (gp_count != 0) {
+            fail_msg("WAKEUP with valid GDT raised #GP", 16384);
+        }
+        while (!ap_joined && retries--) {
+            asm volatile("pause" : : : "memory");
+        }
+        if (!ap_joined) {
+            fail_msg("GETSEC[WAKEUP] did not release parked AP", 16384);
+        } else {
+            ml_printf("PASS: RLP joined MLE through TXT.MLE_JOIN\n");
+        }
+    }
+#else
     asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
+#endif
 
     /*
      * Finally leave the measured environment, the way an MLE does at

@@ -115,6 +115,14 @@ static void txt_test_private_space(void)
     txt_write(TXT_HEAP_BASE, 0);
     txt_private_write(TXT_HEAP_BASE, 0xdead0000);
     g_assert_cmpuint(txt_read(TXT_HEAP_BASE), ==, 0);
+
+    /*
+     * MLE_JOIN is the one post-launch MLE-writable private register.
+     * Before SENTER, even that private write must be ignored.
+     */
+    g_assert_cmphex(txt_private_read(TXT_MLE_JOIN), ==, 0);
+    txt_private_write(TXT_MLE_JOIN, 0x2000);
+    g_assert_cmphex(txt_private_read(TXT_MLE_JOIN), ==, 0);
 }
 
 static void txt_test_locality(void)

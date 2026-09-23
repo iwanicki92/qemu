@@ -1,10 +1,9 @@
 /*
  * QEMU Intel TXT (Trusted Execution Technology)
  *
- * GETSEC (SMX) instruction emulation: static leaves and single-vCPU
- * semantic SENTER (see hw/i386/intel_txt.c). SEXIT, single-vCPU
- * WAKEUP and post-launch SMCTRL are accepted; ENTERACCS/EXITAC are
- * deferred.
+ * GETSEC (SMX) instruction emulation: static leaves, semantic SENTER,
+ * AP rendezvous and WAKEUP (see hw/i386/intel_txt.c). SEXIT and
+ * post-launch SMCTRL are accepted; ENTERACCS/EXITAC are deferred.
  *
  * Copyright (c) 2026 Michał Kopeć <michal@nozomi.space>
  *
@@ -21,6 +20,7 @@
 #include "helper-tcg.h"
 #include "hw/i386/intel_txt.h"
 #include "qemu/bitops.h"
+#include "qemu/main-loop.h"
 #include "trace.h"
 
 /*
@@ -77,6 +77,100 @@ static void getsec_load_mle_seg(CPUX86State *env, int reg, uint32_t selector,
         limit = (limit << 12) | 0xfff;
     }
     cpu_x86_load_seg_cache(env, reg, selector, base, limit, e2);
+}
+#endif
+
+#if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TPM)
+/* run_on_cpu() executes these callbacks on the RLP itself under the BQL. */
+static void getsec_park_rlp(CPUState *cs, run_on_cpu_data data)
+{
+    bool *ready = data.host_ptr;
+
+    *ready = cs->halted && !cpu_env(cs)->txt_ap_parked;
+    if (*ready) {
+        cpu_env(cs)->txt_ap_parked = true;
+        trace_getsec_ap_parked(cs->cpu_index);
+    }
+}
+
+static void getsec_unpark_rlp(CPUState *cs, run_on_cpu_data data)
+{
+    cpu_env(cs)->txt_ap_parked = false;
+}
+
+static bool getsec_park_aps(void)
+{
+    g_autoptr(GPtrArray) parked = g_ptr_array_new();
+    CPUState *cs;
+    bool ready;
+
+    bql_lock();
+    CPU_FOREACH(cs) {
+        if (cs == current_cpu) {
+            continue;
+        }
+        ready = false;
+        run_on_cpu(cs, getsec_park_rlp, RUN_ON_CPU_HOST_PTR(&ready));
+        if (!ready) {
+            /*
+             * Restore only APs parked by THIS attempt, not an AP
+             * left sleeping from an earlier successful launch.
+             */
+            for (size_t i = 0; i < parked->len; i++) {
+                run_on_cpu(g_ptr_array_index(parked, i), getsec_unpark_rlp,
+                           RUN_ON_CPU_NULL);
+            }
+            bql_unlock();
+            return false;
+        }
+        g_ptr_array_add(parked, cs);
+    }
+    bql_unlock();
+    return true;
+}
+
+static void getsec_unpark_aps(void)
+{
+    CPUState *cs;
+
+    bql_lock();
+    CPU_FOREACH(cs) {
+        if (cs != current_cpu && cpu_env(cs)->txt_ap_parked) {
+            run_on_cpu(cs, getsec_unpark_rlp, RUN_ON_CPU_NULL);
+        }
+    }
+    bql_unlock();
+}
+
+static void getsec_join_rlp(CPUState *cs, run_on_cpu_data data)
+{
+    const IntelTxtRlpEntry *rlp = data.host_ptr;
+    CPUX86State *env = cpu_env(cs);
+
+    g_assert(env->txt_ap_parked && cs->halted);
+    cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) &
+                            ~(CR0_PG_MASK | CR0_AM_MASK | CR0_WP_MASK));
+    cpu_x86_update_cr4(env, CR4_SMXE_MASK);
+#ifdef TARGET_X86_64
+    env->efer &= ~(MSR_EFER_LME | MSR_EFER_LMA);
+    env->hflags &= ~(HF_LMA_MASK | HF_CS64_MASK);
+#endif
+    env->gdt.base = rlp->gdt_base;
+    env->gdt.limit = rlp->gdt_limit;
+    getsec_load_mle_seg(env, R_CS, rlp->seg_sel, rlp->cs_desc);
+    getsec_load_mle_seg(env, R_DS, rlp->seg_sel + 8, rlp->ds_desc);
+    getsec_load_mle_seg(env, R_ES, rlp->seg_sel + 8, rlp->ds_desc);
+    getsec_load_mle_seg(env, R_SS, rlp->seg_sel + 8, rlp->ds_desc);
+    cpu_x86_load_seg_cache(env, R_FS, 0, 0, 0, 0);
+    cpu_x86_load_seg_cache(env, R_GS, 0, 0, 0, 0);
+    cpu_load_eflags(env, 0x2, ~0u);
+    env->eip = rlp->entry_point;
+    cs->exception_index = -1;
+    /* INIT/SIPI pending during TXT sleep are not processed on WAKEUP. */
+    cpu_reset_interrupt(cs, CPU_INTERRUPT_INIT | CPU_INTERRUPT_SIPI);
+    env->txt_ap_parked = false;
+    cs->halted = 0;
+    trace_getsec_ap_joined(cs->cpu_index, rlp->entry_point);
 }
 #endif
 
@@ -165,9 +259,15 @@ void helper_getsec(CPUX86State *env)
             IntelTxtMleEntry entry;
 
             trace_getsec_senter();
+            if (!getsec_park_aps()) {
+                intel_txt_reject_aps(env_archcpu(env)->txt_state);
+                break;
+            }
             if (!intel_txt_senter(env_archcpu(env)->txt_state,
                                   (uint32_t)env->regs[R_EBX],
                                   (uint32_t)env->regs[R_ECX], &entry)) {
+                /* A TPM or heap failure must not strand sleeping APs. */
+                getsec_unpark_aps();
                 break;
             }
             /*
@@ -225,23 +325,47 @@ void helper_getsec(CPUX86State *env)
             raise_exception_ra(env, EXCP0D_GPF, GETPC());
         }
         break;
-    case GETSEC_LEAF_WAKEUP:
+    case GETSEC_LEAF_WAKEUP: {
+        IntelTxtRlpEntry rlp;
+        CPUState *cs;
+
         if (!env_archcpu(env)->txt_state ||
-            !intel_txt_wakeup(env_archcpu(env)->txt_state)) {
+            !intel_txt_wakeup(env_archcpu(env)->txt_state, &rlp)) {
             raise_exception_ra(env, EXCP0D_GPF, GETPC());
+            break;
         }
+        bql_lock();
+        CPU_FOREACH(cs) {
+            if (cs != current_cpu && cpu_env(cs)->txt_ap_parked) {
+                run_on_cpu(cs, getsec_join_rlp, RUN_ON_CPU_HOST_PTR(&rlp));
+            }
+        }
+        bql_unlock();
         break;
-    case GETSEC_LEAF_SEXIT:
+    }
+    case GETSEC_LEAF_SEXIT: {
+        CPUState *cs;
+        bool sleeping = false;
+
+        /* SEXIT before WAKEUP would abandon RLPs in TXT sleep. */
+        bql_lock();
+        CPU_FOREACH(cs) {
+            if (cs != current_cpu && cpu_env(cs)->txt_ap_parked) {
+                sleeping = true;
+                break;
+            }
+        }
+        bql_unlock();
         /*
-         * Leaves the measured environment and *returns* to the
-         * instruction after GETSEC; the MLE prints its teardown
-         * message there.  No cpu_loop_exit(), no machine reset.
+         * Leaves the measured environment and returns to the next
+         * instruction. Never drop it with RLPs still asleep.
          */
-        if (!env_archcpu(env)->txt_state ||
+        if (sleeping || !env_archcpu(env)->txt_state ||
             !intel_txt_sexit(env_archcpu(env)->txt_state)) {
             raise_exception_ra(env, EXCP0D_GPF, GETPC());
         }
         break;
+    }
 #endif
 #endif /* !CONFIG_USER_ONLY */
     default:

@@ -52,6 +52,29 @@ if 'qemu-system-i386' in emulators
   # QEMU.
   run_swtpm_test = find_program('run-swtpm-test.sh')
   tests += {
+    'test-smx-busy-ap.c': {
+      'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                          '-fno-stack-protector'],
+      'qemu_args': ['-machine', 'q35,txt=on',
+                    '-cpu', 'qemu32,smx,sse', '-smp', '2',
+                    '-chardev',
+                    'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                    '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                    '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+      'wrapper': [run_swtpm_test],
+    },
+    'test-smx-getsec-smp.c': {
+      'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                          '-fno-stack-protector', '-msse'],
+      'qemu_args': ['-machine', 'q35,txt=on',
+                    '-cpu', 'qemu32,smx,sse', '-smp', '2',
+                    '-device', 'intel-iommu',
+                    '-chardev',
+                    'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                    '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                    '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+      'wrapper': [run_swtpm_test],
+    },
     'test-smx-getsec.c': {
       'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
                           '-fno-stack-protector', '-msse'],

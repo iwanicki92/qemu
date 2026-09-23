@@ -198,12 +198,20 @@ typedef struct IntelTxtMleEntry {
  */
 bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
                       uint32_t acm_size, IntelTxtMleEntry *entry);
+/* Record a rejected launch when an RLP cannot be parked safely. */
+void intel_txt_reject_aps(IntelTxtState *s);
 /* Post-launch SMCTRL; SMI masking is not modeled. */
 bool intel_txt_smctrl(IntelTxtState *s, uint32_t control);
 /* Leave the measured environment; not a platform reset. */
 bool intel_txt_sexit(IntelTxtState *s);
-/* WAKEUP has no AP work in the supported single-vCPU launch. */
-bool intel_txt_wakeup(IntelTxtState *s);
+/* Validated RLP entry state from the physical TXT.MLE_JOIN block. */
+typedef struct IntelTxtRlpEntry {
+    uint32_t entry_point, seg_sel, gdt_base, gdt_limit;
+    uint64_t cs_desc, ds_desc;
+} IntelTxtRlpEntry;
+
+/* No AP is released if this validation fails. */
+bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp);
 #endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

@@ -194,7 +194,7 @@ TYPE_CODE = 1 (SINIT ACM); the reason is the PROGRESS_CODE):
   |             |                        | header, malformed or out-of-bounds info table, or a chipset    |
   |             |                        | id list that does not cover TXT.DIDVID.                        |
   +-------------+------------------------+----------------------------------------------------------------+
-  | 0x80070001  | APS_UNSUPPORTED        | Multiple vCPUs: AP sleep/wakeup is not implemented yet         |
+  | 0x80070001  | APS_UNSUPPORTED        | An AP was not halted or could not enter TXT sleep              |
   +-------------+------------------------+----------------------------------------------------------------+
 
 TXT private config space
@@ -207,8 +207,8 @@ its function; the device implements:
 
 - reads returning the same register set as public space (some
   loaders poke private registers during bring-up debugging),
-- writes ignored unless a launch is in progress (or always ignored,
-  in semantic mode),
+- writes ignored except ``TXT.MLE_JOIN`` when ``STS.SENTER_DONE`` and
+  ``STS.PRIVATE_OPEN`` are both set (the MLE publishes its AP entry),
 - ``TXT.CMD_CLOSE_PRIVATE`` closes it.
 
 DPR — DMA Protected Range
@@ -288,8 +288,11 @@ GETSEC[SEXIT] (EAX=5)
   environment.
 
 GETSEC[WAKEUP] (EAX=8)
-  Accepted only after SENTER on a single-vCPU machine (no AP to wake).
-  Real RLP sleep, MLE_JOIN consumption and AP wakeup are not implemented.
+  After SENTER, validates the four-word ``TXT.MLE_JOIN`` block and
+  its 32-bit flat ring-0 CS/data descriptors before releasing any
+  sleeping RLP. Each AP resumes at the MLE's physical entry on its
+  own vCPU thread. An invalid join block raises #GP without waking
+  any AP. With one vCPU there is nothing to wake.
 
 GETSEC[EXITAC] (EAX=3, EBX=near jump target)
   Not needed for the semantic flow (no AC mode is entered); returns
@@ -387,18 +390,23 @@ MLE's own decision (in tboot, the ``ap_wake_mwait`` command-line
 option).  The distinction matters to this emulation because the two
 parking strategies have very different requirements:
 
-- MONITOR/MWAIT AP parking needs monitored-address wake semantics,
-  which TCG does not model. It is not the selected tboot path.
+- With tboot ``ap_wake_mwait=true``, joined APs use MONITOR/MWAIT
+  while waiting for Linux to start them. TCG's MONITOR ignores the
+  address and its SMP MWAIT yields via ``helper_pause()``, so tboot's
+  loop polls its wake flag rather than waking on a memory write. This
+  is a functional bring-up path, **not** faithful MWAIT semantics;
+  guests expecting a real monitored-address wake are unsupported.
 - Parking APs in a VMX mini-guest (tboot's default) executes VMXON,
   VMPTRLD, a long run of VMWRITEs and VMLAUNCH, and relies on
   intercepting INIT/SIPI. **QEMU TCG implements no VMX instructions**.
 
-The bring-up target is instead **one vCPU** with tboot's default VMX
-path: tboot checks the CPUID and feature-control bits but does not run
-its AP VMX code when there are no APs. Use the explicit
-``txt-vmx-compat=on`` setting for that capability check only. SENTER
-rejects more than one vCPU before measuring anything; AP sleep/wakeup
-are still unimplemented (single-vCPU WAKEUP is a post-launch no-op).
+The original single-vCPU path uses tboot's default VMX option, with
+``txt-vmx-compat=on`` for its capability check only. The SMP path uses
+``ap_wake_mwait=true`` and a CPU exposing ``monitor``; it does **not**
+advertise VMX instructions TCG cannot execute. SENTER requires every
+AP to be halted, rendezvouses with each vCPU and parks it before PCR
+measurement. Failed launches release the APs parked by that attempt.
+GETSEC[WAKEUP] transfers them to the validated join entry.
 
 Semantic measured launch (GETSEC[SENTER])
 =========================================
@@ -497,8 +505,9 @@ e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
    Without it such a guest panics with "tboot: Failed to initialize
    DMAR table".  A guest with no intel-iommu has no DMAR and the
    fields stay zero.  The remaining hash/policy fields remain zero.
-f. ``TXT.MLE_JOIN`` is written by the MLE; the single-vCPU
-   GETSEC[WAKEUP] is a no-op. AP wakeup remains unimplemented.
+f. The MLE writes ``TXT.MLE_JOIN`` in private MMIO after SENTER;
+   GETSEC[WAKEUP] validates that block and its GDT before joining
+   every sleeping AP. It is a no-op on a single-vCPU machine.
 g. VT-d PMR-equivalent protection on the MLE range remains deferred.
    The MLE supplies ``vtd_pmr_lo_base``/``size`` and the ``hi``
    pair in os_sinit_data (tboot's ``set_vtd_pmrs()``), and real SINIT
@@ -510,9 +519,9 @@ g. VT-d PMR-equivalent protection on the MLE range remains deferred.
 h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).
-i. Transfer BSP control to the MLE entry point (see below). Until
-   AP sleep state and GETSEC[WAKEUP] exist, reject multi-vCPU launches
-   before changing PCRs; APs are **not** silently left running.
+i. Transfer BSP control to the MLE entry point (see below). APs were
+   halted and put into TXT sleep before measurement; a running AP
+   rejects the launch rather than executing outside the MLE.
 
 Private space is opened at step b and is *not* closed by SENTER.  An
 earlier revision of this document had step h close it, which no MLE
@@ -525,13 +534,12 @@ from its own teardown path via ``CMD_CLOSE_PRIVATE``
 open from reset, stays open across SENTER for the MLE's use, and is
 closed by the MLE or by a TXT reset.
 
-Current implementation: for a single vCPU, SENTER checks the launch
-inputs, measures the SINIT ACM and MLE, writes the SINIT-MLE heap section,
-sets the SENTER_DONE / MEM_CONFIG_LOCK / PRIVATE_OPEN status bits, and
-transfers BSP execution to the physical MLE entry with paging off.
-Multiple vCPUs are rejected *before measurement*: until AP sleep and
-real GETSEC[WAKEUP] are implemented, allowing an AP to continue running
-outside the measured environment would violate the DRTM boundary.
+Current implementation: SENTER parks each halted AP on its own thread,
+checks the launch inputs, measures the SINIT ACM and MLE, writes the
+SINIT-MLE heap section, sets the SENTER_DONE / MEM_CONFIG_LOCK /
+PRIVATE_OPEN status bits, and transfers BSP execution to the physical
+MLE entry with paging off. An AP that is still executing causes a
+pre-measure rejection; a failed launch rolls back the newly parked APs.
 The SINIT measurement uses the TIS ``_TPM_Hash_Start`` /
 ``_TPM_Hash_Data`` / ``_TPM_Hash_End`` signal sequence at locality 4.
 ``_TPM_Hash_Start`` resets the DRTM PCRs and ``_TPM_Hash_End`` extends
@@ -666,7 +674,8 @@ Machine/device wiring
 - MCH (q35): DPR config register + TXT-capable DIDVID reporting.
 - CPU: ``smx`` CPUID bit default-enabled on the TXT machine; GETSEC
   decode in ``target/i386/tcg``; chipset SENTER_DONE state gates
-  the implemented single-vCPU WAKEUP and SMCTRL requests.
+  WAKEUP and SMCTRL requests. A TXT-sleep CPU flag has its own
+  migration subsection and machine reset clears it.
 - Migration: blocked while a launch sequence is in progress
   (measured-environment flag set, SENTER not completed); VMState
   otherwise covers all registers.
@@ -689,11 +698,11 @@ Deviations from real hardware
    differ from what a real SINIT would extend (exact per-generation
    digest lists, e.g. for PCR17, are normalized to the MLE guide's
    documented sequence).
-7. SENTER transfers a single BSP to the MLE after the partial DRTM
-   measurement. Multiple vCPUs are rejected before measurement until
-   AP parking and real GETSEC[WAKEUP] are implemented. The PCR 17 composite
-   and VT-d enforcement remain incomplete: a successful transfer
-   does not imply production-grade TXT attestation.
+7. SMP APs must already be halted at SENTER. GETSEC[WAKEUP] joins
+   them to the MLE, but the tboot MWAIT path uses polling rather than
+   memory-write-triggered wake; VMX AP parking is unsupported. The
+   PCR 17 composite and VT-d enforcement remain incomplete: a
+   successful transfer does not imply production-grade TXT attestation.
 8. SENTER takes the SINIT base/size from the pre-programmed
    TXT.SINIT_BASE/SIZE registers; it does not latch the
    GETSEC[SENTER] EBX/ECX operands into them (on HW the chipset

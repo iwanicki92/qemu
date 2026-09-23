@@ -10606,6 +10606,14 @@ int x86_cpu_pending_interrupt(const CPUState *cs, int interrupt_request)
 {
     const CPUX86State *env = cpu_env(cs);
 
+    /*
+     * TXT RLP sleep is not an ordinary HLT: INIT, SIPI and interrupts
+     * cannot release it. CPU_INTERRUPT_RESET is handled by the TCG core
+     * separately, but a sleeping, halted CPU has no work here.
+     */
+    if (env->txt_ap_parked) {
+        return 0;
+    }
     if (interrupt_request & CPU_INTERRUPT_POLL) {
         return CPU_INTERRUPT_POLL;
     }

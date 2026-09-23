@@ -27,6 +27,7 @@
 #include "qemu/main-loop.h"
 #include "system/runstate.h"
 #include "system/tpm_util.h"
+#include "target/i386/cpu.h"
 #include "trace.h"
 
 #ifdef CONFIG_TPM
@@ -313,13 +314,21 @@ static uint64_t intel_txt_private_read(void *opaque, hwaddr addr,
 static void intel_txt_private_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned size)
 {
+    IntelTxtState *s = INTEL_TXT(opaque);
+
     /*
-     * The private space is writable only by the SINIT ACM on real
-     * hardware.  In the semantic model nothing runs inside it, so
-     * all writes are ignored (see docs/specs/intel-txt.rst,
-     * "TXT private config space").
+     * The MLE publishes the RLP join block here after SENTER, while
+     * private space is open.  Other private registers are reserved for
+     * SINIT (which the semantic launch models without ACM execution).
      */
-    trace_txt_reg_write_ignored("private", addr, val);
+    if ((addr & ~7) == TXT_MLE_JOIN &&
+        (s->sts & (TXT_STS_SENTER_DONE | TXT_STS_PRIVATE_OPEN)) ==
+        (TXT_STS_SENTER_DONE | TXT_STS_PRIVATE_OPEN)) {
+        trace_txt_reg_write("private", addr, val);
+        intel_txt_reg_write(s, addr, val, size);
+    } else {
+        trace_txt_reg_write_ignored("private", addr, val);
+    }
 }
 
 static const MemoryRegionOps intel_txt_public_ops = {
@@ -1690,6 +1699,12 @@ static int intel_txt_validate_acm(IntelTxtState *s, const uint8_t *acm,
     return 0;
 }
 
+void intel_txt_reject_aps(IntelTxtState *s)
+{
+    s->errorcode = TXT_ERRORCODE_APS_UNSUPPORTED;
+    trace_txt_senter_errorcode(s->errorcode);
+}
+
 bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
                       uint32_t acm_size, IntelTxtMleEntry *entry)
 {
@@ -1703,15 +1718,12 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     trace_txt_senter();
 
     /*
-     * GETSEC[WAKEUP] is not implemented yet.  Never claim a measured
-     * launch while another vCPU can keep executing outside the MLE.
-     * Reject before resetting any PCR, rather than leaving live APs
-     * outside the DRTM boundary.
+     * The CPU helper rendezvouses and parks each RLP on its own thread
+     * before entering here; refuse to measure with any unparked AP.
      */
     CPU_FOREACH(cpu) {
-        if (cpu != current_cpu) {
-            s->errorcode = TXT_ERRORCODE_APS_UNSUPPORTED;
-            trace_txt_senter_errorcode(s->errorcode);
+        if (cpu != current_cpu && !cpu_env(cpu)->txt_ap_parked) {
+            intel_txt_reject_aps(s);
             return false;
         }
     }
@@ -1946,19 +1958,64 @@ bool intel_txt_sexit(IntelTxtState *s)
     return true;
 }
 
-bool intel_txt_wakeup(IntelTxtState *s)
+static bool intel_txt_join_desc(uint32_t base, uint32_t limit,
+                                uint32_t selector, uint64_t *desc)
 {
-    CPUState *cpu;
+    uint32_t offset = selector & ~7u;
 
-    if (!(s->sts & TXT_STS_SENTER_DONE)) {
+    if (selector & 4 || offset == 0 || offset + 7 > limit) {
         return false;
     }
-    CPU_FOREACH(cpu) {
-        if (cpu != current_cpu) {
-            /* An AP must never be advertised as woken without parking. */
-            return false;
-        }
+    return intel_txt_gread_u64((uint64_t)base + offset, desc, NULL);
+}
+
+bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp)
+{
+    uint64_t addr = s->mle_join;
+    uint32_t cs_flags, ds_flags;
+
+    if (!(s->sts & TXT_STS_SENTER_DONE) || !addr || (addr & 3) ||
+        addr > INTEL_TXT_GUEST_32BIT_LIMIT - 16) {
+        trace_txt_wakeup_rejected("unlaunched or invalid MLE_JOIN pointer");
+        return false;
     }
+    /* mle_join_t is four little-endian u32s in tboot config_regs.h. */
+    if (!intel_txt_gread_u32(addr, &rlp->gdt_limit, NULL) ||
+        !intel_txt_gread_u32(addr + 4, &rlp->gdt_base, NULL) ||
+        !intel_txt_gread_u32(addr + 8, &rlp->seg_sel, NULL) ||
+        !intel_txt_gread_u32(addr + 12, &rlp->entry_point, NULL)) {
+        trace_txt_wakeup_rejected("unreadable MLE_JOIN");
+        return false;
+    }
+    if (rlp->gdt_limit < 23 || rlp->gdt_limit > UINT16_MAX ||
+        !rlp->gdt_base ||
+        (uint64_t)rlp->gdt_base + rlp->gdt_limit >=
+            INTEL_TXT_GUEST_32BIT_LIMIT ||
+        !rlp->entry_point || rlp->seg_sel > UINT16_MAX - 8 ||
+        !intel_txt_join_desc(rlp->gdt_base, rlp->gdt_limit,
+                             rlp->seg_sel, &rlp->cs_desc) ||
+        !intel_txt_join_desc(rlp->gdt_base, rlp->gdt_limit,
+                             rlp->seg_sel + 8, &rlp->ds_desc)) {
+        trace_txt_wakeup_rejected("invalid GDT range, selector or entry");
+        return false;
+    }
+    cs_flags = rlp->cs_desc >> 32;
+    ds_flags = rlp->ds_desc >> 32;
+    /*
+     * Ring-0 present flat 32-bit CS and writable DS; the tboot entry
+     * uses CS-relative addressing before loading its own GDT.
+     */
+    if ((cs_flags & 0x0040f800) != 0x00409800 ||
+        (ds_flags & 0x0040fa00) != 0x00409200 ||
+        (cs_flags & 0x00200000) ||
+        ((rlp->cs_desc >> 16) & 0xffff) != 0 ||
+        (cs_flags & 0xff000000) != 0 ||
+        (cs_flags & 0xff) != 0) {
+        trace_txt_wakeup_rejected("GDT descriptors not flat ring-0 code/data");
+        return false;
+    }
+    trace_txt_wakeup_entry(rlp->entry_point, rlp->seg_sel,
+                           rlp->gdt_base, rlp->gdt_limit);
     return true;
 }
 

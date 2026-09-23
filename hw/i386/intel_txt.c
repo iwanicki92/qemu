@@ -19,12 +19,15 @@
 #include "qemu/osdep.h"
 
 #include "e820_memory_layout.h"
+#include "hw/i386/intel_iommu.h"
 #include "hw/i386/intel_txt.h"
 #include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
+#include "hw/i386/x86-iommu.h"
 #include "migration/vmstate.h"
 #include "qemu/main-loop.h"
+#include "qom/object.h"
 #include "system/runstate.h"
 #include "system/tpm_util.h"
 #include "target/i386/cpu.h"
@@ -1922,6 +1925,38 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     }
 
     /*
+     * Program the VT-d Protected Memory Regions before the DRTM
+     * measurement below, so a programming failure cannot leave PCRs
+     * 17-22 half-measured.  On hardware the chipset programs the PMRs
+     * during SINIT setup; in this model the values are known from
+     * os_sinit_data, so SENTER applies them itself.
+     *
+     * The PMR has to be able to deny DMA on every device path: fail
+     * closed when there is no VT-d device, or when a host device
+     * caches mappings outside the IOMMU (see
+     * intel_iommu_set_txt_pmr()).  Each SENTER starts from a released
+     * PMR so a retry re-programs exactly the validated window.
+     */
+    {
+        X86IOMMUState *x86_iommu = x86_iommu_get_default();
+        Object *iommu = x86_iommu ?
+            object_dynamic_cast(OBJECT(&x86_iommu->busdev),
+                                TYPE_INTEL_IOMMU_DEVICE) : NULL;
+
+        if (!iommu) {
+            error_setg(&err, "no VT-d (intel-iommu) device to protect "
+                                 "the MLE against DMA");
+            goto fail_pmr_program;
+        }
+        intel_iommu_clear_txt_pmr(INTEL_IOMMU_DEVICE(iommu));
+        if (!intel_iommu_set_txt_pmr(INTEL_IOMMU_DEVICE(iommu),
+                                     pmrs.lo_base, pmrs.lo_size,
+                                     pmrs.hi_base, pmrs.hi_size, &err)) {
+            goto fail_pmr_program;
+        }
+    }
+
+    /*
      * Steps a and d, as one hardware-faithful sequence.
      *
      * The DRTM PCRs are established with the TIS _TPM_Hash_Start /
@@ -1996,6 +2031,12 @@ fail_pmr:
     s->errorcode = pmr_errorcode;
     trace_txt_senter_errorcode(s->errorcode);
     return false;
+fail_pmr_program:
+    error_report_err(err);
+    g_free(acm);
+    s->errorcode = TXT_ERRORCODE_PMR_PROGRAM_FAILED;
+    trace_txt_senter_errorcode(s->errorcode);
+    return false;
 fail_heap_data:
     error_report_err(err);
 fail_heap:
@@ -2060,6 +2101,22 @@ bool intel_txt_sexit(IntelTxtState *s)
                 TXT_STS_PRIVATE_OPEN | TXT_STS_LOCALITY1_OPEN |
                 TXT_STS_LOCALITY2_OPEN);
     s->sts |= TXT_STS_SEXIT_DONE;
+
+    /*
+     * Release the VT-d PMR protection along with the measured
+     * environment: the OS takes over with ordinary DMA and its own
+     * VT-d driver (if any).  A later SENTER re-programs the PMRs.
+     */
+    {
+        X86IOMMUState *x86_iommu = x86_iommu_get_default();
+        Object *iommu = x86_iommu ?
+            object_dynamic_cast(OBJECT(&x86_iommu->busdev),
+                                TYPE_INTEL_IOMMU_DEVICE) : NULL;
+
+        if (iommu) {
+            intel_iommu_clear_txt_pmr(INTEL_IOMMU_DEVICE(iommu));
+        }
+    }
 
     /*
      * SINIT_BASE/SIZE, HEAP_BASE/SIZE and DPR deliberately stay

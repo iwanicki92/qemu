@@ -52,6 +52,10 @@
 #define DMAR_AFLOG_REG          0x58 /* Advanced fault control */
 #define DMAR_AFLOG_REG_HI       0X5c
 #define DMAR_PMEN_REG           0x64 /* Enable protected memory region */
+#define VTD_PMEN_EPM            (1U << 31)
+#define VTD_PMEN_PRS            (1U << 0)
+#define VTD_PMR_GRANULARITY     (2 * 1024 * 1024ULL)
+#define VTD_PMR_ADDR_MASK       (~(VTD_PMR_GRANULARITY - 1))
 #define DMAR_PLMBASE_REG        0x68 /* PMRR low addr */
 #define DMAR_PLMLIMIT_REG       0x6c /* PMRR low limit */
 #define DMAR_PHMBASE_REG        0x70 /* PMRR high base addr */
@@ -222,6 +226,8 @@
 #define VTD_CAP_FS1GP               (1ULL << 56)
 #define VTD_CAP_ESRTPS              (1ULL << 63)
 #define VTD_CAP_DRAIN               (VTD_CAP_DRAIN_READ | VTD_CAP_DRAIN_WRITE)
+#define VTD_CAP_PLMR                (1ULL << 5)
+#define VTD_CAP_PHMR                (1ULL << 6)
 #define VTD_CAP_CM                  (1ULL << 7)
 #define VTD_PASID_ID_SHIFT          20
 #define VTD_PASID_ID_MASK           ((1ULL << VTD_PASID_ID_SHIFT) - 1)

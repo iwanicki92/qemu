@@ -69,9 +69,12 @@ if 'qemu-system-i386' in emulators
       # intel-iommu makes the machine publish a DMAR ACPI table, which
       # SENTER must copy into sinit_mle_data for the MLE; the test
       # checks that copy, so the device is load-bearing here.
+      # iommu-testdev provides the DMA engine the PMR denial checks
+      # drive through the IOMMU address space.
       'qemu_args': ['-machine', 'q35,txt=on',
                     '-cpu', 'qemu32,smx,sse',
                     '-device', 'intel-iommu',
+                    '-device', 'iommu-testdev',
                     '-chardev',
                     'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
                     '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
@@ -90,6 +93,7 @@ if 'qemu-system-i386' in emulators
     'qemu_args': ['-machine', 'q35,txt=on',
                   '-cpu', 'qemu32,smx,sse', '-smp', '2',
                   '-device', 'intel-iommu',
+                  '-device', 'iommu-testdev',
                   '-chardev',
                   'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
                   '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',

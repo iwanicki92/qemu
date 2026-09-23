@@ -278,6 +278,7 @@ struct IntelIOMMUState {
     dma_addr_t root;                /* Current root table pointer */
     bool root_scalable;             /* Type of root table (scalable or not) */
     bool dmar_enabled;              /* Set if DMA remapping is enabled */
+    bool pmr_enabled;               /* PMEN.PRS; recomputed from CSR on load */
 
     uint16_t iq_head;               /* Current invalidation queue head */
     uint16_t iq_tail;               /* Current invalidation queue tail */
@@ -330,5 +331,11 @@ struct IntelIOMMUState {
  */
 VTDAddressSpace *vtd_find_add_as(IntelIOMMUState *s, PCIBus *bus,
                                  int devfn, unsigned int pasid);
+
+/* TXT SINIT programs PMRs in host-physical address space, before measuring. */
+bool intel_iommu_set_txt_pmr(IntelIOMMUState *s, uint64_t lo_base,
+                             uint64_t lo_size, uint64_t hi_base,
+                             uint64_t hi_size, Error **errp);
+void intel_iommu_clear_txt_pmr(IntelIOMMUState *s);
 
 #endif

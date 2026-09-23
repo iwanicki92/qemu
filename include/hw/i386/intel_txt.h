@@ -126,6 +126,10 @@
 #define TXT_ERRORCODE_PMR_INVALID \
     (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
      TXT_ERRORCODE_PROGRESS_CODE(0x08))
+/* The VT-d device is missing, or its PMRs could not be programmed. */
+#define TXT_ERRORCODE_PMR_PROGRAM_FAILED \
+    (TXT_ERRORCODE_VALID | TXT_ERRORCODE_TYPE_SINIT | \
+     TXT_ERRORCODE_PROGRESS_CODE(0x09))
 /*
  * SENTER precondition: the region TXT.SINIT_BASE/SIZE points at does
  * not describe a SINIT ACM for this chipset -- bad ACM header,

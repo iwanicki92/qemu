@@ -1701,7 +1701,8 @@ static bool vtd_switch_address_space(VTDAddressSpace *as)
     assert(as);
 
     s = as->iommu_state;
-    use_iommu = s->dmar_enabled && !vtd_as_pt_enabled(as);
+    use_iommu = qatomic_read(&s->pmr_enabled) ||
+                (s->dmar_enabled && !vtd_as_pt_enabled(as));
     pt = s->dmar_enabled && vtd_as_pt_enabled(as);
 
     /*
@@ -1711,7 +1712,8 @@ static bool vtd_switch_address_space(VTDAddressSpace *as)
      * PGTT=PT and used as nesting parent if PGTT=FST. Otherwise fall back
      * to original processing.
      */
-    if (s->root_scalable && s->fsts && vtd_find_hiod_iommufd(as)) {
+    if (!qatomic_read(&s->pmr_enabled) && s->root_scalable && s->fsts &&
+        vtd_find_hiod_iommufd(as)) {
         use_iommu = false;
     }
 
@@ -1790,6 +1792,121 @@ static void vtd_switch_address_space_all(IntelIOMMUState *s)
     while (g_hash_table_iter_next(&iter, NULL, (void **)&vtd_as)) {
         vtd_switch_address_space(vtd_as);
     }
+}
+
+/*
+ * Enable or release the Protected Memory Regions.  The PMR must also
+ * intercept passthrough DMA when DMA remapping is off, because a
+ * device without a root table bypasses the translation path.
+ *
+ * PMEN.PRS is device state, not a guest bit: the hardware drives it
+ * here, and vtd_handle_pmen_write() calls back in when the guest
+ * clears EPM (the Linux release handshake).
+ *
+ * Refused (returns false) when enabling while a host device has
+ * cached mappings outside QEMU's DMA path (notifiers or the
+ * iommufd/host-vIOMMU device): the PMR could not then deny the DMA.
+ */
+static bool vtd_pmr_update(IntelIOMMUState *s, bool enabled)
+{
+    if (enabled == qatomic_read(&s->pmr_enabled)) {
+        return true;
+    }
+    if (enabled && (!QLIST_EMPTY(&s->vtd_as_with_notifiers) ||
+                    (s->vtd_host_iommu_dev &&
+                     g_hash_table_size(s->vtd_host_iommu_dev)))) {
+        return false;
+    }
+
+    vtd_reset_caches(s);
+    qatomic_set(&s->pmr_enabled, enabled);
+    vtd_address_space_refresh_all(s);
+    stl_le_p(&s->csr[DMAR_PMEN_REG],
+             enabled ? VTD_PMEN_EPM | VTD_PMEN_PRS : 0);
+    trace_vtd_pmr_update(enabled);
+    return true;
+}
+
+/*
+ * True if DMA to host-physical address @phys falls inside a protected
+ * window.  The limit is inclusive and the region is 2 MiB granular;
+ * a base above its limit encodes an empty window.  The check runs on
+ * the translated host-physical address, not the IOVA.
+ */
+static bool vtd_pmr_blocks(IntelIOMMUState *s, uint64_t phys)
+{
+    uint64_t lo_base = vtd_get_long_raw(s, DMAR_PLMBASE_REG) &
+                       VTD_PMR_ADDR_MASK;
+    uint64_t lo_limit = (vtd_get_long_raw(s, DMAR_PLMLIMIT_REG) &
+                         VTD_PMR_ADDR_MASK) | (VTD_PMR_GRANULARITY - 1);
+    uint64_t hi_base = vtd_get_quad_raw(s, DMAR_PHMBASE_REG) &
+                       VTD_PMR_ADDR_MASK;
+    uint64_t hi_limit = (vtd_get_quad_raw(s, DMAR_PHMLIMIT_REG) &
+                         VTD_PMR_ADDR_MASK) | (VTD_PMR_GRANULARITY - 1);
+
+    return (lo_base <= lo_limit && phys >= lo_base && phys <= lo_limit) ||
+           (hi_base <= hi_limit && phys >= hi_base && phys <= hi_limit);
+}
+
+/*
+ * Program the TXT PMRs for a staged launch.  SINIT hands us half-open
+ * [base, base + size) windows that it validated against the MLE's
+ * mapped pages; encode them as the inclusive 2 MiB-granular base/limit
+ * pair the VT-d registers use.  A zero-size window is encoded as empty
+ * (base above its limit).
+ */
+bool intel_iommu_set_txt_pmr(IntelIOMMUState *s, uint64_t lo_base,
+                             uint64_t lo_size, uint64_t hi_base,
+                             uint64_t hi_size, Error **errp)
+{
+    uint64_t haw = VTD_HAW_MASK(s->aw_bits);
+
+    if (s->pmr_enabled) {
+        error_setg(errp,
+                   "TXT: a protected memory region is already enabled");
+        return false;
+    }
+    if ((lo_base >> 32) ||
+        ((lo_base | lo_size | hi_base | hi_size) &
+         (VTD_PMR_GRANULARITY - 1)) ||
+        (lo_size && lo_base + lo_size - 1 > haw) ||
+        (hi_size && hi_base + hi_size - 1 > haw)) {
+        error_setg(errp,
+                   "TXT: PMR window is not 2 MiB aligned or exceeds the "
+                   "%u-bit host address space", s->aw_bits);
+        return false;
+    }
+    vtd_set_long(s, DMAR_PLMBASE_REG, lo_base);
+    vtd_set_long(s, DMAR_PLMLIMIT_REG,
+                 lo_size ? lo_base + lo_size - 1 : 0);
+    vtd_set_quad_raw(s, DMAR_PHMBASE_REG,
+                     hi_size ? hi_base : VTD_PMR_GRANULARITY);
+    vtd_set_quad_raw(s, DMAR_PHMLIMIT_REG,
+                     hi_size ? hi_base + hi_size - 1 : 0);
+    if (!vtd_pmr_update(s, true)) {
+        vtd_set_long(s, DMAR_PLMBASE_REG, 0);
+        vtd_set_long(s, DMAR_PLMLIMIT_REG, 0);
+        vtd_set_quad_raw(s, DMAR_PHMBASE_REG, 0);
+        vtd_set_quad_raw(s, DMAR_PHMLIMIT_REG, 0);
+        error_setg(errp,
+                   "TXT: cannot enable the PMR while a host device "
+                   "caches mappings outside the IOMMU path");
+        return false;
+    }
+    return true;
+}
+
+/* Release the TXT PMRs; called from SEXIT and reset. */
+void intel_iommu_clear_txt_pmr(IntelIOMMUState *s)
+{
+    if (!s->pmr_enabled) {
+        return;
+    }
+    vtd_set_long(s, DMAR_PLMBASE_REG, 0);
+    vtd_set_long(s, DMAR_PLMLIMIT_REG, 0);
+    vtd_set_quad_raw(s, DMAR_PHMBASE_REG, 0);
+    vtd_set_quad_raw(s, DMAR_PHMLIMIT_REG, 0);
+    vtd_pmr_update(s, false);
 }
 
 static const bool vtd_qualified_faults[] = {
@@ -3597,6 +3714,21 @@ static void vtd_handle_fectl_write(IntelIOMMUState *s)
     }
 }
 
+/*
+ * PMEN.EPM is the software enable for the Protected Memory Regions.
+ * vtd_pmr_update() drives PMEN.PRS, which the guest then observes;
+ * the release handshake (Linux iommu_disable_protect_mem_regions())
+ * clears EPM and polls for PRS to clear.
+ */
+static void vtd_handle_pmen_write(IntelIOMMUState *s)
+{
+    bool epm = vtd_get_long_raw(s, DMAR_PMEN_REG) & VTD_PMEN_EPM;
+
+    if (!vtd_pmr_update(s, epm)) {
+        trace_vtd_pmr_update(false);
+    }
+}
+
 static void vtd_handle_ics_write(IntelIOMMUState *s)
 {
     uint32_t ics_reg = vtd_get_long_raw(s, DMAR_ICS_REG);
@@ -3831,6 +3963,34 @@ static void vtd_mem_write(void *opaque, hwaddr addr,
     /* Protected Memory Enable Register, 32-bit */
     case DMAR_PMEN_REG:
         vtd_set_long(s, addr, val);
+        vtd_handle_pmen_write(s);
+        break;
+
+    /*
+     * Protected Memory Region base/limit registers.  Only writable
+     * while the region is not protected (PMEN.PRS clear); the 64-bit
+     * high-PMR registers also expose 32-bit _HI accessors.
+     */
+    case DMAR_PLMBASE_REG:
+    case DMAR_PLMLIMIT_REG:
+    case DMAR_PHMBASE_REG_HI:
+    case DMAR_PHMLIMIT_REG_HI:
+        if (vtd_get_long_raw(s, DMAR_PMEN_REG) & VTD_PMEN_PRS) {
+            break;
+        }
+        vtd_set_long(s, addr, val);
+        break;
+
+    case DMAR_PHMBASE_REG:
+    case DMAR_PHMLIMIT_REG:
+        if (vtd_get_long_raw(s, DMAR_PMEN_REG) & VTD_PMEN_PRS) {
+            break;
+        }
+        if (size == 4) {
+            vtd_set_long(s, addr, val);
+        } else {
+            vtd_set_quad(s, addr, val);
+        }
         break;
 
     /* Root Table Address Register, 64-bit */
@@ -4056,6 +4216,22 @@ static IOMMUTLBEntry vtd_iommu_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
         success = true;
     }
 
+    if (success) {
+        /*
+         * The PMR denies DMA into the protected window on the
+         * translated host-physical address, even when DMA remapping
+         * is off: a device without a root table would otherwise
+         * bypass the IOMMU path entirely.
+         */
+        if (vtd_pmr_blocks(s, iotlb.translated_addr)) {
+            trace_vtd_pmr_dma_blocked(pci_bus_num(vtd_as->bus),
+                                      vtd_as->devfn, iotlb.iova,
+                                      iotlb.translated_addr);
+            vtd_prepare_error_entry(&iotlb);
+            success = false;
+        }
+    }
+
     if (likely(success)) {
         trace_vtd_dmar_translate(pci_bus_num(vtd_as->bus),
                                  VTD_PCI_SLOT(vtd_as->devfn),
@@ -4129,6 +4305,14 @@ static int vtd_post_load(void *opaque, int version_id)
     vtd_update_scalable_state(iommu);
 
     vtd_update_iq_dw(iommu);
+
+    /*
+     * pmr_enabled is derived state, not migrated: re-derive it from the
+     * migrated PMEN.PRS before refreshing the address spaces so the
+     * destination routes DMA identically to the source.
+     */
+    iommu->pmr_enabled =
+        vtd_get_long_raw(iommu, DMAR_PMEN_REG) & VTD_PMEN_PRS;
 
     /*
      * Memory regions are dynamically turned on/off depending on
@@ -5039,6 +5223,21 @@ static void vtd_cap_init(IntelIOMMUState *s)
         s->cap |= VTD_CAP_CM;
     }
 
+    /*
+     * The PMR capability bits mirror the machine's TXT support: the
+     * PMRs exist to protect the TXT MLE, and a non-TXT machine reports
+     * them clear, leaving PMEN read-only exactly as it was before PMR
+     * support existed.
+     */
+    {
+        Object *pc = object_dynamic_cast(qdev_get_machine(),
+                                         TYPE_PC_MACHINE);
+
+        if (pc && PC_MACHINE(pc)->txt_enabled) {
+            s->cap |= VTD_CAP_PLMR | VTD_CAP_PHMR;
+        }
+    }
+
     /* TODO: read cap/ecap from host to decide which cap to be exposed. */
     if (s->fsts) {
         s->ecap |= VTD_ECAP_SMTS | VTD_ECAP_FSTS;
@@ -5066,6 +5265,12 @@ static void vtd_cap_init(IntelIOMMUState *s)
 static void vtd_init(IntelIOMMUState *s)
 {
     X86IOMMUState *x86_iommu = X86_IOMMU_DEVICE(s);
+    /*
+     * PMR base/limit registers are writable across the host address
+     * width; the 2 MiB granularity is applied by the device in
+     * vtd_pmr_blocks().
+     */
+    const uint64_t pmr_wmask = VTD_HAW_MASK(s->aw_bits);
 
     memset(s->csr, 0, DMAR_REG_SIZE);
     memset(s->wmask, 0, DMAR_REG_SIZE);
@@ -5075,6 +5280,7 @@ static void vtd_init(IntelIOMMUState *s)
     s->root = 0;
     s->root_scalable = false;
     s->dmar_enabled = false;
+    s->pmr_enabled = false;
     s->intr_enabled = false;
     s->iq_head = 0;
     s->iq_tail = 0;
@@ -5149,11 +5355,19 @@ static void vtd_init(IntelIOMMUState *s)
      */
     vtd_define_long(s, DMAR_FEUADDR_REG, 0, 0, 0);
 
-    /* Treated as RO for implementations that PLMR and PHMR fields reported
-     * as Clear in the CAP_REG.
-     * vtd_define_long(s, DMAR_PMEN_REG, 0, 0x80000000UL, 0);
+    /*
+     * PMEN: EPM is the only software-writable bit; PRS is driven by the
+     * device in vtd_pmr_update().  The PMR base/limit registers hold
+     * host-physical addresses with 2 MiB granularity and are only
+     * writable while the region is not protected (vtd_mem_write).
      */
-    vtd_define_long(s, DMAR_PMEN_REG, 0, 0, 0);
+    vtd_define_long(s, DMAR_PMEN_REG, 0, VTD_PMEN_EPM, 0);
+    vtd_define_long(s, DMAR_PLMBASE_REG, 0, 0xffffffffUL, 0);
+    vtd_define_long(s, DMAR_PLMLIMIT_REG, 0, 0xffffffffUL, 0);
+    vtd_define_quad(s, DMAR_PHMBASE_REG, 0, pmr_wmask, 0);
+    vtd_define_long(s, DMAR_PHMBASE_REG_HI, 0, 0xffffffffUL, 0);
+    vtd_define_quad(s, DMAR_PHMLIMIT_REG, 0, pmr_wmask, 0);
+    vtd_define_long(s, DMAR_PHMLIMIT_REG_HI, 0, 0xffffffffUL, 0);
 
     vtd_define_quad(s, DMAR_IQH_REG, 0, 0, 0);
     vtd_define_quad(s, DMAR_IQT_REG, 0, 0x7fff0ULL, 0);

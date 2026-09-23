@@ -141,6 +141,52 @@
 #define TXT_ERR_ACM_INVALID          0x80060001ULL
 
 /*
+ * VT-d PMR (Protected Memory Region) register access.  The q35 host
+ * bridge exposes the IOMMU CSR region at 0xFED90000 in system
+ * memory (it is a sysbus device, not PCI).  The values mirror
+ * hw/i386/intel_iommu_internal.h, restated here because this binary
+ * links no QEMU headers.  The machine runs with txt=on, so CAP
+ * advertises PLMR/PHMR; a PMR-valid SENTER programs the window from
+ * the os_sinit data (the 16 MiB low window of this fixture) before
+ * establishing the measured environment, and SEXIT releases it.
+ */
+#define VTD_CSR_BASE            0xfed90000UL
+#define VTD_CSR_CAP             0x8
+#define VTD_CSR_PMEN            0x64
+#define VTD_CSR_PLMBASE         0x68
+#define VTD_CSR_PLMLIMIT        0x6c
+/* 16 MiB window: last address of [0, 0x1000000) is 0x1000000 - 1. */
+#define VTD_PMR_LIMIT_16M       0xffffffU
+#define VTD_CAP_PLMR            (1U << 5)
+#define VTD_CAP_PHMR            (1U << 6)
+#define VTD_PMEN_EPM            (1U << 31)
+#define VTD_PMEN_PRS            (1U << 0)
+
+/*
+ * The iommu-testdev (0x1b36:0x0005) DMA engine: the test arms a
+ * 4-byte write to GVA and a read back from GPA, then polls the
+ * result register.  A translation the IOMMU refuses reports
+ * ITD_ERR_TX_FAIL immediately; the BUSY poll only bounds the
+ * normal path, so a blocked transfer cannot hang the test.  The
+ * values mirror hw/misc/iommu-testdev.h.
+ */
+#define ITD_VENDOR              0x1b36
+#define ITD_DEVICE              0x0005
+#define ITD_REG_TRIGGERING      0x00
+#define ITD_REG_GVA_LO          0x04
+#define ITD_REG_GVA_HI          0x08
+#define ITD_REG_LEN             0x0c
+#define ITD_REG_RESULT          0x10
+#define ITD_REG_DBELL           0x14
+#define ITD_REG_ATTRS           0x18
+#define ITD_REG_GPA_LO          0x1c
+#define ITD_REG_GPA_HI          0x20
+#define ITD_DBELL_ARM           0x1
+#define ITD_RESULT_IDLE         0xffffffffU
+#define ITD_RESULT_BUSY         0xfffffffeU
+#define ITD_ERR_TX_FAIL         0xdead0002U
+
+/*
  * Launch inputs for SENTER: an 8 KiB ACM in a 16 KiB SINIT slot at
  * 0xE10000 and a 4 KiB heap at 0xE20000, both inside the DPR range
  * [0xE00000, 0x1000000) selected below.
@@ -366,6 +412,106 @@ static void msr_write32(uint32_t index, uint32_t val)
      * live in the low half of the register.
      */
     asm volatile("wrmsr" :: "a"(val), "d"((uint32_t)0), "c"(index));
+}
+
+static uint32_t port_inl(uint32_t port)
+{
+    uint32_t v;
+
+    asm volatile("inl %%dx, %0" : "=a"(v) : "d"(port));
+    return v;
+}
+
+static void port_outl(uint32_t port, uint32_t v)
+{
+    asm volatile("outl %%eax, %%dx" :: "a"(v), "d"(port));
+}
+
+/* PCI config access on bus 0; the test's devices are all on bus 0. */
+static uint32_t pci_cfg_readl(uint32_t devfn, uint32_t off)
+{
+    port_outl(0xcf8, 0x80000000U | (devfn << 8) | (off & 0xfc));
+    return port_inl(0xcfc);
+}
+
+static void pci_cfg_writel(uint32_t devfn, uint32_t off, uint32_t v)
+{
+    port_outl(0xcf8, 0x80000000U | (devfn << 8) | (off & 0xfc));
+    port_outl(0xcfc, v);
+}
+
+static uint32_t vtd_readl(uint32_t off)
+{
+    /* volatile: MMIO read of an IOMMU CSR register. */
+    return *(volatile uint32_t *)(uintptr_t)(VTD_CSR_BASE + off);
+}
+
+static uint32_t itd_readl(uint32_t bar, uint32_t off)
+{
+    /* volatile: MMIO read of a test device register. */
+    return *(volatile uint32_t *)(uintptr_t)(bar + off);
+}
+
+static void itd_writel(uint32_t bar, uint32_t off, uint32_t v)
+{
+    /* volatile: MMIO write of a test device register. */
+    *(volatile uint32_t *)(uintptr_t)(bar + off) = v;
+}
+
+/*
+ * Find the iommu-testdev on bus 0, enable its memory space and bus
+ * mastering, and return its 4 KiB BAR0 base.  Returns 0 if absent; the
+ * meson args always create it, so 0 is a test-environment failure.
+ */
+static uint32_t itd_find_bar(void)
+{
+    uint32_t devfn;
+    uint32_t id;
+    uint32_t cmd;
+
+    for (devfn = 0; devfn < 32; devfn++) {
+        id = pci_cfg_readl(devfn, 0x0);
+        if ((id & 0xffff) != ITD_VENDOR || (id >> 16) != ITD_DEVICE) {
+            continue;
+        }
+        cmd = pci_cfg_readl(devfn, 0x4);
+        pci_cfg_writel(devfn, 0x4, cmd | 0x6); /* MEM | MASTER */
+        return pci_cfg_readl(devfn, 0x10) & 0xfffffff0UL;
+    }
+    return 0;
+}
+
+/*
+ * Run one 4-byte DMA of the test value at @addr through the device's
+ * IOMMU address space (IOVA == GPA).  Returns 0 on success and
+ * ITD_ERR_TX_FAIL when the IOMMU refuses the transfer.
+ */
+static uint32_t itd_dma(uint32_t bar, uint64_t addr)
+{
+    uint32_t result;
+    uint32_t i;
+
+    itd_writel(bar, ITD_REG_GVA_LO, (uint32_t)addr);
+    itd_writel(bar, ITD_REG_GVA_HI, (uint32_t)(addr >> 32));
+    itd_writel(bar, ITD_REG_GPA_LO, (uint32_t)addr);
+    itd_writel(bar, ITD_REG_GPA_HI, (uint32_t)(addr >> 32));
+    itd_writel(bar, ITD_REG_LEN, 4);
+    itd_writel(bar, ITD_REG_ATTRS, 0);
+    itd_writel(bar, ITD_REG_DBELL, ITD_DBELL_ARM);
+    /* The read of the triggering register starts the DMA. */
+    (void)itd_readl(bar, ITD_REG_TRIGGERING);
+
+    result = ITD_RESULT_BUSY;
+    for (i = 0; i < 1000; i++) {
+        result = itd_readl(bar, ITD_REG_RESULT);
+        if (result != ITD_RESULT_BUSY) {
+            break;
+        }
+    }
+    if (result == ITD_RESULT_BUSY) {
+        return ITD_ERR_TX_FAIL;
+    }
+    return result;
 }
 
 /*
@@ -1557,6 +1703,28 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         }
     }
 
+    /*
+     * SEXIT also released the PMR: PMEN reads back cleared and DMA
+     * into the former window succeeds again, so the guest that takes
+     * over after the measured environment can DMA freely whether or
+     * not it programs the IOMMU itself.
+     */
+    {
+        uint32_t bar = itd_find_bar();
+
+        if (vtd_readl(VTD_CSR_PMEN) != 0) {
+            ml_printf("smx: PMEN=0x%x after SEXIT\n",
+                      vtd_readl(VTD_CSR_PMEN));
+            fail_msg("SEXIT left the PMR enabled", 65536);
+        }
+        if (bar && itd_dma(bar, 0x40000) != 0) {
+            fail_msg("DMA into the former PMR window is still refused "
+                     "after SEXIT", 65536);
+        } else {
+            ml_printf("PASS: SEXIT released the PMR\n");
+        }
+    }
+
     if (main_fail) {
         ml_printf("smx: MLE landing failed (0x%x)\n", main_fail);
         asm volatile("out %%eax, $0xf4" :: "a"(main_fail));
@@ -1849,13 +2017,47 @@ int main(void)
     }
 
     /*
-     * 8. SENTER with valid launch inputs: the preconditions pass, the
-     *    DRTM is established over the SINIT region with the TIS hash
-     *    signals (which reset PCRs 17-22 and extend PCR 17 with the
-     *    region's hash).  The fourth heap section is deliberately
-     *    malformed until the final entry test, so SENTER rejects it
-     *    with HEAP_INVALID after measuring, without transferring away
-     *    from the remaining negative tests.  STS.SENTER_DONE stays clear.
+     * 8a. Before any SENTER has programmed a PMR, the IOMMU is plain
+     *     passthrough: the machine advertises PLMR/PHMR (txt=on),
+     *     PMEN is released, and DMA into the would-be 16 MiB PMR
+     *     window succeeds.  The target sits below the test image, so
+     *     a refused transfer could not be blamed on unmapped RAM.
+     */
+    {
+        uint32_t bar = itd_find_bar();
+
+        if (!bar) {
+            fail_msg("iommu-testdev not found on the PCI bus", 2048);
+        }
+        if (!(vtd_readl(VTD_CSR_CAP) & (VTD_CAP_PLMR | VTD_CAP_PHMR))) {
+            fail_msg("CAP does not advertise PLMR/PHMR on a txt=on "
+                     "machine", 2048);
+        }
+        if (vtd_readl(VTD_CSR_PMEN) != 0) {
+            ml_printf("smx: PMEN=0x%x before launch\n",
+                      vtd_readl(VTD_CSR_PMEN));
+            fail_msg("PMEN is set before any SENTER programmed a PMR",
+                     2048);
+        }
+        if (itd_dma(bar, 0x40000) != 0) {
+            fail_msg("DMA into the would-be PMR window failed before "
+                     "any PMR was enabled", 2048);
+        } else {
+            ml_printf("PASS: PMR released, DMA passthrough before "
+                      "launch\n");
+        }
+    }
+
+    /*
+     * 8b. SENTER with valid launch inputs: the preconditions pass and
+     *     the PMR is programmed into the IOMMU, then the DRTM is
+     *     established over the SINIT region with the TIS hash signals
+     *     (which reset PCRs 17-22 and extend PCR 17 with the
+     *     region's hash).  The fourth heap section is deliberately
+     *     malformed until the final entry test, so SENTER rejects it
+     *     with HEAP_INVALID after measuring, without transferring away
+     *     from the remaining negative tests.  STS.SENTER_DONE stays
+     *     clear.
      */
     txt_write64(TXT_OFF_ERRORCODE, 0);
     ml_printf("smx: SENTER, launch inputs set ...\n");
@@ -1878,6 +2080,45 @@ int main(void)
             ml_printf("PASS: SENTER measures but rejects missing "
                       "SINIT-MLE heap (0x%llx)\n",
                       (unsigned long long)ec);
+        }
+    }
+
+    /*
+     * 8c. The step-8b SENTER validated the PMR and programmed the
+     *     IOMMU before measuring, so even though it then rejected the
+     *     malformed heap, the protected window is live: DMA into
+     *     [0, 16 MiB) -- the os_sinit low PMR of this fixture -- must
+     *     fail while DMA outside it still succeeds.  Remapping is off,
+     *     so without the PMR check this DMA would bypass the IOMMU
+     *     entirely.
+     */
+    {
+        uint32_t bar = itd_find_bar();
+        uint32_t pmen;
+
+        if (!bar) {
+            fail_msg("iommu-testdev not found on the PCI bus", 4096);
+        }
+        pmen = vtd_readl(VTD_CSR_PMEN);
+        if (pmen != (VTD_PMEN_EPM | VTD_PMEN_PRS)) {
+            ml_printf("smx: PMEN=0x%x after the PMR-valid SENTER\n", pmen);
+            fail_msg("PMR was not enabled by the PMR-valid SENTER", 4096);
+        }
+        if (vtd_readl(VTD_CSR_PLMBASE) != 0 ||
+            vtd_readl(VTD_CSR_PLMLIMIT) != VTD_PMR_LIMIT_16M) {
+            ml_printf("smx: PLMBASE=0x%x PLMLIMIT=0x%x\n",
+                      vtd_readl(VTD_CSR_PLMBASE),
+                      vtd_readl(VTD_CSR_PLMLIMIT));
+            fail_msg("PMR registers do not hold the os_sinit window",
+                     4096);
+        }
+        if (itd_dma(bar, 0x40000) != ITD_ERR_TX_FAIL) {
+            fail_msg("DMA into the live PMR window was not denied", 4096);
+        } else if (itd_dma(bar, 0x2000000) != 0) {
+            fail_msg("DMA outside the PMR window failed", 4096);
+        } else {
+            ml_printf("PASS: the live PMR denies DMA into the protected "
+                      "window\n");
         }
     }
 

@@ -60,6 +60,8 @@ vtd_reg_write_iectl(uint32_t value) "value 0x%"PRIx32
 vtd_reg_ics_clear_ip(void) ""
 vtd_dmar_translate(uint8_t bus, uint8_t slot, uint8_t func, uint64_t iova, uint64_t gpa, uint64_t mask) "dev %02x:%02x.%02x iova 0x%"PRIx64" -> gpa 0x%"PRIx64" mask 0x%"PRIx64
 vtd_dmar_enable(bool en) "enable %d"
+vtd_pmr_update(bool enabled) "PMR enabled=%d"
+vtd_pmr_dma_blocked(uint32_t bus, uint32_t devfn, uint64_t iova, uint64_t hpa) "PMR blocked DMA: bus=%d devfn=0x%x iova 0x%"PRIx64" -> hpa 0x%"PRIx64
 vtd_dmar_fault(uint16_t sid, int fault, uint64_t addr, bool is_write) "sid 0x%"PRIx16" fault %d addr 0x%"PRIx64" write %d"
 vtd_ir_enable(bool en) "enable %d"
 vtd_ir_irte_get(int index, uint64_t lo, uint64_t hi) "index %d low 0x%"PRIx64" high 0x%"PRIx64

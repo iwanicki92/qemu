@@ -283,8 +283,9 @@ GETSEC[SENTER] (EAX=4, EBX=SINIT ACM phys base, ECX=ACM size, EDX=0)
   ERRORCODE and returns on failure instead of a hardware TXT reset.
 
 GETSEC[SEXIT] (EAX=5)
-  Not implemented; the modeled teardown/reset behavior below is a
-  proposal, not a validated guest path.
+  Leaves the measured environment and **returns to the next
+  instruction**; see *Teardown* below.  #GP outside a measured
+  environment.
 
 GETSEC[WAKEUP] (EAX=8)
   Accepted only after SENTER on a single-vCPU machine (no AP to wake).
@@ -611,11 +612,20 @@ can be checked against §2.4 of the guide rather than rediscovered.
 Teardown (GETSEC[SEXIT])
 ========================
 
+Implemented (``intel_txt_sexit()``).
+
 - Requires measured environment; otherwise #GP.
-- Clears secrets (QEMU: clears ``E2STS.SECRET_STS``), releases DPR
-  and PMR enforcement, closes private space, clears
-  ``STS.SENTER_DONE`` and the locality-open bits, and sets
-  ``STS.SEXIT_DONE``.
+- Clears secrets (QEMU: clears ``E2STS.SECRET_STS``), closes private
+  space, clears ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK`` and the
+  locality-open bits, and sets ``STS.SEXIT_DONE``.
+- DPR and PMR enforcement release is a no-op here, because neither is
+  enforced in the first place (deviation 3).
+
+An MLE normally arrives at SEXIT having already issued
+``CMD_NO_SECRETS``, ``CMD_UNLOCK_MEM_CONFIG`` and
+``CMD_CLOSE_PRIVATE`` itself, so most of that is idempotent; SEXIT
+does it anyway, because the instruction has to be sufficient on its
+own.
 
 SEXIT is **not** a platform reset, and an earlier revision of this
 document (and of the master plan) was wrong to describe it as one.

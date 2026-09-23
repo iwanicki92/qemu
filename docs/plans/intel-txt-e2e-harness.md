@@ -444,11 +444,11 @@ Note `qemu64` cannot be used: it reports `AuthenticAMD`, and tboot's
 Generic coreboot TXT cannot simply be enabled for q35: it expects platform
 DRAM-clear/reset features and a BIOS ACM that QEMU does not execute.
 
-### Teardown triple-faults on the unimplemented SEXIT (2026-09-23)
+### Teardown: triple fault on unimplemented SEXIT, now fixed (2026-09-23)
 
-The measured-boot runs exit with status 0, but that is **not** a clean
-shutdown and must not be read as one. `-d int,guest_errors` shows the
-guest ending like this:
+**Resolved.** Originally the measured-boot runs exited with status 0 while
+actually triple-faulting, which must not be read as a clean shutdown.
+`-d int,guest_errors` showed the guest ending like this:
 
 - `v=06` (#UD) at `0x820ac0` with `EAX=5` -- GETSEC leaf 5, SEXIT, which
   is unimplemented and raises #UD by design
@@ -464,7 +464,31 @@ space closed`) and its final line is `executing GETSEC[SEXIT]...`, with no
 exercised** path, not a hypothetical one -- any guest that powers off or
 reboots out of a measured launch reaches it.
 
-This does not affect the PCR evidence above, which is gathered by `/init`
-before it requests power-off. It does mean the run's exit status carries no
-information about teardown, and that implementing SEXIT is the next
-functional gap on the critical path.
+This did not affect the PCR evidence above, which `/init` gathers before
+requesting power-off, but it did mean the run's exit status carried no
+information about teardown.
+
+SEXIT is now implemented (`intel_txt_sexit()`): it clears the secrets flag,
+closes private space, clears `STS.SENTER_DONE`/`MEM_CONFIG_LOCK`/the
+locality-open bits, sets `STS.SEXIT_DONE`, and **returns to the next
+instruction** rather than resetting -- a reset there would make the MLE's
+own teardown message unreachable. The launch *configuration*
+(SINIT_BASE/SIZE, HEAP_BASE/SIZE, DPR) deliberately stays programmed so a
+further SENTER is possible in the same power cycle.
+
+In `run-20260923-110502/` tboot now prints its final line,
+**`measured environment torn down`**, and the exception tally over the whole
+run contains no `#UD` (v=06), no `#GP` (v=0d) and no double fault (v=08);
+every `check_exception` record has `old: 0xffffffff`, i.e. nothing nested.
+What remains is ordinary Linux demand paging and interrupt vectors. PCR
+17/18 are unchanged from the established baseline, as they must be --
+teardown happens after measurement.
+
+Exit status is therefore a meaningful signal again.
+
+Guest-test coverage: the MLE landing code issues SEXIT and checks it
+returns, clears the launch state, clears the secrets flag, and leaves
+SINIT/HEAP/DPR programmed; a separate pre-launch check asserts SEXIT raises
+#GP(0) outside a measured environment. Three mutations confirm the
+assertions bite: not clearing `SENTER_DONE`, dropping the
+measured-environment check, and not setting `SEXIT_DONE` each fail the test.

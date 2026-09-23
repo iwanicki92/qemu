@@ -48,6 +48,7 @@
 
 #define GETSEC_LEAF_CAPABILITIES 0
 #define GETSEC_LEAF_SENTER       4
+#define GETSEC_LEAF_SEXIT        5
 #define GETSEC_LEAF_PARAMETERS   6
 
 /*
@@ -103,9 +104,15 @@
 #define TXT_OFF_HEAP_SIZE      0x308
 #define TXT_OFF_DPR            0x330
 
+#define TXT_OFF_E2STS          0x8f0
+
 #define TXT_STS_SENTER_DONE    (1ULL << 0)
+#define TXT_STS_SEXIT_DONE     (1ULL << 1)
 #define TXT_STS_MEM_CONFIG_LOCK (1ULL << 6)
 #define TXT_STS_PRIVATE_OPEN   (1ULL << 7)
+#define TXT_STS_LOCALITY1_OPEN (1ULL << 15)
+#define TXT_STS_LOCALITY2_OPEN (1ULL << 16)
+#define TXT_E2STS_SECRET_STS   (1ULL << 1)
 
 /* TXT.DPR layout: bit 0 LOCK, bits [11:4] SIZE in 1 MiB blocks,
    bits [31:20] TOP. */
@@ -1437,6 +1444,47 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
     asm volatile(".byte 0x0f, 0x37" : : "a"(7), "b"(0) : "memory");
     asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
 
+    /*
+     * Finally leave the measured environment, the way an MLE does at
+     * shutdown (tboot's txt_shutdown()).  SEXIT is not a reset: it
+     * has to return to the next instruction, or the MLE's teardown
+     * message -- and here, the rest of this function -- would be
+     * unreachable.  It must clear the launch *state* while leaving
+     * the launch *configuration* programmed, so a further SENTER is
+     * possible in the same power cycle.
+     */
+    {
+        uint64_t sinit_base = txt_read64(TXT_OFF_SINIT_BASE);
+        uint64_t heap_base = txt_read64(TXT_OFF_HEAP_BASE);
+        uint64_t dpr = txt_read64(TXT_OFF_DPR);
+        uint64_t sts_after;
+
+        asm volatile(".byte 0x0f, 0x37" : : "a"(5) : "memory");
+
+        /* Reaching this instruction at all is half the test. */
+        sts_after = txt_read64(TXT_OFF_STS);
+        if ((sts_after & (TXT_STS_SENTER_DONE | TXT_STS_MEM_CONFIG_LOCK |
+                          TXT_STS_PRIVATE_OPEN | TXT_STS_LOCALITY1_OPEN |
+                          TXT_STS_LOCALITY2_OPEN)) ||
+            !(sts_after & TXT_STS_SEXIT_DONE)) {
+            ml_printf("smx: TXT.STS after SEXIT is 0x%llx\n",
+                      (unsigned long long)sts_after);
+            fail_msg("SEXIT left the measured-environment state set", 32768);
+        }
+        if (txt_read64(TXT_OFF_E2STS) & TXT_E2STS_SECRET_STS) {
+            fail_msg("SEXIT did not clear the secrets flag", 32768);
+        }
+        if (txt_read64(TXT_OFF_SINIT_BASE) != sinit_base ||
+            txt_read64(TXT_OFF_HEAP_BASE) != heap_base ||
+            txt_read64(TXT_OFF_DPR) != dpr) {
+            fail_msg("SEXIT cleared launch configuration registers", 32768);
+        }
+        if (!main_fail) {
+            ml_printf("PASS: GETSEC[SEXIT] left the measured environment "
+                      "and returned\n");
+        }
+    }
+
     if (main_fail) {
         ml_printf("smx: MLE landing failed (0x%x)\n", main_fail);
         asm volatile("out %%eax, $0xf4" :: "a"(main_fail));
@@ -1996,6 +2044,28 @@ int main(void)
      *     in place, so this exercises the CPL check the way a guest
      *     userspace program would hit it.
      */
+    /*
+     * SEXIT outside a measured environment is #GP: there is nothing
+     * to leave.  Checked here, before any launch, while
+     * STS.SENTER_DONE is still clear.  The successful case runs in
+     * the MLE after SENTER (see mle_landing_c).
+     */
+    {
+        gp_count = 0;
+        gp_err = 0xffffffffU;
+        asm volatile(".byte 0x0f, 0x37"
+                     : : "a"(GETSEC_LEAF_SEXIT) : "memory");
+        if (gp_count != 1 || gp_err != 0) {
+            ml_printf("smx: #GP count=%d error code=0x%x\n", gp_count,
+                      gp_err);
+            fail_msg("GETSEC[SEXIT] outside a measured environment did "
+                     "not raise #GP(0)", 8192);
+        } else {
+            ml_printf("PASS: GETSEC[SEXIT] outside a measured "
+                      "environment raises #GP(0)\n");
+        }
+    }
+
     gdt_install();
     ml_printf("smx: ring-3 descriptors and TSS installed\n");
     {

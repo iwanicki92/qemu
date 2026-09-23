@@ -2,8 +2,9 @@
  * QEMU Intel TXT (Trusted Execution Technology)
  *
  * GETSEC (SMX) instruction emulation: static leaves and single-vCPU
- * semantic SENTER (see hw/i386/intel_txt.c). Single-vCPU WAKEUP and
- * post-launch SMCTRL are accepted; SEXIT/ENTERACCS/EXITAC are deferred.
+ * semantic SENTER (see hw/i386/intel_txt.c). SEXIT, single-vCPU
+ * WAKEUP and post-launch SMCTRL are accepted; ENTERACCS/EXITAC are
+ * deferred.
  *
  * Copyright (c) 2026 Michał Kopeć <michal@nozomi.space>
  *
@@ -27,6 +28,7 @@
  */
 #define GETSEC_LEAF_CAPABILITIES    0
 #define GETSEC_LEAF_SENTER          4
+#define GETSEC_LEAF_SEXIT           5
 #define GETSEC_LEAF_PARAMETERS      6
 #define GETSEC_LEAF_SMCTRL         7
 #define GETSEC_LEAF_WAKEUP         8
@@ -229,12 +231,23 @@ void helper_getsec(CPUX86State *env)
             raise_exception_ra(env, EXCP0D_GPF, GETPC());
         }
         break;
+    case GETSEC_LEAF_SEXIT:
+        /*
+         * Leaves the measured environment and *returns* to the
+         * instruction after GETSEC; the MLE prints its teardown
+         * message there.  No cpu_loop_exit(), no machine reset.
+         */
+        if (!env_archcpu(env)->txt_state ||
+            !intel_txt_sexit(env_archcpu(env)->txt_state)) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
+        break;
 #endif
 #endif /* !CONFIG_USER_ONLY */
     default:
         /*
-         * ENTERACCS, EXITAC and SEXIT are not implemented yet;
-         * report #UD so the missing leaf stays observable.
+         * ENTERACCS and EXITAC are not implemented yet; report #UD
+         * so the missing leaf stays observable.
          */
         trace_getsec_unimpl(leaf);
         raise_exception_ra(env, EXCP06_ILLOP, GETPC());

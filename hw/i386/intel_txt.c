@@ -1863,6 +1863,40 @@ bool intel_txt_smctrl(IntelTxtState *s, uint32_t control)
     return control == 0 && (s->sts & TXT_STS_SENTER_DONE);
 }
 
+bool intel_txt_sexit(IntelTxtState *s)
+{
+    if (!(s->sts & TXT_STS_SENTER_DONE)) {
+        /* Not in a measured environment: the SDM requires #GP. */
+        return false;
+    }
+
+    /*
+     * Leave the measured environment.  SEXIT is *not* a platform
+     * reset: execution continues at the instruction after GETSEC, and
+     * tboot's txt_shutdown() prints "measured environment torn down"
+     * there before handing off to the OS, so a reset would make the
+     * whole handoff unreachable.
+     *
+     * An MLE normally reaches this having already issued
+     * CMD_NO_SECRETS, CMD_UNLOCK_MEM_CONFIG and CMD_CLOSE_PRIVATE
+     * itself (tboot/txt/txt.c), so most of the below is idempotent;
+     * do it anyway, because SEXIT must be sufficient on its own.
+     */
+    s->e2sts &= ~TXT_E2STS_SECRET_STS;
+    s->sts &= ~(TXT_STS_SENTER_DONE | TXT_STS_MEM_CONFIG_LOCK |
+                TXT_STS_PRIVATE_OPEN | TXT_STS_LOCALITY1_OPEN |
+                TXT_STS_LOCALITY2_OPEN);
+    s->sts |= TXT_STS_SEXIT_DONE;
+
+    /*
+     * SINIT_BASE/SIZE, HEAP_BASE/SIZE and DPR deliberately stay
+     * programmed: that is what allows a further SENTER in the same
+     * power cycle.  Only a TXT reset clears them.
+     */
+    trace_txt_sexit(s->sts);
+    return true;
+}
+
 bool intel_txt_wakeup(IntelTxtState *s)
 {
     CPUState *cpu;

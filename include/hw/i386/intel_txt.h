@@ -200,6 +200,8 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
                       uint32_t acm_size, IntelTxtMleEntry *entry);
 /* Post-launch SMCTRL; SMI masking is not modeled. */
 bool intel_txt_smctrl(IntelTxtState *s, uint32_t control);
+/* Leave the measured environment; not a platform reset. */
+bool intel_txt_sexit(IntelTxtState *s);
 /* WAKEUP has no AP work in the supported single-vCPU launch. */
 bool intel_txt_wakeup(IntelTxtState *s);
 #endif /* CONFIG_TPM */

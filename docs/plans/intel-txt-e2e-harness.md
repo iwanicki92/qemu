@@ -441,8 +441,30 @@ offers. With that, real tboot completes measured launch and reaches
 Note `qemu64` cannot be used: it reports `AuthenticAMD`, and tboot's
 `supports_txt()` requires `GenuineIntel`.
 
-Next: finish the TXT-enabled x86_64 kernel and initramfs and read the PCRs
-from inside the guest; validate DMAR/VT-d; implement required teardown
-semantics; and consider modelling the 8259->IOAPIC INTIN0 wire in QEMU.
 Generic coreboot TXT cannot simply be enabled for q35: it expects platform
 DRAM-clear/reset features and a BIOS ACM that QEMU does not execute.
+
+### Teardown triple-faults on the unimplemented SEXIT (2026-09-23)
+
+The measured-boot runs exit with status 0, but that is **not** a clean
+shutdown and must not be read as one. `-d int,guest_errors` shows the
+guest ending like this:
+
+- `v=06` (#UD) at `0x820ac0` with `EAX=5` -- GETSEC leaf 5, SEXIT, which
+  is unimplemented and raises #UD by design
+- `v=0d` (#GP) at `0x803100`, then `v=08` (double fault) at the same
+  address, then `check_exception old: 0x8 new 0xd` -- triple fault
+
+QEMU then stops, and with `-no-reboot` that surfaces as exit status 0.
+
+The serial log corroborates it: tboot's teardown runs to completion
+(`secrets flag cleared`, `memory configuration unlocked`, `private config
+space closed`) and its final line is `executing GETSEC[SEXIT]...`, with no
+`measured environment torn down` following. So SEXIT is on the **actually
+exercised** path, not a hypothetical one -- any guest that powers off or
+reboots out of a measured launch reaches it.
+
+This does not affect the PCR evidence above, which is gathered by `/init`
+before it requests power-off. It does mean the run's exit status carries no
+information about teardown, and that implementing SEXIT is the next
+functional gap on the critical path.

@@ -754,12 +754,27 @@ Machine/device wiring
 Deviations from real hardware
 =============================
 
-1. No ACM signature or key-hash verification; TXT.PUBLIC_KEY is a
-   placeholder. (PCR values are *not* trustworthy for remote
-   attestation of QEMU guests.)
+1. No ACM signature or key-hash verification, and none is planned:
+   this is a permanent scope boundary, not an unfinished feature.
+   ``key_size`` and ``rsa2048_sig`` are ignored, and TXT.PUBLIC_KEY
+   reports a fixed placeholder rather than the hash of a fused key.
+   Verifying an ACM against the RSA key carried in its own header
+   would only prove self-consistency -- any self-signed image passes
+   -- so it would add the appearance of a trust chain without the
+   substance of one.  PCR values are therefore *not* trustworthy for
+   remote attestation of QEMU guests.
 2. SINIT executes as QEMU helper code, not from authenticated RAM;
    no GETSEC[ENTERACCS]/AC-mode. FIT, BootGuard and CBnT features
    are out of scope.
+
+   A genuine Intel SINIT ACM cannot be used with this model.  It is
+   authenticated code that a real CPU executes in a dedicated mode
+   against the specific chipset it was built for; QEMU implements the
+   *semantics* of a measured launch, not an ACM execution
+   environment, and a production ACM would fail its own chipset-ID
+   and production-fuse checks here regardless.  The test fixture in
+   the E2E harness is deliberately unsigned, is not an Intel ACM, and
+   must never be treated as a trust anchor or used on hardware.
 3. VT-d PMR and chipset DPR are enforced on the modeled PCI and Q35
    ISA DMA paths; other host DMA mechanisms must not bypass those paths.
    SMI inhibition between SENTER and

@@ -42,6 +42,14 @@
 #define TXT_SINIT_BASE          0x270
 #define TXT_SINIT_SIZE          0x278
 #define TXT_MLE_JOIN            0x290
+/*
+ * QEMU-specific: the MONITOR-based RLP wakeup location.  Real SINIT
+ * ACMs publish a platform-specific physical address in
+ * sinit_mle_data.rlp_wakeup_addr; this model points that field at an
+ * otherwise reserved TXT public-space offset, so the MLE's plain
+ * 32-bit store traps into the device.  See docs/specs/intel-txt.rst.
+ */
+#define TXT_RLP_WAKEUP          0x2a0
 #define TXT_HEAP_BASE           0x300
 #define TXT_HEAP_SIZE           0x308
 #define TXT_MSEG_BASE           0x310
@@ -232,6 +240,11 @@ typedef struct IntelTxtRlpEntry {
 
 /* No AP is released if this validation fails. */
 bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp);
+/*
+ * Release every AP parked in TXT sleep into the MLE described by
+ * @rlp.  Defined by the TCG SMX helper; the BQL must be held.
+ */
+void intel_txt_join_parked_rlps(IntelTxtRlpEntry *rlp);
 #endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

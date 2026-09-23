@@ -118,6 +118,9 @@ Off   Name                      Access        Semantics (QEMU)
 0x290 TXT.MLE_JOIN              RW            RLP join structure: ``gdt_limit``,
                                               ``gdt_base``, ``seg_sel``, ``entry_point``
                                               (4 x u32).
+0x2a0 TXT.RLP_WAKEUP            WO            QEMU-specific MONITOR wake location (see
+                                              *RLP wake mechanisms*). A nonzero store
+                                              joins the parked RLPs.
 0x300 TXT.HEAP_BASE             RW            Physical address of TXT heap.
 0x308 TXT.HEAP_SIZE             RW            Heap size in bytes.
 0x310 TXT.MSEG_BASE             RW            MSEG (SMM monitor) base.
@@ -389,13 +392,35 @@ support. The semantic SENTER honors ``rlp_wake_getsec`` /
 ``rlp_wake_monitor`` from the intersection of MLE and os_sinit_data
 capabilities.
 
-The emulated SINIT advertises ``rlp_wake_getsec`` and **not**
-``rlp_wake_monitor``, which pins the RLP wake to GETSEC[WAKEUP].  The
-choice is the ACM's to make: an MLE takes MONITOR whenever the ACM
-offers it and only falls back to GETSEC otherwise (tboot
-``txt/txt.c``, ``txt_launch_environment()``).  GETSEC[WAKEUP] is the
-leaf this model implements, so offering MONITOR as well would only
-let the MLE select a mechanism QEMU does not provide.
+RLP wake mechanisms
+-------------------
+
+Both mechanisms are implemented, and the MLE selects between them:
+it takes MONITOR whenever the ACM offers it and falls back to
+GETSEC[WAKEUP] otherwise (tboot ``txt/txt.c``,
+``txt_launch_environment()``).  Because the offer comes from the ACM
+header, which is guest-supplied here, the emulated SENTER honors
+whatever ``os_sinit_data.capabilities`` asks for rather than gating
+on an advertisement it does not control:
+
+- ``rlp_wake_monitor``: SENTER publishes ``TXT.RLP_WAKEUP``
+  (0xfed302a0) in ``sinit_mle_data.rlp_wakeup_addr``.  The MLE's
+  ordinary 32-bit store of a nonzero value to that address traps into
+  the chipset model, which validates ``TXT.MLE_JOIN`` exactly as
+  GETSEC[WAKEUP] does and joins every parked RLP.  A zero store, an
+  unlaunched environment, or a launch that did not negotiate MONITOR
+  wake leaves the RLPs parked.
+
+  On real hardware ``rlp_wakeup_addr`` is a platform-specific
+  location chosen by the ACM; pointing it at an otherwise reserved
+  TXT public-space offset is a QEMU-specific choice that keeps the
+  wake observable without a monitored-address implementation in TCG.
+
+- ``rlp_wake_getsec``: the MLE issues GETSEC[WAKEUP] (EAX=8) instead,
+  and no wake address is published (``rlp_wakeup_addr`` stays zero).
+
+An ``os_sinit_data`` too short to contain the capabilities field
+predates it and can only mean GETSEC[WAKEUP].
 
 RLP wake is a separate question from how the MLE then *parks* its
 APs, and the two are chosen independently -- the wake method comes
@@ -410,6 +435,9 @@ parking strategies have very different requirements:
   loop polls its wake flag rather than waking on a memory write. This
   is a functional bring-up path, **not** faithful MWAIT semantics;
   guests expecting a real monitored-address wake are unsupported.
+  Note this is *guest* MONITOR/MWAIT, and is independent of the
+  chipset's MONITOR-based RLP wake described above, which does not
+  rely on the MWAIT instruction at all.
 - Parking APs in a VMX mini-guest (tboot's default) executes VMXON,
   VMPTRLD, a long run of VMWRITEs and VMLAUNCH, and relies on
   intercepting INIT/SIPI. **QEMU TCG implements no VMX instructions**.
@@ -746,11 +774,13 @@ Deviations from real hardware
    differ from what a real SINIT would extend (exact per-generation
    digest lists, e.g. for PCR17, are normalized to the MLE guide's
    documented sequence).
-7. SMP APs must already be halted at SENTER. GETSEC[WAKEUP] joins
-   them to the MLE, but the tboot MWAIT path uses polling rather than
-   memory-write-triggered wake; VMX AP parking is unsupported. The
-   PCR 17 composite and VT-d enforcement remain incomplete: a
-   successful transfer does not imply production-grade TXT attestation.
+7. SMP APs must already be halted at SENTER. Both GETSEC[WAKEUP] and
+   the MONITOR wake register join them to the MLE, but *guest*
+   MONITOR/MWAIT does not track the monitored address: MWAIT
+   degenerates to a spin under SMP (architecturally legal, since
+   spurious wakeups are permitted) so tboot's post-join AP loop polls.
+   VMX AP parking is unsupported. A successful transfer does not imply
+   production-grade TXT attestation.
 8. SENTER takes the SINIT base/size from the pre-programmed
    TXT.SINIT_BASE/SIZE registers; it does not latch the
    GETSEC[SENTER] EBX/ECX operands into them (on HW the chipset

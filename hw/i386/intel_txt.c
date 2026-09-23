@@ -74,6 +74,14 @@ struct IntelTxtState {
     uint64_t e2sts;
 
     /*
+     * MONITOR-based RLP wakeup, chosen by the MLE through
+     * os_sinit_data.capabilities and answered by publishing
+     * TXT_RLP_WAKEUP in sinit_mle_data.rlp_wakeup_addr.  False leaves
+     * GETSEC[WAKEUP] as the only way to join the RLPs.
+     */
+    bool rlp_wake_monitor;
+
+    /*
      * SMI inhibition while a measured environment is live: engaged
      * by a successful SENTER, released by SEXIT or GETSEC[SMCTRL].
      * SMIs arriving while it is set are held per CPU and redelivered
@@ -361,12 +369,43 @@ static uint64_t intel_txt_public_read(void *opaque, hwaddr addr,
     return val;
 }
 
+/*
+ * The MLE joins the RLPs by storing a nonzero value to the address
+ * SINIT published in sinit_mle_data.rlp_wakeup_addr.  Only a launched
+ * environment that negotiated MONITOR wake reacts; anything else
+ * leaves the RLPs parked, exactly like a rejected GETSEC[WAKEUP].
+ */
+static void intel_txt_monitor_wake(IntelTxtState *s, uint64_t val)
+{
+#if defined(CONFIG_TPM) && defined(CONFIG_TCG)
+    IntelTxtRlpEntry rlp;
+
+    if (!s->rlp_wake_monitor || val == 0) {
+        trace_txt_monitor_wake_ignored(val);
+        return;
+    }
+    if (!intel_txt_wakeup(s, &rlp)) {
+        return;
+    }
+    trace_txt_monitor_wake(val);
+    /* Device dispatch already holds the BQL; run_on_cpu requires it. */
+    BQL_LOCK_GUARD();
+    intel_txt_join_parked_rlps(&rlp);
+#else
+    trace_txt_monitor_wake_ignored(val);
+#endif
+}
+
 static void intel_txt_public_write(void *opaque, hwaddr addr,
                                    uint64_t val, unsigned size)
 {
     IntelTxtState *s = INTEL_TXT(opaque);
 
     trace_txt_reg_write("public", addr, val);
+    if (addr == TXT_RLP_WAKEUP) {
+        intel_txt_monitor_wake(s, val);
+        return;
+    }
     intel_txt_reg_write(s, addr, val, size);
 }
 
@@ -547,8 +586,17 @@ enum {
 #define OS_SINIT_OFF_PMR_LO_SIZE  0x28   /* u64 */
 #define OS_SINIT_OFF_PMR_HI_BASE  0x30   /* u64 */
 #define OS_SINIT_OFF_PMR_HI_SIZE  0x38   /* u64 */
+#define OS_SINIT_OFF_LCP_PO_BASE  0x40   /* u64 */
+#define OS_SINIT_OFF_LCP_PO_SIZE  0x48   /* u64 */
+#define OS_SINIT_OFF_CAPABILITIES 0x50   /* u32 */
+
+/* os_sinit_data.capabilities bits (tboot include/mle.h, txt_caps_t) */
+#define TXT_CAPS_RLP_WAKE_GETSEC   BIT(0)
+#define TXT_CAPS_RLP_WAKE_MONITOR  BIT(1)
 #define OS_SINIT_MIN_SIZE         0x20
 #define OS_SINIT_PMR_MIN_SIZE     0x40
+/* Through capabilities, i.e. enough to choose the RLP wake mechanism. */
+#define OS_SINIT_CAPS_MIN_SIZE    0x54
 #define TXT_PMR_GRANULARITY      (2 * 1024 * 1024ULL)
 
 /* Offsets within the MLE header (tboot include/mle.h mle_hdr_t) */
@@ -1425,14 +1473,40 @@ static bool intel_txt_write_sinit_mle_data(IntelTxtState *s, Error **errp)
         }
     }
 
+    /*
+     * Answer the RLP wake mechanism the MLE asked for.  GETSEC[WAKEUP]
+     * is the fallback and needs no published address; MONITOR wake
+     * additionally reports the location whose write releases the
+     * parked RLPs.  An os_sinit_data too short to hold capabilities
+     * predates the field and can only mean GETSEC[WAKEUP].
+     */
+    s->rlp_wake_monitor = false;
+    if (os_sinit_sz >= sizeof(uint64_t) + OS_SINIT_CAPS_MIN_SIZE) {
+        uint64_t os_sinit = s->heap_base + bios_sz + os_mle_sz +
+                            sizeof(uint64_t);
+        uint32_t caps;
+
+        if (!intel_txt_gread_u32(os_sinit + OS_SINIT_OFF_CAPABILITIES,
+                                 &caps, errp)) {
+            return false;
+        }
+        s->rlp_wake_monitor = (caps & TXT_CAPS_RLP_WAKE_MONITOR) != 0;
+        trace_txt_rlp_wake_mechanism(caps, s->rlp_wake_monitor ?
+                                     "MONITOR" : "GETSEC[WAKEUP]");
+    }
+
     /* total_end includes the loader's size prefix; the buffer does not. */
     buf = g_malloc0(total_end - sizeof(uint64_t));
     stl_le_p(buf + SINIT_MLE_OFF_VERSION, SINIT_MLE_VERSION);
     /*
-     * rlp_wakeup_addr stays zero: the emulation uses the
-     * GETSEC[WAKEUP] rendezvous, not the MONITOR mechanism.  The TPM
-     * 1.2 hash and policy fields stay zero as well.
+     * rlp_wakeup_addr is only meaningful for MONITOR wake; it stays
+     * zero for the GETSEC[WAKEUP] rendezvous.  The TPM 1.2 hash and
+     * policy fields stay zero either way.
      */
+    if (s->rlp_wake_monitor) {
+        stl_le_p(buf + SINIT_MLE_OFF_RLP_WAKEUP_ADDR,
+                 INTEL_TXT_PUBLIC_BASE + TXT_RLP_WAKEUP);
+    }
     stl_le_p(buf + SINIT_MLE_OFF_NUM_MDRS, nr_ram);
     stl_le_p(buf + SINIT_MLE_OFF_MDRS_OFF, mdr_off);
     if (have_dmar) {
@@ -2393,6 +2467,7 @@ static void intel_txt_reset_hold(Object *obj, ResetType type)
 #endif
     s->e2sts = 0;
     s->smi_inhibit = false;
+    s->rlp_wake_monitor = false;
 }
 
 static void intel_txt_realize(DeviceState *dev, Error **errp)
@@ -2482,7 +2557,7 @@ static const VMStateDescription vmstate_intel_txt = {
     .post_load = intel_txt_post_load,
 #endif
     .name = TYPE_INTEL_TXT,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(sts, IntelTxtState),
@@ -2500,6 +2575,7 @@ static const VMStateDescription vmstate_intel_txt = {
         VMSTATE_UINT64(dpr, IntelTxtState),
         VMSTATE_UINT64(e2sts, IntelTxtState),
         VMSTATE_BOOL_V(smi_inhibit, IntelTxtState, 2),
+        VMSTATE_BOOL_V(rlp_wake_monitor, IntelTxtState, 3),
         VMSTATE_END_OF_LIST()
     },
 };

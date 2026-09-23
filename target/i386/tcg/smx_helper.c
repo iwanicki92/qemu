@@ -172,6 +172,23 @@ static void getsec_join_rlp(CPUState *cs, run_on_cpu_data data)
     cs->halted = 0;
     trace_getsec_ap_joined(cs->cpu_index, rlp->entry_point);
 }
+
+/*
+ * Shared by GETSEC[WAKEUP] and the chipset's MONITOR wake register
+ * (hw/i386/intel_txt.c), which both join every parked RLP to the
+ * same validated entry state.
+ */
+void intel_txt_join_parked_rlps(IntelTxtRlpEntry *rlp)
+{
+    CPUState *cs;
+
+    g_assert(bql_locked());
+    CPU_FOREACH(cs) {
+        if (cs != current_cpu && cpu_env(cs)->txt_ap_parked) {
+            run_on_cpu(cs, getsec_join_rlp, RUN_ON_CPU_HOST_PTR(rlp));
+        }
+    }
+}
 #endif
 
 void helper_getsec(CPUX86State *env)
@@ -327,7 +344,6 @@ void helper_getsec(CPUX86State *env)
         break;
     case GETSEC_LEAF_WAKEUP: {
         IntelTxtRlpEntry rlp;
-        CPUState *cs;
 
         if (!env_archcpu(env)->txt_state ||
             !intel_txt_wakeup(env_archcpu(env)->txt_state, &rlp)) {
@@ -335,11 +351,7 @@ void helper_getsec(CPUX86State *env)
             break;
         }
         bql_lock();
-        CPU_FOREACH(cs) {
-            if (cs != current_cpu && cpu_env(cs)->txt_ap_parked) {
-                run_on_cpu(cs, getsec_join_rlp, RUN_ON_CPU_HOST_PTR(&rlp));
-            }
-        }
+        intel_txt_join_parked_rlps(&rlp);
         bql_unlock();
         break;
     }

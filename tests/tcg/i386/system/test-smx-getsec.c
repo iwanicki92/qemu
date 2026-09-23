@@ -102,6 +102,7 @@
 #define TXT_OFF_SINIT_BASE     0x270
 #define TXT_OFF_SINIT_SIZE     0x278
 #define TXT_OFF_MLE_JOIN       0x290
+#define TXT_OFF_RLP_WAKEUP     0x2a0
 #define TXT_OFF_HEAP_BASE      0x300
 #define TXT_OFF_HEAP_SIZE      0x308
 #define TXT_OFF_DPR            0x330
@@ -205,6 +206,20 @@
 #define TEST_MLE_SIZE          0x2000ULL
 #define TEST_MLE_HDR_OFF       0x100ULL
 #define TEST_HEAP_SIZE         0x1000ULL
+
+/*
+ * os_sinit_data carries capabilities only in the MONITOR-wake build;
+ * the default section stops before that field, which leaves
+ * GETSEC[WAKEUP] as the negotiated RLP wake mechanism.
+ */
+#ifdef TEST_TXT_MONITOR_WAKE
+#define TEST_OS_SINIT_SIZE     0x60
+#else
+#define TEST_OS_SINIT_SIZE     0x48
+#endif
+#define TEST_SINIT_MLE_OFF     (0x20 + TEST_OS_SINIT_SIZE)
+/* sinit_mle_data.rlp_wakeup_addr, past the section's u64 size prefix */
+#define SINIT_MLE_OFF_RLP_WAKEUP 0x78
 
 /*
  * Offsets inside the synthetic SINIT ACM fixture (see setup_acm()).
@@ -1355,15 +1370,17 @@ static void setup_mle(void)
     }
 
     /* Heap sections. */
-    for (i = 0; i < 0x70; i++) {
+    for (i = 0; i < TEST_SINIT_MLE_OFF + 8; i++) {
         heap[i] = 0;
     }
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x00) = 0x10;
     *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x10) = 0x10;
-    /* Guest physical heap is read by the SENTER helper between writes. */
-    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x20) = 0x48;
-    /* Volatile: keep launches rejected until the final entry test. */
-    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x68) = 0xffff;
+    /* volatile: the SENTER helper reads this guest heap between writes. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x20) =
+        TEST_OS_SINIT_SIZE;
+    /* volatile: keep launches rejected until the final entry test. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + TEST_SINIT_MLE_OFF) =
+        0xffff;
 
     os_sinit = (volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x28);
     *(volatile uint32_t *)os_sinit = 6;                 /* version */
@@ -1375,6 +1392,12 @@ static void setup_mle(void)
     os_sinit[5] = 0x1000000;                            /* lo size: 16 MiB */
     os_sinit[6] = 0;                                    /* empty hi base */
     os_sinit[7] = 0;                                    /* empty hi size */
+#ifdef TEST_TXT_MONITOR_WAKE
+    os_sinit[8] = 0;                                    /* lcp_po_base */
+    os_sinit[9] = 0;                                    /* lcp_po_size */
+    /* capabilities: ask for MONITOR wake, with GETSEC[WAKEUP] offered */
+    *((volatile uint32_t *)os_sinit + 20) = 0x00000003;
+#endif
 
     ml_printf("smx: MLE image, page table and heap built\n");
 }
@@ -1574,7 +1597,7 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
     uint64_t sts;
     /* volatile: SINIT writes this guest heap outside the C flow. */
     volatile uint8_t *section = (volatile uint8_t *)(uintptr_t)
-        (TEST_HEAP_BASE + 0x68);
+        (TEST_HEAP_BASE + TEST_SINIT_MLE_OFF);
     uint32_t count, off;
     uint32_t original_pmbase, original_acpi_ctrl;
     uint64_t smi_count_before;
@@ -1653,7 +1676,8 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         if (sum != 0) {
             fail_msg("SINIT-MLE DMAR copy fails its ACPI checksum", 16384);
         }
-        if (itd_dma(itd_find_bar(), TEST_HEAP_BASE + 0x68 + dmar_off) !=
+        if (itd_dma(itd_find_bar(),
+                    TEST_HEAP_BASE + TEST_SINIT_MLE_OFF + dmar_off) !=
             ITD_ERR_TX_FAIL) {
             fail_msg("DMA can overwrite the live TXT heap DMAR copy",
                      16384);
@@ -1725,6 +1749,41 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             fail_msg("SEXIT abandoned a sleeping AP", 16384);
         }
         join[0] = ACM_GDT_LIMIT;
+#ifdef TEST_TXT_MONITOR_WAKE
+        {
+            /* Volatile: a guest MMIO register, not ordinary RAM. */
+            volatile uint32_t *wake = (volatile uint32_t *)
+                (TXT_PUBLIC_BASE + TXT_OFF_RLP_WAKEUP);
+            /* volatile: SINIT wrote this heap section outside the C flow. */
+            volatile uint8_t *smd = (volatile uint8_t *)(uintptr_t)
+                (TEST_HEAP_BASE + TEST_SINIT_MLE_OFF + 8);
+            unsigned settle;
+
+            if (guest_le(smd + SINIT_MLE_OFF_RLP_WAKEUP, 4) !=
+                TXT_PUBLIC_BASE + TXT_OFF_RLP_WAKEUP) {
+                fail_msg("SINIT did not publish the MONITOR wake address",
+                         16384);
+            }
+            /* Only a nonzero store joins the RLPs. */
+            *wake = 0;
+            for (settle = 0; settle < 100000; settle++) {
+                asm volatile("pause" : : : "memory");
+            }
+            if (ap_joined) {
+                fail_msg("a zero MONITOR write released the parked AP",
+                         16384);
+            }
+            *wake = 1;
+            while (!ap_joined && retries--) {
+                asm volatile("pause" : : : "memory");
+            }
+            if (!ap_joined) {
+                fail_msg("MONITOR wake did not release parked AP", 16384);
+            } else {
+                ml_printf("PASS: RLP joined MLE through MONITOR wake\n");
+            }
+        }
+#else
         gp_count = 0;
         asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
         if (gp_count != 0) {
@@ -1738,6 +1797,7 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         } else {
             ml_printf("PASS: RLP joined MLE through TXT.MLE_JOIN\n");
         }
+#endif
     }
 #else
     asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
@@ -1889,8 +1949,8 @@ static void setup_mle_entry(void)
         code[1 + i] = stack >> (8 * i);
         code[22 + i] = landing >> (8 * i);
     }
-    /* Volatile: SINIT reads the guest heap; create the fourth section. */
-    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + 0x68) = 0;
+    /* volatile: SINIT reads the guest heap; create the fourth section. */
+    *(volatile uint64_t *)(uintptr_t)(TEST_HEAP_BASE + TEST_SINIT_MLE_OFF) = 0;
 }
 
 int main(void)

@@ -165,8 +165,11 @@ txt_drtm_digest(const char *what, const char *sha1, const char *sha256) "DRTM: %
 txt_measure_mle(uint64_t ptab, uint64_t size, uint64_t hdr_off) "DRTM: MLE measured via ptab 0x%"PRIx64" size 0x%"PRIx64" hdr@0x%"PRIx64
 txt_acm_validated(uint64_t size, uint32_t entry_point, uint32_t chipset_ids) "GETSEC[SENTER]: SINIT ACM accepted, size 0x%"PRIx64" entry 0x%"PRIx32" %"PRIu32" chipset ids"
 txt_sinit_mle_data(uint32_t num_mdrs, uint64_t region_off) "sinit_mle_data written: %u MDRs at heap offset 0x%"PRIx64
-txt_wakeup_rejected(const char *reason) "GETSEC[WAKEUP]: %s"
-txt_wakeup_entry(uint32_t entry, uint32_t selector, uint32_t gdt, uint32_t limit) "GETSEC[WAKEUP]: entry 0x%"PRIx32" cs 0x%"PRIx32" gdt 0x%"PRIx32" limit 0x%"PRIx32
+txt_wakeup_rejected(const char *reason) "TXT RLP wake: %s"
+txt_wakeup_entry(uint32_t entry, uint32_t selector, uint32_t gdt, uint32_t limit) "TXT RLP wake: entry 0x%"PRIx32" cs 0x%"PRIx32" gdt 0x%"PRIx32" limit 0x%"PRIx32
+txt_rlp_wake_mechanism(uint32_t caps, const char *how) "os_sinit_data capabilities 0x%"PRIx32", RLP wake via %s"
+txt_monitor_wake(uint64_t val) "TXT MONITOR wake, value 0x%"PRIx64
+txt_monitor_wake_ignored(uint64_t val) "TXT MONITOR wake ignored, value 0x%"PRIx64
 txt_sexit(uint64_t sts) "GETSEC[SEXIT]: measured environment left, TXT.STS = 0x%"PRIx64
 txt_smi_inhibit(void) "TXT: SMI inhibition engaged by SENTER"
 txt_smi_held(int cpu) "TXT: SMI held on CPU %d (inhibition engaged)"

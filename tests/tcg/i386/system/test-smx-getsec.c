@@ -2073,6 +2073,31 @@ int main(void)
     }
     ml_printf("smx: SINIT/HEAP/DPR programmed\n");
 
+    /* A protected SINIT alone is insufficient: the heap/DMAR must fit. */
+    {
+        uint8_t before[32], after[32];
+        int read_before = pcr_read(17, before);
+
+        txt_write64(TXT_OFF_HEAP_BASE, TEST_HEAP_BASE - 0x200000);
+        txt_write64(TXT_OFF_ERRORCODE, 0);
+        getsec_senter();
+        if (txt_read64(TXT_OFF_ERRORCODE) != TXT_ERR_HEAP_INVALID ||
+            !read_before || !pcr_read(17, after) || !pcr_is(before, after)) {
+            fail_msg("heap outside locked DPR accepted before DRTM", 64);
+        }
+        txt_write64(TXT_OFF_HEAP_BASE, TEST_HEAP_BASE);
+        txt_write64(TXT_OFF_HEAP_SIZE, 0x200000);
+        txt_write64(TXT_OFF_ERRORCODE, 0);
+        getsec_senter();
+        if (txt_read64(TXT_OFF_ERRORCODE) != TXT_ERR_HEAP_INVALID ||
+            !pcr_read(17, after) || !pcr_is(before, after)) {
+            fail_msg("heap crossing DPR top accepted before DRTM", 64);
+        } else {
+            ml_printf("PASS: DPR excludes heap: rejected before PCR reset\n");
+        }
+        txt_write64(TXT_OFF_HEAP_SIZE, TEST_HEAP_SIZE);
+    }
+
     /* The ECX ACM size must match the header even inside a larger slot. */
     txt_write64(TXT_OFF_ERRORCODE, 0);
     getsec_senter_size(2 * TEST_SINIT_SIZE);

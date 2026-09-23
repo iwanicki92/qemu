@@ -422,8 +422,9 @@ Preconditions checked by the helper; failures set TXT.ERRORCODE and
 return without a machine reset (a QEMU semantic deviation):
 
 1. CR4.SMXE, CPL0, chipset present (CAPABILITIES bit0).
-2. EBX/ECX: SINIT ACM in guest RAM, below 4 GiB, within DPR cover,
-   ``size`` consistent with the ACM header (header.size*4).
+2. EBX/ECX: SINIT ACM in guest RAM, below 4 GiB, within a nonempty,
+   locked DPR (invalid or wrapping DPR bounds are rejected), ``size``
+   consistent with the ACM header (header.size*4).
 3. SINIT ACM validation (``intel_txt_validate_acm()`` in
    ``hw/i386/intel_txt.c``), mirroring tboot's ``is_acmod()`` /
    ``verify_acmod()`` / ``does_acmod_match_platform()``
@@ -465,9 +466,11 @@ return without a machine reset (a QEMU semantic deviation):
    omits (see Deviations 1 and 2). Loaders do not verify the
    signature either, so an unsigned ACM that satisfies the
    structural checks above is accepted by tboot and GRUB.
-4. Heap: HEAP_BASE/SIZE set; the size-prefixed sections
-   (bios_data, os_mle_data, os_sinit_data) parse and fit in
-   HEAP_SIZE; os_sinit_data version in range (>= 4); ``mle_ptab``
+4. Heap: HEAP_BASE/SIZE set, nonempty and entirely inside the DPR
+   before any PCR reset (an uncovered heap records ``HEAP_INVALID``);
+   the size-prefixed sections (bios_data, os_mle_data, os_sinit_data)
+   parse and fit in HEAP_SIZE; os_sinit_data version in range (>= 4);
+   ``mle_ptab``
    non-zero, page-aligned, below 4 GiB; ``mle_size`` non-zero,
    page-aligned and at most 2 MiB (one page table); ``mle_hdr_base``
    leaves room for an MLE header inside ``[0, mle_size)``; the MLE

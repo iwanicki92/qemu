@@ -1875,8 +1875,9 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
      */
     dpr_size = (s->dpr >> 4) & 0xff;
     dpr_top = (s->dpr >> 20) & 0xfff;
-    if (dpr_size == 0 ||
-        s->sinit_base < (dpr_top << 20) - dpr_size * 0x100000ull ||
+    if (!(s->dpr & TXT_DPR_LOCK) || dpr_size == 0 ||
+        dpr_size > dpr_top ||
+        s->sinit_base < ((dpr_top - dpr_size) << 20) ||
         s->sinit_base + s->sinit_size > (dpr_top << 20)) {
         goto fail_sinit_dpr;
     }
@@ -1935,7 +1936,10 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
      */
     if (s->heap_base == 0 || s->heap_size == 0 ||
         s->heap_base >= INTEL_TXT_GUEST_32BIT_LIMIT ||
-        s->heap_size > INTEL_TXT_GUEST_32BIT_LIMIT - s->heap_base) {
+        s->heap_size > INTEL_TXT_GUEST_32BIT_LIMIT - s->heap_base ||
+        s->heap_base < ((dpr_top - dpr_size) << 20) ||
+        s->heap_base >= (dpr_top << 20) ||
+        s->heap_size > (dpr_top << 20) - s->heap_base) {
         goto fail_heap;
     }
 

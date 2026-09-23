@@ -1,6 +1,6 @@
 # TXT DPR enforcement and private-space scope
 
-Status: in progress. Upstream RFC is blocked until this work is implemented and verified.
+Status: in progress. Local correctness work; upstream contributions are deferred.
 
 ## Contract
 

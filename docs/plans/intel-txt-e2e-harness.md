@@ -326,9 +326,49 @@ intended primary evidence is instead an in-guest read of
 `/sys/class/tpm/tpm0/pcr-sha1|sha256/<17..22>` from a purpose-built
 initramfs, which reports the values as the OS observes them after launch.
 
-Next: fix or explain the coreboot/SeaBIOS virtual-wire/APIC handoff so the
-normal CPU configuration boots; finish the TXT-enabled x86_64 kernel and
-initramfs and read the PCRs from inside the guest; validate DMAR/VT-d; and
-implement required teardown semantics. Generic coreboot TXT cannot simply
-be enabled for q35: it expects platform DRAM-clear/reset features and a
-BIOS ACM that QEMU does not execute.
+### Virtual-wire ExtINT: why `-apic` was needed, and the fix (2026-09-23)
+
+**Resolved.** The `-cpu ...,-apic` workaround is no longer required.
+
+With a local APIC present, coreboot+SeaBIOS halted after `Press ESC for boot
+menu.` with the BSP in HLT, IF=1. Tracing (`--trace ioapic_set_irq
+--trace apic_local_deliver --trace pic_interrupt`) showed the PIT toggling
+GSI 0 forever while **neither** `apic_local_deliver` nor `pic_interrupt`
+ever fired -- nothing was being delivered or acknowledged. Monitor state at
+the hang:
+
+- `LVT0 = 0x00010700` -- ExtINT but **masked**, LAPIC enabled (`SPIV=0x10f`)
+- IOAPIC pin 0 = ExtINT, unmasked
+- IOAPIC pin 2 = **masked**
+- `pic0: irr=11 isr=00` -- IRQ0 pending, never acknowledged
+
+Coreboot's `lapic_enable_extint()` prefers routing virtual-wire ExtINT
+through IOAPIC GSI0 and deliberately leaves LINT0 masked when that
+succeeds. That is valid on real chipsets, where the 8259 INTR output is
+wired to IOAPIC INTIN0.
+
+**QEMU does not model that wire.** It connects the i8259 INTR output
+directly to the local APIC LINT0 input (`apic_deliver_pic_intr()`), and its
+IOAPIC never sees it. `ioapic_set_irq()` additionally remaps ISA IRQ0 onto
+pin **2**, so pin 0 is never asserted by anything. Coreboot's GSI0 ExtINT
+route therefore had no path to the CPU, and SeaBIOS waited forever for a
+timer tick.
+
+This is a QEMU fidelity gap rather than a coreboot bug. Modelling the
+8259->INTIN0 wire would touch the most heavily used interrupt path in every
+PC machine type, so it is left as separate future work. The harness instead
+gains coreboot `IOAPIC_NO_EXTINT_GSI0_WIRE` (selected by
+`emulation/qemu-q35`), which makes `route_i8259_irq0()` report failure so
+`lapic_enable_extint()` unmasks LINT0 -- the only virtual-wire path QEMU
+offers. With that, real tboot completes measured launch and reaches
+`transfering control to kernel` on a stock `-cpu Nehalem,smx,sse`
+(`run-20260923-095210/`).
+
+Note `qemu64` cannot be used: it reports `AuthenticAMD`, and tboot's
+`supports_txt()` requires `GenuineIntel`.
+
+Next: finish the TXT-enabled x86_64 kernel and initramfs and read the PCRs
+from inside the guest; validate DMAR/VT-d; implement required teardown
+semantics; and consider modelling the 8259->IOAPIC INTIN0 wire in QEMU.
+Generic coreboot TXT cannot simply be enabled for q35: it expects platform
+DRAM-clear/reset features and a BIOS ACM that QEMU does not execute.

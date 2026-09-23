@@ -206,13 +206,23 @@
 #define TEST_MLE_SIZE          0x2000ULL
 #define TEST_MLE_HDR_OFF       0x100ULL
 #define TEST_HEAP_SIZE         0x1000ULL
+#ifdef TEST_TXT_TPM2_LOG
+/* Outside the 16 MiB PMR: Intel TXT SDG Appendix F permits this. */
+#define TEST_EVENT_LOG_BASE    0x1100000ULL
+#define TEST_EVENT_LOG_SIZE    0x1000U
+typedef volatile uint8_t txt_guest_u8;   /* SENTER accesses this guest RAM. */
+typedef volatile uint32_t txt_guest_u32; /* SENTER accesses this guest RAM. */
+typedef volatile uint64_t txt_guest_u64; /* SENTER accesses this guest RAM. */
+#endif
 
 /*
  * os_sinit_data carries capabilities only in the MONITOR-wake build;
  * the default section stops before that field, which leaves
  * GETSEC[WAKEUP] as the negotiated RLP wake mechanism.
  */
-#ifdef TEST_TXT_MONITOR_WAKE
+#ifdef TEST_TXT_TPM2_LOG
+#define TEST_OS_SINIT_SIZE     0x90
+#elif defined(TEST_TXT_MONITOR_WAKE)
 #define TEST_OS_SINIT_SIZE     0x60
 #else
 #define TEST_OS_SINIT_SIZE     0x48
@@ -1392,11 +1402,31 @@ static void setup_mle(void)
     os_sinit[5] = 0x1000000;                            /* lo size: 16 MiB */
     os_sinit[6] = 0;                                    /* empty hi base */
     os_sinit[7] = 0;                                    /* empty hi size */
-#ifdef TEST_TXT_MONITOR_WAKE
+#if defined(TEST_TXT_MONITOR_WAKE) || defined(TEST_TXT_TPM2_LOG)
     os_sinit[8] = 0;                                    /* lcp_po_base */
     os_sinit[9] = 0;                                    /* lcp_po_size */
     /* capabilities: ask for MONITOR wake, with GETSEC[WAKEUP] offered */
     *((volatile uint32_t *)os_sinit + 20) = 0x00000003;
+#endif
+#ifdef TEST_TXT_TPM2_LOG
+    {
+        txt_guest_u8 *ext = heap + 0x28 + 0x5c;
+        txt_guest_u8 *log = (txt_guest_u8 *)(uintptr_t)
+            TEST_EVENT_LOG_BASE;
+
+        *(txt_guest_u32 *)os_sinit = 7;
+        *(txt_guest_u32 *)(ext + 0) = 8;  /* TPM2 log pointer 2.1 */
+        *(txt_guest_u32 *)(ext + 4) = 28;
+        *(txt_guest_u64 *)(ext + 8) = TEST_EVENT_LOG_BASE;
+        *(txt_guest_u32 *)(ext + 16) = TEST_EVENT_LOG_SIZE;
+        *(txt_guest_u32 *)(ext + 20) = 0;
+        *(txt_guest_u32 *)(ext + 24) = 0;
+        *(txt_guest_u32 *)(ext + 28) = 0; /* END */
+        *(txt_guest_u32 *)(ext + 32) = 8;
+        for (i = 0; i < TEST_EVENT_LOG_SIZE; i++) {
+            log[i] = 0;
+        }
+    }
 #endif
 
     ml_printf("smx: MLE image, page table and heap built\n");
@@ -1572,6 +1602,97 @@ static uint64_t guest_le(volatile uint8_t *p, unsigned int bytes)
     return value;
 }
 
+#ifdef TEST_TXT_TPM2_LOG
+static void check_tpm2_event_log(void)
+{
+    txt_guest_u8 *ext = (txt_guest_u8 *)(uintptr_t)
+        (TEST_HEAP_BASE + 0x28 + 0x5c);
+    txt_guest_u8 *log = (txt_guest_u8 *)(uintptr_t)
+        TEST_EVENT_LOG_BASE;
+    uint32_t banks = guest_le(log + 56, 4);
+    uint32_t next = guest_le(ext + 24, 4);
+    uint32_t pos = 60, pcr;
+    unsigned i, j;
+    uint32_t has_sha256 = 0;
+    const char signature[] = "Spec ID Event03";
+
+    if (guest_le(ext + 20, 4) != 0 || next > TEST_EVENT_LOG_SIZE ||
+        banks < 2 || banks > 4 || guest_le(log + 0, 4) != 0 ||
+        guest_le(log + 4, 4) != 3 || guest_le(log + 53, 1) != 2 ||
+        guest_le(log + 56, 4) != banks) {
+        fail_msg("TPM2 Spec ID or event-log offsets invalid", 16384);
+    }
+    for (i = 0; i < sizeof(signature); i++) {
+        if (log[32 + i] != signature[i]) {
+            fail_msg("TPM2 Spec ID signature invalid", 16384);
+        }
+    }
+    for (i = 0; i < banks; i++) {
+        uint16_t alg = guest_le(log + pos, 2);
+        uint16_t length = guest_le(log + pos + 2, 2);
+
+        if ((alg != 4 || length != 20) && (alg != 11 || length != 32) &&
+            (alg != 12 || length != 48) && (alg != 13 || length != 64)) {
+            fail_msg("TPM2 Spec ID bank descriptor invalid", 16384);
+        }
+        if (alg == 11) {
+            has_sha256++;
+        }
+        pos += 4;
+    }
+    if (has_sha256 != 1 || log[pos] != 0 ||
+        guest_le(log + 28, 4) != pos + 1 - 32) {
+        fail_msg("TPM2 Spec ID payload invalid", 16384);
+    }
+    pos++;
+    for (pcr = 17; pcr <= 18; pcr++) {
+        uint32_t event_banks, event_size;
+
+        if (guest_le(log + pos, 4) != pcr ||
+            guest_le(log + pos + 4, 4) != 5) {
+            fail_msg("TXT measurement missing from TPM2 event log", 16384);
+        }
+        event_banks = guest_le(log + pos + 8, 4);
+        if (event_banks != banks) {
+            fail_msg("TPM2 event digest count invalid", 16384);
+        }
+        pos += 12;
+        for (i = 0; i < banks; i++) {
+            uint16_t alg = guest_le(log + pos, 2);
+            unsigned digest_len = 0;
+            uint8_t any = 0;
+
+            for (j = 0; j < banks; j++) {
+                if (guest_le(log + 60 + 4 * j, 2) == alg) {
+                    digest_len = guest_le(log + 62 + 4 * j, 2);
+                    break;
+                }
+            }
+            if (!digest_len) {
+                fail_msg("TPM2 log event has undeclared bank", 16384);
+            }
+            pos += 2;
+            for (j = 0; j < digest_len; j++) {
+                any |= log[pos + j];
+            }
+            if (!any) {
+                fail_msg("TPM2 event contains an empty digest", 16384);
+            }
+            pos += digest_len;
+        }
+        event_size = guest_le(log + pos, 4);
+        if (event_size != 12) {
+            fail_msg("TPM2 TXT event description missing", 16384);
+        }
+        pos += 4 + event_size;
+    }
+    if (pos != next) {
+        fail_msg("TPM2 next_record_offset does not follow events", 16384);
+    }
+    ml_printf("PASS: TPM2 Spec ID and both measured event records\n");
+}
+#endif
+
 #ifdef TEST_TXT_SMP
 /* Volatile: AP writes this word concurrently with the BSP's spin wait. */
 static volatile uint32_t ap_joined;
@@ -1636,6 +1757,9 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
          TXT_STS_PRIVATE_OPEN) || txt_read64(TXT_OFF_ERRORCODE)) {
         fail_msg("MLE entry TXT status is wrong", 16384);
     }
+#ifdef TEST_TXT_TPM2_LOG
+    check_tpm2_event_log();
+#endif
     if (guest_le(section + 8, 4) != 6 ||
         count == 0 || off != 0x98 ||
         guest_le(section, 8) < off + 0x18 ||
@@ -2840,6 +2964,45 @@ int main(void)
         }
     }
 
+#ifdef TEST_TXT_TPM2_LOG
+    /* Bad log pointers, sizes and ext-data all fail before PCR reset. */
+    {
+        txt_guest_u8 *ext = (txt_guest_u8 *)(uintptr_t)
+            (TEST_HEAP_BASE + 0x28 + 0x5c);
+        txt_guest_u64 *addr = (txt_guest_u64 *)(ext + 8);
+        txt_guest_u32 *capacity = (txt_guest_u32 *)(ext + 16);
+        txt_guest_u32 *end_type = (txt_guest_u32 *)(ext + 28);
+        uint8_t before[32], after[32];
+        unsigned i;
+
+        if (!pcr_read(17, before)) {
+            fail_msg("PCR17 unavailable before bad-log test", 16384);
+        }
+        for (i = 0; i < 5; i++) {
+            if (i == 0) {
+                *addr = TEST_HEAP_BASE; /* overlaps the TXT heap */
+            } else if (i == 1) {
+                *addr = 0xfed00000; /* HPET MMIO, not guest RAM */
+            } else if (i == 2) {
+                *capacity = 128; /* cannot fit even a single-bank log */
+            } else if (i == 3) {
+                *end_type = 8; /* duplicate malformed element */
+            } else {
+                *addr = TEST_MLE_BASE; /* would overwrite measured image */
+            }
+            txt_write64(TXT_OFF_ERRORCODE, 0);
+            getsec_senter();
+            if (txt_read64(TXT_OFF_ERRORCODE) != TXT_ERR_HEAP_INVALID ||
+                !pcr_read(17, after) || !pcr_is(before, after)) {
+                fail_msg("bad TPM2 log changed the DRTM PCR", 16384);
+            }
+            *addr = TEST_EVENT_LOG_BASE;
+            *capacity = TEST_EVENT_LOG_SIZE;
+            *end_type = 0;
+        }
+        ml_printf("PASS: malformed TPM2 logs rejected before PCR reset\n");
+    }
+#endif
     if (main_fail) {
         return main_fail;
     }

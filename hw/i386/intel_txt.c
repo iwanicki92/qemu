@@ -481,6 +481,7 @@ static const MemoryRegionOps intel_txt_public_ops = {
  * backends/tpm/tpm_int.h, which is backend-internal.
  */
 enum {
+    TPM2_ST_NO_SESSIONS = 0x8001,
     TPM2_ST_SESSIONS   = 0x8002,
     TPM2_CC_PCR_Extend = 0x00000182,
     TPM2_RS_PW         = 0x40000009, /* password auth session handle */
@@ -498,6 +499,8 @@ enum {
  * Anything shorter than this is genuinely truncated.
  */
 #define TPM2_RESP_HDR_SIZE 10
+#define TPM2_CC_GET_CAPABILITY 0x0000017a
+#define TPM2_CAP_PCRS          0x00000005
 
 /*
  * Response buffer handed to the backend.
@@ -589,6 +592,34 @@ enum {
 #define OS_SINIT_OFF_LCP_PO_BASE  0x40   /* u64 */
 #define OS_SINIT_OFF_LCP_PO_SIZE  0x48   /* u64 */
 #define OS_SINIT_OFF_CAPABILITIES 0x50   /* u32 */
+#define OS_SINIT_OFF_EXT_DATA     0x5c   /* version 7: after EFI RSDP */
+#define TXT_EXT_END              0
+#define TXT_EXT_EVENT_LOG_2_1    8
+#define TXT_EXT_HEADER_SIZE      8
+#define TXT_EXT_LOG_SIZE         28      /* header + 20-byte descriptor */
+#define TXT_LOG_MAX_SIZE         (1024 * 1024)
+#define TXT_LOG_EV_ACTION        5       /* semantic QEMU measurements */
+#define TXT_LOG_NR_BANKS         4
+
+static const struct {
+    uint16_t alg;
+    QCryptoHashAlgo crypto;
+    uint8_t len;
+} intel_txt_log_banks[TXT_LOG_NR_BANKS] = {
+    { TPM2_ALG_SHA1, QCRYPTO_HASH_ALGO_SHA1, 20 },
+    { TPM2_ALG_SHA256, QCRYPTO_HASH_ALGO_SHA256, 32 },
+    { TPM2_ALG_SHA384, QCRYPTO_HASH_ALGO_SHA384, 48 },
+    { TPM2_ALG_SHA512, QCRYPTO_HASH_ALGO_SHA512, 64 },
+};
+
+typedef struct IntelTxtEventLog {
+    uint64_t addr;
+    uint64_t ext_addr;
+    uint32_t size;
+    uint8_t banks;
+    uint8_t acm[TXT_LOG_NR_BANKS][64];
+    uint8_t mle[TXT_LOG_NR_BANKS][64];
+} IntelTxtEventLog;
 
 /* os_sinit_data.capabilities bits (tboot include/mle.h, txt_caps_t) */
 #define TXT_CAPS_RLP_WAKE_GETSEC   BIT(0)
@@ -741,8 +772,9 @@ struct tpm2_cmd_pcr_extend {
  * and non-reentrant; it also means no other BQL-protected frontend
  * can interleave a submission with ours.
  */
-static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
-                              uint32_t cmd_len, Error **errp)
+static int intel_txt_tpm_send_response(IntelTxtState *s, const uint8_t *cmd,
+                                       uint32_t cmd_len, uint8_t *result,
+                                       size_t *result_len, Error **errp)
 {
     TPMBackendCmd tcmd;
     uint8_t *resp;
@@ -816,9 +848,24 @@ static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
         error_setg(errp, "TPM2 command at locality 4 failed: "
                    "response code 0x%" PRIx32, errcode);
         ret = -1;
+    } else if (result_len) {
+        if (*result_len < resp_len) {
+            error_setg(errp, "TPM response of %u bytes exceeds %zu-byte "
+                       "destination", resp_len, *result_len);
+            ret = -1;
+        } else {
+            memcpy(result, resp, resp_len);
+            *result_len = resp_len;
+        }
     }
     g_free(resp);
     return ret;
+}
+
+static int intel_txt_tpm_send(IntelTxtState *s, const uint8_t *cmd,
+                              uint32_t cmd_len, Error **errp)
+{
+    return intel_txt_tpm_send_response(s, cmd, cmd_len, NULL, NULL, errp);
 }
 
 /*
@@ -876,8 +923,16 @@ int intel_txt_drtm_extend_pcr(IntelTxtState *s, uint32_t pcr,
         return -1;
     }
     for (size_t i = 0; i < n; i++) {
-        if ((digests[i].alg != TPM2_ALG_SHA1 || digests[i].len != 20) &&
-            (digests[i].alg != TPM2_ALG_SHA256 || digests[i].len != 32)) {
+        bool supported = false;
+
+        for (unsigned j = 0; j < TXT_LOG_NR_BANKS; j++) {
+            if (digests[i].alg == intel_txt_log_banks[j].alg &&
+                digests[i].len == intel_txt_log_banks[j].len) {
+                supported = true;
+                break;
+            }
+        }
+        if (!supported) {
             error_setg(errp, "digest %zu: unsupported algorithm 0x%" PRIx16
                        " with %zu-byte digest", i, digests[i].alg,
                        digests[i].len);
@@ -1198,6 +1253,290 @@ static bool intel_txt_validate_pmrs(IntelTxtState *s, IntelTxtPmrs *pmr,
     return true;
 }
 
+/* Query the enabled PCR banks before constructing any Spec ID or PCR event. */
+static bool intel_txt_event_log_banks(IntelTxtState *s, uint8_t *banks,
+                                      Error **errp)
+{
+    uint8_t cmd[22], rsp[INTEL_TXT_TPM_BUF_SIZE];
+    size_t len = sizeof(rsp), pos = 19;
+    uint32_t count;
+
+    stw_be_p(cmd, TPM2_ST_NO_SESSIONS);
+    stl_be_p(cmd + 2, sizeof(cmd));
+    stl_be_p(cmd + 6, TPM2_CC_GET_CAPABILITY);
+    stl_be_p(cmd + 10, TPM2_CAP_PCRS);
+    stl_be_p(cmd + 14, 0); /* property: ignored for TPM_CAP_PCRS */
+    stl_be_p(cmd + 18, 1); /* propertyCount */
+    if (intel_txt_tpm_send_response(s, cmd, sizeof(cmd), rsp, &len, errp) < 0) {
+        return false;
+    }
+    if (len < pos || lduw_be_p(rsp) != TPM2_ST_NO_SESSIONS ||
+        rsp[10] != 0 || ldl_be_p(rsp + 11) != TPM2_CAP_PCRS) {
+        error_setg(errp, "TPM2_GetCapability(PCRS) returned an invalid or "
+                   "partial response");
+        return false;
+    }
+    count = ldl_be_p(rsp + 15);
+    *banks = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t alg;
+        uint8_t select_size, bit;
+
+        if (len - pos < 3) {
+            goto malformed;
+        }
+        alg = lduw_be_p(rsp + pos);
+        select_size = rsp[pos + 2];
+        pos += 3;
+        if (select_size < 3 || select_size > len - pos) {
+            goto malformed;
+        }
+        /* Both PCR17 and PCR18 must be active in each reported bank. */
+        bit = rsp[pos + 2] & 0x06;
+        if (bit) {
+            bool supported = false;
+
+            if (bit != 0x06) {
+                error_setg(errp, "TPM PCR17/18 bank 0x%x is only partially "
+                           "allocated", alg);
+                return false;
+            }
+            for (unsigned j = 0; j < TXT_LOG_NR_BANKS; j++) {
+                if (intel_txt_log_banks[j].alg == alg) {
+                    if (*banks & BIT(j)) {
+                        goto malformed;
+                    }
+                    *banks |= BIT(j);
+                    supported = true;
+                    break;
+                }
+            }
+            if (!supported) {
+                error_setg(errp, "active DRTM PCR bank 0x%x is not "
+                           "supported by the semantic TXT model", alg);
+                return false;
+            }
+        }
+        pos += select_size;
+    }
+    if (pos != len || !*banks) {
+        goto malformed;
+    }
+    return true;
+malformed:
+    error_setg(errp, "TPM2_GetCapability(PCRS) returned malformed selections");
+    return false;
+}
+
+/* Never write a log through MMIO, ROM or a hole in guest RAM. */
+static bool intel_txt_log_is_ram(uint64_t addr, uint32_t size)
+{
+    while (size) {
+        hwaddr xlat, n = size;
+        MemoryRegion *mr = address_space_translate(&address_space_memory,
+                                                    addr, &xlat, &n, true,
+                                                    MEMTXATTRS_UNSPECIFIED);
+
+        if (!mr || !memory_region_is_ram(mr) || !n) {
+            return false;
+        }
+        addr += n;
+        size -= n;
+    }
+    return true;
+}
+
+/* Validate the TPM2 v7 OS-to-SINIT extended element and its log address. */
+static bool intel_txt_event_log_prepare(IntelTxtState *s,
+                                        IntelTxtEventLog *log, Error **errp)
+{
+    uint64_t bios_sz, os_mle_sz, os_sinit_sz, os_sinit, remaining, ext;
+    uint64_t ptab, mle_size, phys, pd, pt;
+    uint32_t version, type, size, count = 0;
+    uint8_t desc[20];
+    bool found = false, ended = false;
+
+    if (!intel_txt_heap_parse(s, &bios_sz, &os_mle_sz, &os_sinit_sz, errp)) {
+        return false;
+    }
+    os_sinit = s->heap_base + bios_sz + os_mle_sz + sizeof(uint64_t);
+    if (!intel_txt_gread_u32(os_sinit, &version, errp)) {
+        return false;
+    }
+    if (version < 7) { /* TPM 1.2 and the existing version-6 fixture */
+        return true;
+    }
+    if (os_sinit_sz < sizeof(uint64_t) + OS_SINIT_OFF_EXT_DATA +
+                        TXT_EXT_HEADER_SIZE) {
+        error_setg(errp, "TPM2 os_sinit_data has no extended data");
+        return false;
+    }
+    remaining = os_sinit_sz - sizeof(uint64_t) - OS_SINIT_OFF_EXT_DATA;
+    ext = os_sinit + OS_SINIT_OFF_EXT_DATA;
+    while (remaining >= TXT_EXT_HEADER_SIZE) {
+        if (!intel_txt_gread_u32(ext, &type, errp) ||
+            !intel_txt_gread_u32(ext + 4, &size, errp)) {
+            return false;
+        }
+        if (size < TXT_EXT_HEADER_SIZE || size > remaining) {
+            break;
+        }
+        if (type == TXT_EXT_END) {
+            ended = (size == TXT_EXT_HEADER_SIZE);
+            break;
+        }
+        if (type == TXT_EXT_EVENT_LOG_2_1) {
+            if (found || size != TXT_EXT_LOG_SIZE) {
+                break;
+            }
+            if (!intel_txt_gread(ext + 8, desc, sizeof(desc), errp)) {
+                return false;
+            }
+            found = true;
+            log->ext_addr = ext + 8;
+            log->addr = ldq_le_p(desc);
+            log->size = ldl_le_p(desc + 8);
+            if (ldl_le_p(desc + 12) > log->size ||
+                ldl_le_p(desc + 16) > log->size) {
+                break;
+            }
+        }
+        ext += size;
+        remaining -= size;
+        if (++count > 256) {
+            break;
+        }
+    }
+    if (!found || !ended ||
+        log->size > TXT_LOG_MAX_SIZE ||
+        log->addr == 0 || (log->addr & 0xfff) ||
+        log->addr >= INTEL_TXT_GUEST_32BIT_LIMIT ||
+        log->size > INTEL_TXT_GUEST_32BIT_LIMIT - log->addr ||
+        (log->addr < s->heap_base + s->heap_size &&
+         s->heap_base < log->addr + log->size) ||
+        (log->addr < s->sinit_base + s->sinit_size &&
+         s->sinit_base < log->addr + log->size) ||
+        !intel_txt_log_is_ram(log->addr, log->size)) {
+        error_setg(errp, "invalid TPM2 event-log pointer, size or "
+                   "TXT-heap extended data");
+        return false;
+    }
+    /* The log must not overwrite bytes measured into PCR18 or its mappings. */
+    if (!intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_MLE_PTAB,
+                             &ptab, errp) ||
+        !intel_txt_gread_u64(os_sinit + OS_SINIT_OFF_MLE_SIZE,
+                             &mle_size, errp)) {
+        return false;
+    }
+    for (uint64_t off = 0; off < mle_size; off += 4096) {
+        if (!intel_txt_mle_xlate(ptab, off, &phys, &pd, &pt, errp)) {
+            return false;
+        }
+        if ((phys < log->addr + log->size &&
+             log->addr < phys + 4096) ||
+            (pd < log->addr + log->size &&
+             log->addr < pd + 4096) ||
+            (pt < log->addr + log->size &&
+             log->addr < pt + 4096) ||
+            (ptab < log->addr + log->size &&
+             log->addr < ptab + 4096)) {
+            error_setg(errp, "TPM2 event log overlaps measured MLE or "
+                       "its page tables");
+            return false;
+        }
+    }
+    if (!intel_txt_event_log_banks(s, &log->banks, errp)) {
+        return false;
+    }
+    /* Both measurements and all selected digests must fit before PCR reset. */
+    {
+        size_t needed = 60 + 4 * ctpop8(log->banks) + 1;
+
+        for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
+            if (log->banks & BIT(i)) {
+                needed += 2 * (2 + intel_txt_log_banks[i].len);
+            }
+        }
+        needed += 2 * (12 + 4 + sizeof("QEMU TXT ACM") - 1);
+        if (needed > log->size) {
+            error_setg(errp, "TPM2 event log size %u is too small for "
+                       "%zu bytes of measurements", log->size, needed);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Append a TCG_PCR_EVENT2 whose digest matches the model's actual extend. */
+static size_t intel_txt_log_append(uint8_t *dst, uint32_t pcr,
+                                   const IntelTxtEventLog *log,
+                                   const uint8_t digests[TXT_LOG_NR_BANKS][64],
+                                   const char *description)
+{
+    size_t off = 12, text_len = strlen(description);
+
+    stl_le_p(dst, pcr);
+    stl_le_p(dst + 4, TXT_LOG_EV_ACTION);
+    stl_le_p(dst + 8, ctpop8(log->banks));
+    for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
+        if (!(log->banks & BIT(i))) {
+            continue;
+        }
+        stw_le_p(dst + off, intel_txt_log_banks[i].alg);
+        memcpy(dst + off + 2, digests[i], intel_txt_log_banks[i].len);
+        off += 2 + intel_txt_log_banks[i].len;
+    }
+    stl_le_p(dst + off, text_len);
+    memcpy(dst + off + 4, description, text_len);
+    return off + 4 + text_len;
+}
+
+/* Publish the complete bounded log first, then its offsets in the TXT heap. */
+static bool intel_txt_event_log_publish(const IntelTxtEventLog *log,
+                                        Error **errp)
+{
+    uint8_t data[512] = { 0 }, offsets[8];
+    size_t off = 60;
+
+    if (!log->banks) {
+        return true; /* version-6 launch; no TPM2 pointer element */
+    }
+    stl_le_p(data + 4, 3); /* EV_NO_ACTION, not extended into any PCR */
+    memcpy(data + 32, "Spec ID Event03", 15);
+    data[53] = 2; /* spec version 2.0 */
+    data[55] = 2; /* 64-bit UINTN */
+    stl_le_p(data + 56, ctpop8(log->banks));
+    for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
+        if (!(log->banks & BIT(i))) {
+            continue;
+        }
+        stw_le_p(data + off, intel_txt_log_banks[i].alg);
+        stw_le_p(data + off + 2, intel_txt_log_banks[i].len);
+        off += 4;
+    }
+    data[off++] = 0; /* vendorInfoSize */
+    stl_le_p(data + 28, off - 32); /* TCG_PCR_EVENT eventSize */
+    off += intel_txt_log_append(data + off, 17, log, log->acm,
+                                "QEMU TXT ACM");
+    off += intel_txt_log_append(data + off, 18, log, log->mle,
+                                "QEMU TXT MLE");
+    g_assert(off <= sizeof(data));
+    if (off > log->size ||
+        !intel_txt_gwrite(log->addr, data, off, errp)) {
+        if (!*errp) {
+            error_setg(errp, "TPM2 event log cannot hold %zu bytes", off);
+        }
+        return false;
+    }
+    stl_le_p(offsets, 0); /* Spec ID is the first record */
+    stl_le_p(offsets + 4, off);
+    if (!intel_txt_gwrite(log->ext_addr + 12, offsets, sizeof(offsets), errp)) {
+        return false;
+    }
+    trace_txt_event_log(log->addr, off, ctpop8(log->banks));
+    return true;
+}
+
 /*
  * Spec step c: hash the MLE as the page table maps it and extend PCR 18
  * with the result (which is what a real SINIT ACM does).  PCR 18 has
@@ -1205,7 +1544,7 @@ static bool intel_txt_validate_pmrs(IntelTxtState *s, IntelTxtPmrs *pmr,
  * lands as a clean extend-from-zero.
  */
 static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
-                                 Error **errp)
+                                 IntelTxtEventLog *log, Error **errp)
 {
     uint64_t bios_sz, os_mle_sz, os_sinit_sz, os_sinit;
     uint64_t ptab, mle_size, hdr_base, hdr_phys, entry_phys;
@@ -1214,7 +1553,8 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
     uint8_t *mle = NULL;
     uint8_t *sha1 = NULL, *sha256 = NULL;
     size_t sha1_len = 0, sha256_len = 0;
-    TPMDigestValue digests[2];
+    TPMDigestValue digests[TXT_LOG_NR_BANKS];
+    size_t nr_digests = 0;
     uint64_t off;
     int ret = -1;
 
@@ -1321,17 +1661,34 @@ static int intel_txt_measure_mle(IntelTxtState *s, IntelTxtMleEntry *entry,
         goto out;
     }
 
-    digests[0] = (TPMDigestValue) {
-        .alg = TPM2_ALG_SHA1, .digest = sha1, .len = sha1_len,
-    };
-    digests[1] = (TPMDigestValue) {
-        .alg = TPM2_ALG_SHA256, .digest = sha256, .len = sha256_len,
-    };
+    for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
+        g_autofree uint8_t *extra = NULL;
+        const uint8_t *hash = i == 0 ? sha1 : sha256;
+        size_t len = i == 0 ? sha1_len : sha256_len;
+
+        if (!(log->banks & BIT(i)) && (log->banks || i >= 2)) {
+            continue;
+        }
+        if (i >= 2) {
+            len = 0;
+            if (qcrypto_hash_bytes(intel_txt_log_banks[i].crypto, mle,
+                                   mle_size, &extra, &len, errp) < 0) {
+                goto out;
+            }
+            hash = extra;
+        }
+        g_assert(len == intel_txt_log_banks[i].len);
+        memcpy(log->mle[i], hash, len);
+        digests[nr_digests++] = (TPMDigestValue) {
+            .alg = intel_txt_log_banks[i].alg,
+            .digest = log->mle[i], .len = len,
+        };
+    }
 
     trace_txt_measure_mle(ptab, mle_size, hdr_base);
     intel_txt_trace_digest("MLE", sha1, sha1_len, sha256, sha256_len);
-    ret = intel_txt_drtm_extend_pcr(s, INTEL_TXT_DRTM_PCR_MLE, digests, 2,
-                                   errp);
+    ret = intel_txt_drtm_extend_pcr(s, INTEL_TXT_DRTM_PCR_MLE, digests,
+                                   nr_digests, errp);
     if (ret == 0) {
         entry->entry_phys = entry_phys;
         entry->ptab = ptab;
@@ -1966,6 +2323,7 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     uint32_t cs_flags, ds_flags;
     uint8_t *acm = NULL;
     IntelTxtPmrs pmrs;
+    IntelTxtEventLog log = { 0 };
     uint64_t pmr_errorcode;
     CPUState *cpu;
     Error *err = NULL;
@@ -2078,6 +2436,25 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     if (!intel_txt_validate_pmrs(s, &pmrs, &pmr_errorcode, &err)) {
         goto fail_pmr;
     }
+    /* Check log bounds and supported active banks before any PCR is reset. */
+    if (!intel_txt_event_log_prepare(s, &log, &err)) {
+        goto fail_event_log;
+    }
+    for (unsigned i = 0; i < TXT_LOG_NR_BANKS; i++) {
+        g_autofree uint8_t *digest = NULL;
+        size_t len = 0;
+
+        if (!(log.banks & BIT(i))) {
+            continue;
+        }
+        if (qcrypto_hash_bytes(intel_txt_log_banks[i].crypto,
+                               (char *)acm, acm_size,
+                               &digest, &len, &err) < 0) {
+            goto fail_event_log;
+        }
+        g_assert(len == intel_txt_log_banks[i].len);
+        memcpy(log.acm[i], digest, len);
+    }
 
     /*
      * Engage SMI inhibition once every precondition has passed and
@@ -2171,11 +2548,12 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
      * sequence because _TPM_Hash_Start zeroes PCR 18 as well, so doing
      * it the other way round would discard this extend.
      */
-    ret = intel_txt_measure_mle(s, entry, &err);
+    ret = intel_txt_measure_mle(s, entry, &log, &err);
     if (ret < 0) {
         goto fail_measure;
     }
-    if (!intel_txt_write_sinit_mle_data(s, &err)) {
+    if (!intel_txt_write_sinit_mle_data(s, &err) ||
+        !intel_txt_event_log_publish(&log, &err)) {
         goto fail_heap_data;
     }
 
@@ -2197,6 +2575,12 @@ fail_pmr:
     error_report_err(err);
     g_free(acm);
     s->errorcode = pmr_errorcode;
+    trace_txt_senter_errorcode(s->errorcode);
+    return false;
+fail_event_log:
+    error_report_err(err);
+    g_free(acm);
+    s->errorcode = TXT_ERRORCODE_HEAP_INVALID;
     trace_txt_senter_errorcode(s->errorcode);
     return false;
 fail_pmr_program:

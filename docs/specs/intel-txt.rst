@@ -627,17 +627,37 @@ backend's control channel, so it requires ``-tpmdev emulator``; the
 passthrough backend cannot express it, and ``txt=on`` refuses a
 backend that does not implement it.
 
+For TPM 2.0 ``os_sinit_data`` version 7, SENTER also validates the
+size-bounded event-log pointer 2.1 extended element, its END marker,
+and the log's writable RAM backing before resetting PCRs. The Intel TXT
+Software Development Guide (Appendix F) explicitly says SINIT does
+*not* require or enforce DMA protection of the event-log memory; the
+log may be outside the PMRs (unlike the MLE and its page tables).
+It queries ``TPM2_GetCapability(PCRS)`` for active PCR17/18 banks;
+SHA-1, SHA-256, SHA-384 and SHA-512 are supported and an active bank
+outside that set rejects the launch rather than yielding an incomplete
+log. SENTER writes a TCG ``EV_NO_ACTION`` Spec ID Event03 header and
+updates the heap element's first/next record offsets. Two
+``TCG_PCR_EVENT2`` records hold the actual ACM/PCR17 and MLE/PCR18
+digests in each active bank, so the model's measured extensions can
+be replayed from the log. These records use generic ``EV_ACTION`` and
+``QEMU TXT ACM`` / ``QEMU TXT MLE`` descriptions: they describe the
+*semantic QEMU measurements*, not all events a genuine SINIT ACM
+would have produced. A version-6 heap without the TPM2 pointer keeps
+its previous behavior. Too-small logs and malformed elements fail
+before DRTM PCR reset.
+
 PCR 17 remains only the first component of the eventual composite;
 launch-context digests are not yet extended, so it is not final or
 attestable. PCR 18 receives the measured MLE hash.
 
-Neither input digest is observable from the guest: the ACM digest is
+Neither input digest is returned by the TPM: the ACM digest is
 computed inside the TPM by the ``_TPM_Hash_*`` sequence and never
-returned, and the MLE digest is consumed directly by the extend.  The
-``txt_drtm_digest`` trace point reports both, which makes a PCR value
-reproducible offline -- replaying ``Extend()`` from zero over these
-plus the MLE's own TCG event log must yield exactly what the guest
-reads back from ``/sys/class/tpm/tpm0/pcr-sha1|sha256/<N>``.  That is
+returned, and the MLE digest is consumed directly by the extend. The
+``txt_drtm_digest`` trace point reports SHA-1 and SHA-256; for the
+version-7 TPM2 log QEMU also computes SHA-384/SHA-512 when allocated.
+Replaying ``Extend()`` from zero over the model's log entries and the
+MLE's later entries must match the guest's PCR readback. That is
 an internal-consistency check, not attestation: the fixture is
 unsigned and no signature is verified (deviation 1). Invalid ACM inputs
 and unsupported SMP are rejected before TPM commands; malformed MLE

@@ -179,15 +179,17 @@ DECLARE_INSTANCE_CHECKER(IntelTxtState, INTEL_TXT,
  */
 #define TPM2_ALG_SHA1   0x0004   /* 20-byte digest */
 #define TPM2_ALG_SHA256 0x000b   /* 32-byte digest */
+#define TPM2_ALG_SHA384 0x000c   /* 48-byte digest */
+#define TPM2_ALG_SHA512 0x000d   /* 64-byte digest */
 
 /*
  * One hash-algorithm/digest pair, as passed to
  * intel_txt_drtm_extend_pcr().
  */
 typedef struct TPMDigestValue {
-    uint16_t alg;        /* TPM2_ALG_SHA1 or TPM2_ALG_SHA256 */
+    uint16_t alg;        /* one of TPM2_ALG_SHA1/256/384/512 */
     const uint8_t *digest;
-    size_t len;          /* 20 or 32 bytes, matching alg */
+    size_t len;          /* 20, 32, 48 or 64 bytes, matching alg */
 } TPMDigestValue;
 
 

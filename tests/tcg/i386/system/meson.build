@@ -119,6 +119,24 @@ if 'qemu-system-i386' in emulators
     'wrapper': [run_swtpm_test],
   }}
 
+  # Version-7 OS-to-SINIT data: verify bounded TPM2 Spec ID/log creation,
+  # bank descriptions and PCR-unchanged rejection of a bad log pointer.
+  tests += {'test-smx-getsec.c': {
+    'exe_name': 'test-smx-getsec-tpm2-log',
+    'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                        '-fno-stack-protector', '-msse',
+                        '-DTEST_TXT_TPM2_LOG=1'],
+    'qemu_args': ['-machine', 'q35,txt=on',
+                  '-cpu', 'qemu32,smx,sse',
+                  '-device', 'intel-iommu',
+                  '-device', 'iommu-testdev',
+                  '-chardev',
+                  'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                  '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                  '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+    'wrapper': [run_swtpm_test],
+  }}
+
   tcg_tests += {
     'i386-softmmu': {
       'cc': cc,

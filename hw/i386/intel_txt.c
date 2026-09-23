@@ -2792,16 +2792,28 @@ bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp)
         trace_txt_wakeup_rejected("unreadable MLE_JOIN");
         return false;
     }
+    trace_txt_wakeup_join(rlp->gdt_base, rlp->gdt_limit, rlp->seg_sel,
+                          rlp->entry_point);
     if (rlp->gdt_limit < 23 || rlp->gdt_limit > UINT16_MAX ||
         !rlp->gdt_base ||
         (uint64_t)rlp->gdt_base + rlp->gdt_limit >=
-            INTEL_TXT_GUEST_32BIT_LIMIT ||
-        !rlp->entry_point || rlp->seg_sel > UINT16_MAX - 8 ||
-        !intel_txt_join_desc(rlp->gdt_base, rlp->gdt_limit,
+            INTEL_TXT_GUEST_32BIT_LIMIT) {
+        trace_txt_wakeup_rejected("MLE_JOIN GDT base/limit out of range");
+        return false;
+    }
+    if (!rlp->entry_point) {
+        trace_txt_wakeup_rejected("MLE_JOIN entry point is zero");
+        return false;
+    }
+    if (rlp->seg_sel > UINT16_MAX - 8) {
+        trace_txt_wakeup_rejected("MLE_JOIN segment selector out of range");
+        return false;
+    }
+    if (!intel_txt_join_desc(rlp->gdt_base, rlp->gdt_limit,
                              rlp->seg_sel, &rlp->cs_desc) ||
         !intel_txt_join_desc(rlp->gdt_base, rlp->gdt_limit,
                              rlp->seg_sel + 8, &rlp->ds_desc)) {
-        trace_txt_wakeup_rejected("invalid GDT range, selector or entry");
+        trace_txt_wakeup_rejected("MLE_JOIN CS/DS descriptor not in the GDT");
         return false;
     }
     cs_flags = rlp->cs_desc >> 32;
@@ -2811,12 +2823,20 @@ bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp)
      * uses CS-relative addressing before loading its own GDT.
      */
     if ((cs_flags & 0x0040f800) != 0x00409800 ||
-        (ds_flags & 0x0040fa00) != 0x00409200 ||
-        (cs_flags & 0x00200000) ||
-        ((rlp->cs_desc >> 16) & 0xffff) != 0 ||
+        (cs_flags & 0x00200000)) {
+        trace_txt_wakeup_rejected("MLE_JOIN CS is not a present 32-bit "
+                                  "ring-0 code descriptor");
+        return false;
+    }
+    if ((ds_flags & 0x0040fa00) != 0x00409200) {
+        trace_txt_wakeup_rejected("MLE_JOIN DS is not a present 32-bit "
+                                  "ring-0 writable data descriptor");
+        return false;
+    }
+    if (((rlp->cs_desc >> 16) & 0xffff) != 0 ||
         (cs_flags & 0xff000000) != 0 ||
         (cs_flags & 0xff) != 0) {
-        trace_txt_wakeup_rejected("GDT descriptors not flat ring-0 code/data");
+        trace_txt_wakeup_rejected("MLE_JOIN CS base is not flat");
         return false;
     }
     trace_txt_wakeup_entry(rlp->entry_point, rlp->seg_sel,

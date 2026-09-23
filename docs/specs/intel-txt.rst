@@ -422,6 +422,23 @@ on an advertisement it does not control:
 An ``os_sinit_data`` too short to contain the capabilities field
 predates it and can only mean GETSEC[WAKEUP].
 
+Either mechanism validates ``TXT.MLE_JOIN`` before joining an RLP: the
+GDT base and limit must describe a range below 4 GiB, the limit must
+fit the GDTR's 16-bit limit field, the entry point must be non-zero,
+and the selector must resolve to a present flat ring-0 32-bit code
+descriptor with a writable data descriptor at ``seg_sel + 8``.  Each
+rejection is traced separately (``txt_wakeup_rejected``) and the raw
+structure is traced on every attempt (``txt_wakeup_join``), because a
+malformed join structure otherwise shows up only as an MLE that never
+sees its APs arrive.
+
+That is not hypothetical: Xen's Secure Launch AP bringup builds the
+join structure with ``trampoline_gdt[1]`` as the GDT limit, but the
+first eight bytes of Xen's ``trampoline_gdt`` are a GDTR pseudo-
+descriptor, so element 1 is the GDT *base* (the limit is in the high
+half of element 0).  Both fields then carry the base, the limit does
+not fit 16 bits, and the wake is refused.
+
 RLP wake is a separate question from how the MLE then *parks* its
 APs, and the two are chosen independently -- the wake method comes
 from this capability intersection, while the parking method is the

@@ -167,5 +167,8 @@ txt_sinit_mle_data(uint32_t num_mdrs, uint64_t region_off) "sinit_mle_data writt
 txt_wakeup_rejected(const char *reason) "GETSEC[WAKEUP]: %s"
 txt_wakeup_entry(uint32_t entry, uint32_t selector, uint32_t gdt, uint32_t limit) "GETSEC[WAKEUP]: entry 0x%"PRIx32" cs 0x%"PRIx32" gdt 0x%"PRIx32" limit 0x%"PRIx32
 txt_sexit(uint64_t sts) "GETSEC[SEXIT]: measured environment left, TXT.STS = 0x%"PRIx64
+txt_smi_inhibit(void) "TXT: SMI inhibition engaged by SENTER"
+txt_smi_held(int cpu) "TXT: SMI held on CPU %d (inhibition engaged)"
+txt_smi_released(int pending) "TXT: SMI inhibition released, %d held SMI(s) redelivered"
 txt_dmar_found(uint64_t addr, uint32_t len) "sinit_mle_data: DMAR at 0x%"PRIx64", %"PRIu32" bytes"
 txt_dmar_rejected(uint64_t addr, uint32_t len) "sinit_mle_data: DMAR at 0x%"PRIx64" rejected (bad length/checksum), %"PRIu32" bytes"

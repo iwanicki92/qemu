@@ -72,6 +72,14 @@ struct IntelTxtState {
     /* TXT.E2STS */
     uint64_t e2sts;
 
+    /*
+     * SMI inhibition while a measured environment is live: engaged
+     * by a successful SENTER, released by SEXIT or GETSEC[SMCTRL].
+     * SMIs arriving while it is set are held per CPU and redelivered
+     * on release (see intel_txt_hold_smi / intel_txt_release_smis).
+     */
+    bool smi_inhibit;
+
     /* TXT.DIDVID, configurable for experimentation (see spec) */
     uint64_t didvid;
 
@@ -1925,6 +1933,19 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
     }
 
     /*
+     * Engage SMI inhibition once every precondition has passed and
+     * before any DRTM PCR is reset below: an SMI must not preempt a
+     * launch while the measured environment is being established.
+     * Arriving SMIs are held per CPU and redelivered by SEXIT or
+     * GETSEC[SMCTRL].  A rejected launch never reaches this point,
+     * so its SMIs keep flowing normally.
+     */
+    bql_lock();
+    s->smi_inhibit = true;
+    bql_unlock();
+    trace_txt_smi_inhibit();
+
+    /*
      * Program the VT-d Protected Memory Regions before the DRTM
      * measurement below, so a programming failure cannot leave PCRs
      * 17-22 half-measured.  On hardware the chipset programs the PMRs
@@ -2033,12 +2054,14 @@ fail_pmr:
     return false;
 fail_pmr_program:
     error_report_err(err);
+    intel_txt_release_smis(s);
     g_free(acm);
     s->errorcode = TXT_ERRORCODE_PMR_PROGRAM_FAILED;
     trace_txt_senter_errorcode(s->errorcode);
     return false;
 fail_heap_data:
     error_report_err(err);
+    intel_txt_release_smis(s);
 fail_heap:
     g_free(acm);
     s->errorcode = TXT_ERRORCODE_HEAP_INVALID;
@@ -2061,20 +2084,68 @@ fail_measure:
      * error, malformed MLE header or page table, ...).
      */
     error_report_err(err);
+    intel_txt_release_smis(s);
     g_free(acm);
     s->errorcode = TXT_ERRORCODE_MEASURE_FAILED;
     trace_txt_senter_errorcode(s->errorcode);
     return false;
 }
 
+bool intel_txt_smi_inhibited(IntelTxtState *s)
+{
+    return s->smi_inhibit;
+}
+
+void intel_txt_hold_smi(CPUState *cs)
+{
+    cpu_env(cs)->smi_held = true;
+    trace_txt_smi_held(cs->cpu_index);
+}
+
+void intel_txt_release_smis(IntelTxtState *s)
+{
+    CPUState *cs;
+    int pending = 0;
+
+    /*
+     * GETSEC helpers run without the BQL.  Serialize the inhibit
+     * transition with SMI consumption on other vCPU threads; the
+     * flag must be cleared atomically with draining held SMIs.
+     */
+    bql_lock();
+    if (!s->smi_inhibit) {
+        bql_unlock();
+        return;
+    }
+    s->smi_inhibit = false;
+    CPU_FOREACH(cs) {
+        /*
+         * Several SMIs held on one CPU collapse into a single
+         * redelivery; no SMM handler in this model depends on the
+         * count.
+         */
+        if (cpu_env(cs)->smi_held) {
+            cpu_env(cs)->smi_held = false;
+            cpu_interrupt(cs, CPU_INTERRUPT_SMI);
+            pending++;
+        }
+    }
+    bql_unlock();
+    trace_txt_smi_released(pending);
+}
+
 bool intel_txt_smctrl(IntelTxtState *s, uint32_t control)
 {
-    /*
-     * GETSEC[SMCTRL] with EBX=0 releases SMI inhibition after SINIT
-     * exits. QEMU does not yet inhibit SMIs during SENTER; accept only
-     * the post-launch request rather than claiming full SMI isolation.
-     */
-    return control == 0 && (s->sts & TXT_STS_SENTER_DONE);
+    if (control == 0 && (s->sts & TXT_STS_SENTER_DONE)) {
+        /*
+         * GETSEC[SMCTRL] with EBX=0 releases the SMI inhibition that
+         * SENTER engaged: held SMIs are redelivered and new ones flow
+         * normally until SEXIT.
+         */
+        intel_txt_release_smis(s);
+        return true;
+    }
+    return false;
 }
 
 bool intel_txt_sexit(IntelTxtState *s)
@@ -2117,6 +2188,13 @@ bool intel_txt_sexit(IntelTxtState *s)
             intel_iommu_clear_txt_pmr(INTEL_IOMMU_DEVICE(iommu));
         }
     }
+
+    /*
+     * Release the SMI inhibition together with the measured
+     * environment: SMIs held during the launch are redelivered, and
+     * new ones flow normally to the firmware/OS that takes over.
+     */
+    intel_txt_release_smis(s);
 
     /*
      * SINIT_BASE/SIZE, HEAP_BASE/SIZE and DPR deliberately stay
@@ -2232,6 +2310,7 @@ static void intel_txt_reset_hold(Object *obj, ResetType type)
     s->biosacm_errorcode = 0;
     s->dpr = 0;
     s->e2sts = 0;
+    s->smi_inhibit = false;
 }
 
 static void intel_txt_realize(DeviceState *dev, Error **errp)
@@ -2293,7 +2372,7 @@ static const Property intel_txt_properties[] = {
 
 static const VMStateDescription vmstate_intel_txt = {
     .name = TYPE_INTEL_TXT,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(sts, IntelTxtState),
@@ -2310,6 +2389,7 @@ static const VMStateDescription vmstate_intel_txt = {
         VMSTATE_UINT64(biosacm_errorcode, IntelTxtState),
         VMSTATE_UINT64(dpr, IntelTxtState),
         VMSTATE_UINT64(e2sts, IntelTxtState),
+        VMSTATE_BOOL_V(smi_inhibit, IntelTxtState, 2),
         VMSTATE_END_OF_LIST()
     },
 };

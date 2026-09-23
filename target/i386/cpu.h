@@ -2146,6 +2146,14 @@ typedef struct CPUArchState {
     /* End of state preserved by INIT (dummy marker).  */
     struct {} end_init_save;
 
+    /*
+     * TXT: an SMI was held for this CPU while SMI inhibition was
+     * engaged (between SENTER and SEXIT/GETSEC[SMCTRL]); it is
+     * redelivered once the inhibition is released.  Cleared by CPU
+     * reset.  TCG only; KVM never reaches it.
+     */
+    bool smi_held;
+
     uint64_t system_time_msr;
     uint64_t wall_clock_msr;
     uint64_t steal_time_msr;

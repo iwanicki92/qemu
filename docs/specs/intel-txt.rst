@@ -301,8 +301,11 @@ GETSEC[EXITAC] (EAX=3, EBX=near jump target)
   via the near jump, or #UD until Option B.
 
 GETSEC[SMCTRL] (EAX=7, EBX=0)
-  Accepted after SENTER; no SMI inhibition is modeled, so this only
-  satisfies the MLE's post-launch enable request.
+  Accepted after SENTER.  Releases the SMI inhibition that SENTER
+  engaged: SMIs that arrived while the measured environment was
+  being established are held per CPU and redelivered on release,
+  and new SMIs flow normally until SEXIT (see *SMI inhibition*
+  below).
 
 TXT heap
 ========
@@ -477,7 +480,8 @@ return without a machine reset (a QEMU semantic deviation):
    the MLE page tables and every physical page mapped by ``mle_ptab``
    for the MLE. An uncovered page records ``PMR_INVALID`` (0x80080001).
    An invalid MLE page-table entry records ``MEASURE_FAILED`` instead.
-   **This validates guest inputs only; it does not block DMA.**
+   **This validates guest inputs only; the DMA enforcement happens
+   in step g.**
 
 SINIT-equivalent sequence (unimplemented portions noted):
 
@@ -517,19 +521,36 @@ e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
 f. The MLE writes ``TXT.MLE_JOIN`` in private MMIO after SENTER;
    GETSEC[WAKEUP] validates that block and its GDT before joining
    every sleeping AP. It is a no-op on a single-vCPU machine.
-g. Programming and enforcing VT-d PMRs remains deferred. QEMU now
-   validates the ``os_sinit_data`` low/high PMR inputs before measuring,
-   but does **not** program the VT-d PMR registers or deny device DMA
-   into those windows. TXT heap protection (including the copied DMAR)
-   is provided by the separate DPR on hardware, not by the PMRs; QEMU
-   currently does not enforce DPR against DMA either. The measured
-   DMAR copy must therefore not be treated as hardware-protected.
+g. Program and enforce the VT-d protected memory regions. SENTER
+   validates the ``os_sinit_data`` low/high PMR inputs before
+   measuring (precondition 5), clears any stale PMR, programs the
+   2 MiB-granularity PMR base/limit and PMEN registers, and the VT-d
+   model then denies device DMA into those windows until SEXIT,
+   which clears them.  SENTER fails closed when there is no VT-d
+   device or a host device caches mappings outside the IOMMU.  TXT
+   heap protection (including the copied DMAR) is provided by the
+   separate DPR on hardware, not by the PMRs; QEMU does not enforce
+   DPR against DMA either.  The measured DMAR copy must therefore
+   not be treated as hardware-protected.
 h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).
 i. Transfer BSP control to the MLE entry point (see below). APs were
    halted and put into TXT sleep before measurement; a running AP
    rejects the launch rather than executing outside the MLE.
+
+SMI inhibition
+--------------
+
+Once every precondition has passed (before the DRTM PCRs are
+reset), SENTER engages SMI inhibition for the whole measured
+environment.  An SMI that arrives while it is engaged is held for
+that CPU instead of entering SMM; SEXIT or GETSEC[SMCTRL] releases
+the inhibition and redelivers the held SMIs.  Because QEMU's SMM
+entry is real-mode only (``smbase`` + 0x8000), the inhibition is
+observable and enforceable, but it is a semantic model, not
+chipset SMI masking: there is no SMM-monitor involvement, and
+several SMIs held on one CPU collapse into a single redelivery.
 
 Private space is opened at step b and is *not* closed by SENTER.  An
 earlier revision of this document had step h close it, which no MLE
@@ -697,8 +718,11 @@ Deviations from real hardware
 2. SINIT executes as QEMU helper code, not from authenticated RAM;
    no GETSEC[ENTERACCS]/AC-mode. FIT, BootGuard and CBnT features
    are out of scope.
-3. VT-d PMR inputs are validated, but VT-d PMR and DPR DMA exclusion
-   are not enforced. SMM-monitor (MSEG/STM) is not implemented.
+3. VT-d PMR is enforced against device DMA between SENTER and
+   SEXIT; DPR is not.  SMI inhibition between SENTER and
+   SEXIT/SMCTRL is modeled semantically (held per CPU and
+   redelivered, multiple held SMIs collapse to one), not as chipset
+   SMI masking.  SMM-monitor (MSEG/STM) is not implemented.
 4. Private config space is largely a facade (see above).
 5. Only one TXT generation is modeled; the register map is the
    intersection documented above (FSB-era offsets + modern

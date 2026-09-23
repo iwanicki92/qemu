@@ -427,6 +427,11 @@ static void port_outl(uint32_t port, uint32_t v)
     asm volatile("outl %%eax, %%dx" :: "a"(v), "d"(port));
 }
 
+static void port_outb(uint32_t port, uint32_t v)
+{
+    asm volatile("outb %%al, %%dx" :: "a"(v), "d"(port));
+}
+
 /* PCI config access on bus 0; the test's devices are all on bus 0. */
 static uint32_t pci_cfg_readl(uint32_t devfn, uint32_t off)
 {
@@ -456,6 +461,46 @@ static void itd_writel(uint32_t bar, uint32_t off, uint32_t v)
 {
     /* volatile: MMIO write of a test device register. */
     *(volatile uint32_t *)(uintptr_t)(bar + off) = v;
+}
+
+/*
+ * ICH9 LPC (device 0:31) SMI injection: PMBASE is programmed at
+ * 0x1000 with ACPI enabled, and the APM control port (0xb2) raises
+ * an SMI on any command other than 0x80/0x84 when SMI_EN.APMC_EN is
+ * set.  SeaBIOS relocates SMBASE and installs its own SMM handler;
+ * MSR_SMI_COUNT records actual SMM entry without assuming the reset
+ * SMBASE or overwriting firmware SMRAM.
+ */
+#define ICH9_LPC_DEVFN        0xf8
+#define APM_CNT_PORT          0xb2
+#define SMI_COUNT_MSR         0x34
+
+/* Program the ICH9 PM IO region for APM SMI injection. */
+static uint32_t smi_trigger_setup(void)
+{
+    uint32_t v;
+
+    /* PMBASE 0x1000, RTE on; ACPI enabled so the PM IO maps. */
+    pci_cfg_writel(ICH9_LPC_DEVFN, 0x40, 0x1001);
+    v = pci_cfg_readl(ICH9_LPC_DEVFN, 0x48);
+    pci_cfg_writel(ICH9_LPC_DEVFN, 0x48, v | 0x80);
+    return 0x1000;
+}
+
+static void smi_trigger(uint32_t pm_io)
+{
+    /* volatile: PM IO SMI_EN register, ICH9 APM control port. */
+    *(volatile uint32_t *)(uintptr_t)(pm_io + 0x30) = 0x20;
+    port_outb(APM_CNT_PORT, 0x86);
+}
+
+/*
+ * A pending SMI is consumed at the next translation-block boundary;
+ * an outb to the POST diagnostic port forces one.
+ */
+static void smi_wait(void)
+{
+    port_outb(0x80, 0);
 }
 
 /*
@@ -1531,6 +1576,8 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
     volatile uint8_t *section = (volatile uint8_t *)(uintptr_t)
         (TEST_HEAP_BASE + 0x68);
     uint32_t count, off;
+    uint32_t original_pmbase, original_acpi_ctrl;
+    uint64_t smi_count_before;
 
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
@@ -1609,10 +1656,37 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
     }
 
     /*
-     * SMCTRL releases SMIs. The SMP variant provides a valid RLP
-     * join block, then verifies that its own AP landing code ran.
+     * SMCTRL releases SMIs.  While the measured environment is live,
+     * an SMI must not enter SMM: trigger one, verify it is held, then
+     * let SMCTRL release it and verify exactly one SMM entry via
+     * MSR_SMI_COUNT.  The SMP variant provides a
+     * valid RLP join block, then verifies that its own AP landing
+     * code ran.
      */
+    {
+        uint32_t pm_io;
+
+        original_pmbase = pci_cfg_readl(ICH9_LPC_DEVFN, 0x40);
+        original_acpi_ctrl = pci_cfg_readl(ICH9_LPC_DEVFN, 0x48);
+        pm_io = smi_trigger_setup();
+        smi_count_before = msr_read64(SMI_COUNT_MSR);
+        smi_trigger(pm_io);
+        smi_wait();
+        if (msr_read64(SMI_COUNT_MSR) != smi_count_before) {
+            fail_msg("SMI entered SMM while SMI inhibition was engaged",
+                     16384);
+        }
+    }
     asm volatile(".byte 0x0f, 0x37" : : "a"(7), "b"(0) : "memory");
+    {
+        smi_wait();
+        if (msr_read64(SMI_COUNT_MSR) != smi_count_before + 1) {
+            fail_msg("GETSEC[SMCTRL] did not redeliver the held SMI",
+                     16384);
+        } else {
+            ml_printf("PASS: SMI held during SENTER, redelivered by SMCTRL\n");
+        }
+    }
 #ifdef TEST_TXT_SMP
     {
         /* Volatile: WAKEUP reads this stack block through guest RAM. */
@@ -1724,6 +1798,24 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             ml_printf("PASS: SEXIT released the PMR\n");
         }
     }
+
+    /*
+     * SEXIT also released the SMI inhibition: a new SMI now enters
+     * SMM immediately without waiting for SMCTRL.
+     */
+    {
+        smi_trigger(0x1000);
+        smi_wait();
+        if (msr_read64(SMI_COUNT_MSR) != smi_count_before + 2) {
+            fail_msg("SMI after SEXIT did not enter SMM immediately",
+                     65536);
+        } else {
+            ml_printf("PASS: SMI inhibition released by SEXIT\n");
+        }
+    }
+    /* Restore SeaBIOS's PM IO mapping (including the 0x604 exit port). */
+    pci_cfg_writel(ICH9_LPC_DEVFN, 0x40, original_pmbase);
+    pci_cfg_writel(ICH9_LPC_DEVFN, 0x48, original_acpi_ctrl);
 
     if (main_fail) {
         ml_printf("smx: MLE landing failed (0x%x)\n", main_fail);

@@ -1822,6 +1822,17 @@ static const VMStateDescription vmstate_txt_ap_sleep = {
     }
 };
 
+static const VMStateDescription vmstate_txt_smi_held = {
+    .name = "cpu/txt-smi-held",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = txt_ap_sleep_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.smi_held, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_x86_cpu = {
     .name = "cpu",
     .version_id = 12,
@@ -1918,6 +1929,7 @@ const VMStateDescription vmstate_x86_cpu = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_txt_ap_sleep,
+        &vmstate_txt_smi_held,
         &vmstate_exception_info,
         &vmstate_error_code,
         &vmstate_async_pf_msr,

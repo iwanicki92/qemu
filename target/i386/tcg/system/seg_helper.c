@@ -25,6 +25,9 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "tcg/helper-tcg.h"
+#ifdef CONFIG_TPM
+#include "hw/i386/intel_txt.h"
+#endif
 #include "../seg_helper.h"
 
 void helper_syscall(CPUX86State *env, int next_eip_addend)
@@ -187,6 +190,19 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         break;
     case CPU_INTERRUPT_SMI:
         cpu_svm_check_intercept_param(env, SVM_EXIT_SMI, 0, 0);
+        /*
+         * While TXT SMI inhibition is engaged (between SENTER and
+         * SEXIT/GETSEC[SMCTRL]), the SMI is held instead of entering
+         * SMM; it is redelivered when the inhibition is released.
+         */
+#ifdef CONFIG_TPM
+        if (env_archcpu(env)->txt_state &&
+            intel_txt_smi_inhibited(env_archcpu(env)->txt_state)) {
+            cpu_reset_interrupt(cs, CPU_INTERRUPT_SMI);
+            intel_txt_hold_smi(cs);
+            break;
+        }
+#endif
         cpu_reset_interrupt(cs, CPU_INTERRUPT_SMI);
         do_smm_enter(cpu);
         break;

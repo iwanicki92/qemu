@@ -11,6 +11,7 @@
 #define HW_I386_INTEL_TXT_H
 
 #include "exec/hwaddr.h"
+#include "hw/core/cpu.h"
 #include "qapi/error.h"
 #include "qom/object.h"
 
@@ -208,7 +209,16 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
                       uint32_t acm_size, IntelTxtMleEntry *entry);
 /* Record a rejected launch when an RLP cannot be parked safely. */
 void intel_txt_reject_aps(IntelTxtState *s);
-/* Post-launch SMCTRL; SMI masking is not modeled. */
+/* Is SMI inhibition currently engaged (between SENTER and SEXIT/SMCTRL)? */
+bool intel_txt_smi_inhibited(IntelTxtState *s);
+/* Hold one SMI on this CPU until the inhibition is released. */
+void intel_txt_hold_smi(CPUState *cs);
+/* Release the inhibition and redeliver the SMIs held per CPU. */
+void intel_txt_release_smis(IntelTxtState *s);
+/*
+ * Post-launch SMCTRL: EBX=0 releases the SMI inhibition that SENTER
+ * engaged (held SMIs are redelivered).
+ */
 bool intel_txt_smctrl(IntelTxtState *s, uint32_t control);
 /* Leave the measured environment; not a platform reset. */
 bool intel_txt_sexit(IntelTxtState *s);

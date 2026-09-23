@@ -277,7 +277,7 @@ int main(int argc, char **argv)
      * tpm-tis device at 0xFED40000.
      */
     args = g_strdup_printf(
-        "-machine q35,txt=on "
+        "-machine q35,txt=on -device intel-iommu "
         "-chardev socket,id=chr,path=%s "
         "-tpmdev emulator,id=dev,chardev=chr "
         "-device tpm-tis,tpmdev=dev",

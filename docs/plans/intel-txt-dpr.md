@@ -1,6 +1,6 @@
 # TXT DPR enforcement and private-space scope
 
-Status: in progress. Local correctness work; upstream contributions are deferred.
+Status: implemented and locally verified. Upstream contributions are deferred.
 
 ## Contract
 
@@ -58,5 +58,33 @@ Status: in progress. Local correctness work; upstream contributions are deferred
    Linux 2-CPU handoff, SEXIT teardown, `-d int` exceptions, and checkpatch.
    Only then update `docs/specs/intel-txt.rst` to claim DPR enforcement.
 
-The existing test harness runs with idle AHCI and no NIC or guest root disk,
-so a successful E2E by itself **does not exercise device DMA into DPR**.
+## Verification and boundaries
+
+- Locked DPR activates a separate VT-d physical-address check independent of
+  PMR/PMEN and DMAR enablement, and keeps PCI DMA routed through VT-d while
+  locked. Q35 i8257 callbacks deny overlapping direct ISA DMA; PCI EHCI uses
+  the PCI address space even with bus mastering off on TXT machines.
+- TXT refuses a default Q35 PCI root bus or a PCI expander root bus configured
+  to bypass the IOMMU. Non-TXT device routing is unchanged. A nonempty DPR
+  cannot lock without intel-iommu, nor with existing host notifiers or host
+  IOMMU devices; new host attachments are rejected while DPR/PMR is active.
+- The qtest uses actual PCI DMA and floppy/i8257 DMA at DPR boundaries,
+  including unprotected adjacent addresses, PMR coexistence, CPU writes and
+  reset. Single-/SMP TCG tests verify that locked DPR excludes DMA to the
+  populated heap, including the copied DMAR table, both before and after
+  SENTER. All DMA-result polls are bounded.
+- A live QEMU/swtpm file-migration check verified locked DPR at source and
+  destination and PCI DMA failure at the same protected address on both,
+  after incoming migration completed. DPR is restored from TXT VMState; it is
+  not a separate migrated VT-d property.
+- The 13 focused TCG/qtests and single-/two-vCPU tboot/Linux boots passed;
+  both boots independently replayed all four SHA-1/SHA-256 PCR17/18 values.
+  SMP boot woke the AP and handed two CPUs to Linux; both boots tore down via
+  SEXIT with no logged exceptions. Checkpatch found only the missing commit
+  Signed-off-by header before committing.
+
+The E2E harness itself runs with idle AHCI and no NIC or guest root disk:
+**E2E alone does not exercise DMA into the DPR**. Dedicated qtest/TCG DMA
+transfers establish that narrower functional behavior. The model does not
+provide malicious-device containment, MSEG/STM, a verified MCH DPR PCI mirror,
+or hardware-backed remote attestation.

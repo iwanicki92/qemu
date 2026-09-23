@@ -233,16 +233,23 @@ before SENTER; the SINIT ACM verifies DPR covers the SINIT region
 
 QEMU behavior:
 
-- M1: register storage + lock semantics, no enforcement.
-- M5: after lock, the covered guest-RAM range is made inaccessible
-  to devices (DMA) via memory-region permission changes, and to CPU
-  writes outside of a launch sequence. This is *functional* (guest
-  software correctness) protection, not an adversary model.
+- SENTER requires a locked, nonempty, nonwrapping DPR covering the full
+  SINIT reservation and TXT heap before resetting any DRTM PCR.
+- Locking a nonempty DPR without a compatible intel-iommu device, or
+  while a host device caches mappings outside VT-d, is refused.
+- While locked, the VT-d path denies PCI DMA into the DPR even when
+  guest DMA remapping is disabled or PMEN is cleared. Q35's i8257 ISA
+  DMA path also denies overlapping transfers; refused ISA reads return
+  zeroes and writes are dropped. These checks use physical addresses
+  and cover the entire DMA transfer, not just its first byte.
+- CPU access remains available: firmware and SINIT must populate the
+  protected region. DPR persists across SEXIT, unlike VT-d PMRs, and
+  resets with the chipset. This is functional guest-software protection,
+  **not** an adversary model or remote-attestation equivalent.
 
-The MCH PCI config mirror is deferred to M5 (the TXT MMIO DPR at
-0x330 is fully implemented from M1); its config-space offset must
-be pinned from the Q35 datasheet and coreboot's
-``txt_get_chipset_dpr()`` implementations.
+The MCH PCI config mirror remains unsupported: its offset has not
+been verified against the Q35 datasheet. The TXT MMIO DPR lives at
+0x330.
 
 GETSEC (SMX) CPU interface
 ==========================
@@ -534,9 +541,9 @@ g. Program and enforce the VT-d protected memory regions. SENTER
    which clears them.  SENTER fails closed when there is no VT-d
    device or a host device caches mappings outside the IOMMU.  TXT
    heap protection (including the copied DMAR) is provided by the
-   separate DPR on hardware, not by the PMRs; QEMU does not enforce
-   DPR against DMA either.  The measured DMAR copy must therefore
-   not be treated as hardware-protected.
+   separate DPR, not by the PMRs. QEMU enforces the DPR on its modeled
+   PCI/ISA DMA paths, but the measured DMAR copy is **not** evidence
+   of hardware-backed protection or remote attestation.
 h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).
@@ -671,8 +678,7 @@ Implemented (``intel_txt_sexit()``).
   space, clears ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK`` and the
   locality-open bits, and sets ``STS.SEXIT_DONE``.
 - Disables the VT-d PMRs so device DMA into the former PMR windows is
-  permitted again. DPR stays programmed and locked; DPR DMA exclusion
-  is not yet implemented (deviation 3).
+  permitted again. DPR stays programmed, locked, and DMA-excluding.
 - Releases SMI inhibition and redelivers held SMIs if SMCTRL did not
   already release them.
 
@@ -726,8 +732,9 @@ Deviations from real hardware
 2. SINIT executes as QEMU helper code, not from authenticated RAM;
    no GETSEC[ENTERACCS]/AC-mode. FIT, BootGuard and CBnT features
    are out of scope.
-3. VT-d PMR is enforced against device DMA between SENTER and
-   SEXIT; DPR is not.  SMI inhibition between SENTER and
+3. VT-d PMR and chipset DPR are enforced on the modeled PCI and Q35
+   ISA DMA paths; other host DMA mechanisms must not bypass those paths.
+   SMI inhibition between SENTER and
    SEXIT/SMCTRL is modeled semantically (held per CPU and
    redelivered, multiple held SMIs collapse to one), not as chipset
    SMI masking.  SMM-monitor (MSEG/STM) is not implemented.

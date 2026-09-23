@@ -1702,6 +1702,7 @@ static bool vtd_switch_address_space(VTDAddressSpace *as)
 
     s = as->iommu_state;
     use_iommu = qatomic_read(&s->pmr_enabled) ||
+                qatomic_read(&s->txt_dpr_enabled) ||
                 (s->dmar_enabled && !vtd_as_pt_enabled(as));
     pt = s->dmar_enabled && vtd_as_pt_enabled(as);
 
@@ -1712,8 +1713,9 @@ static bool vtd_switch_address_space(VTDAddressSpace *as)
      * PGTT=PT and used as nesting parent if PGTT=FST. Otherwise fall back
      * to original processing.
      */
-    if (!qatomic_read(&s->pmr_enabled) && s->root_scalable && s->fsts &&
-        vtd_find_hiod_iommufd(as)) {
+    if (!qatomic_read(&s->pmr_enabled) &&
+        !qatomic_read(&s->txt_dpr_enabled) &&
+        s->root_scalable && s->fsts && vtd_find_hiod_iommufd(as)) {
         use_iommu = false;
     }
 
@@ -1833,6 +1835,12 @@ static bool vtd_pmr_update(IntelIOMMUState *s, bool enabled)
  * a base above its limit encodes an empty window.  The check runs on
  * the translated host-physical address, not the IOVA.
  */
+static bool vtd_dpr_blocks(IntelIOMMUState *s, uint64_t phys)
+{
+    return qatomic_read(&s->txt_dpr_enabled) &&
+           phys >= s->txt_dpr_base && phys < s->txt_dpr_top;
+}
+
 static bool vtd_pmr_blocks(IntelIOMMUState *s, uint64_t phys)
 {
     uint64_t lo_base = vtd_get_long_raw(s, DMAR_PLMBASE_REG) &
@@ -1894,6 +1902,41 @@ bool intel_iommu_set_txt_pmr(IntelIOMMUState *s, uint64_t lo_base,
         return false;
     }
     return true;
+}
+
+/*
+ * Locked TXT DPR excludes PCI DMA independently of PMEN. Refuse to enable
+ * while external notifiers or host devices cache translations beyond this
+ * model's control. TXT owns the DPR register and recreates this derived
+ * state on migration; it is not a guest-writable VT-d CSR.
+ */
+bool intel_iommu_set_txt_dpr(IntelIOMMUState *s, uint64_t base,
+                             uint64_t top, Error **errp)
+{
+    if (base >= top ||
+        !QLIST_EMPTY(&s->vtd_as_with_notifiers) ||
+        (s->vtd_host_iommu_dev &&
+         g_hash_table_size(s->vtd_host_iommu_dev))) {
+        error_setg(errp, "TXT DPR cannot protect PCI DMA outside VT-d");
+        return false;
+    }
+    vtd_reset_caches(s);
+    s->txt_dpr_base = base;
+    s->txt_dpr_top = top;
+    qatomic_set(&s->txt_dpr_enabled, true);
+    vtd_address_space_refresh_all(s);
+    return true;
+}
+
+void intel_iommu_clear_txt_dpr(IntelIOMMUState *s)
+{
+    if (!qatomic_read(&s->txt_dpr_enabled)) {
+        return;
+    }
+    vtd_reset_caches(s);
+    qatomic_set(&s->txt_dpr_enabled, false);
+    s->txt_dpr_base = s->txt_dpr_top = 0;
+    vtd_address_space_refresh_all(s);
 }
 
 /* Release the TXT PMRs; called from SEXIT and reset. */
@@ -4216,17 +4259,27 @@ static IOMMUTLBEntry vtd_iommu_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
         success = true;
     }
 
-    if (success) {
+    if (success && (qatomic_read(&s->pmr_enabled) ||
+                    qatomic_read(&s->txt_dpr_enabled))) {
         /*
-         * The PMR denies DMA into the protected window on the
-         * translated host-physical address, even when DMA remapping
-         * is off: a device without a root table would otherwise
-         * bypass the IOMMU path entirely.
+         * Check the actual translated physical address, not the base
+         * of a large-page translation. Return a 4 KiB mapping so the
+         * caller cannot cache access across a DPR/PMR boundary.
          */
-        if (vtd_pmr_blocks(s, iotlb.translated_addr)) {
+        uint64_t phys = iotlb.translated_addr + (addr & iotlb.addr_mask);
+
+        iotlb.translated_addr = phys & VTD_PAGE_MASK_4K;
+        iotlb.iova = addr & VTD_PAGE_MASK_4K;
+        iotlb.addr_mask = ~VTD_PAGE_MASK_4K;
+        if (vtd_dpr_blocks(s, phys)) {
+            trace_vtd_dpr_dma_blocked(pci_bus_num(vtd_as->bus),
+                                      vtd_as->devfn, addr, phys);
+            vtd_prepare_error_entry(&iotlb);
+            success = false;
+        } else if (qatomic_read(&s->pmr_enabled) &&
+                   vtd_pmr_blocks(s, phys)) {
             trace_vtd_pmr_dma_blocked(pci_bus_num(vtd_as->bus),
-                                      vtd_as->devfn, iotlb.iova,
-                                      iotlb.translated_addr);
+                                      vtd_as->devfn, addr, phys);
             vtd_prepare_error_entry(&iotlb);
             success = false;
         }
@@ -4258,6 +4311,16 @@ static int vtd_iommu_notify_flag_changed(IOMMUMemoryRegion *iommu,
     VTDAddressSpace *vtd_as = container_of(iommu, VTDAddressSpace, iommu);
     IntelIOMMUState *s = vtd_as->iommu_state;
     X86IOMMUState *x86_iommu = X86_IOMMU_DEVICE(s);
+
+    /* A newly attached host notifier cannot bypass live DMA exclusion. */
+    if (new != IOMMU_NOTIFIER_NONE &&
+        (qatomic_read(&s->pmr_enabled) ||
+         qatomic_read(&s->txt_dpr_enabled))) {
+        error_setg_errno(errp, ENOTSUP,
+                         "cannot attach a host IOMMU notifier while TXT "
+                         "DPR/PMR protects guest RAM");
+        return -ENOTSUP;
+    }
 
     /* TODO: add support for VFIO and vhost users */
     if (s->snoop_control) {
@@ -4956,6 +5019,12 @@ static bool vtd_dev_set_iommu_device(PCIBus *bus, void *opaque, int devfn,
                    "caching-mode=on for Intel IOMMU.");
         return false;
     }
+    if (qatomic_read(&s->pmr_enabled) ||
+        qatomic_read(&s->txt_dpr_enabled)) {
+        error_setg(errp, "device assignment cannot bypass live TXT "
+                   "DPR/PMR DMA exclusion");
+        return false;
+    }
 
     vtd_iommu_lock(s);
 
@@ -5281,6 +5350,8 @@ static void vtd_init(IntelIOMMUState *s)
     s->root_scalable = false;
     s->dmar_enabled = false;
     s->pmr_enabled = false;
+    s->txt_dpr_enabled = false;
+    s->txt_dpr_base = s->txt_dpr_top = 0;
     s->intr_enabled = false;
     s->iq_head = 0;
     s->iq_tail = 0;

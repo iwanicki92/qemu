@@ -424,6 +424,17 @@ static int i8257_dma_read_memory(IsaDma *obj, int nchan, void *buf, int pos,
         return len;
     }
 
+    /* ISA DMA bypasses VT-d; let the platform reject protected RAM. */
+    if (len > 0 && d->dma_blocked &&
+        d->dma_blocked(d->dma_blocked_opaque,
+                       (r->mode & 0x20) ? addr - pos - len : addr + pos,
+                       len)) {
+        trace_i8257_dma_filtered((r->mode & 0x20) ? addr - pos - len :
+                                 addr + pos, len, false);
+        memset(buf, 0, len);
+        return len;
+    }
+
     if (r->mode & 0x20) {
         int i;
         uint8_t *p = buf;
@@ -449,6 +460,15 @@ static int i8257_dma_write_memory(IsaDma *obj, int nchan, void *buf, int pos,
     hwaddr addr = ((r->pageh & 0x7f) << 24) | (r->page << 16) | r->now[ADDR];
 
     if (i8257_is_verify_transfer(r)) {
+        return len;
+    }
+
+    if (len > 0 && s->dma_blocked &&
+        s->dma_blocked(s->dma_blocked_opaque,
+                       (r->mode & 0x20) ? addr - pos - len : addr + pos,
+                       len)) {
+        trace_i8257_dma_filtered((r->mode & 0x20) ? addr - pos - len :
+                                 addr + pos, len, true);
         return len;
     }
 
@@ -645,6 +665,18 @@ static void i8257_register_types(void)
 }
 
 type_init(i8257_register_types)
+
+void i8257_dma_set_filter(ISABus *bus,
+                          bool (*blocked)(void *, hwaddr, size_t),
+                          void *opaque)
+{
+    for (int i = 0; i < 2; i++) {
+        I8257State *dma = I8257(bus->dma[i]);
+
+        dma->dma_blocked = blocked;
+        dma->dma_blocked_opaque = opaque;
+    }
+}
 
 void i8257_dma_init(Object *parent, ISABus *bus, bool high_page_enable)
 {

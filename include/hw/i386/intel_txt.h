@@ -209,6 +209,8 @@ bool intel_txt_senter(IntelTxtState *s, uint32_t acm_base,
                       uint32_t acm_size, IntelTxtMleEntry *entry);
 /* Record a rejected launch when an RLP cannot be parked safely. */
 void intel_txt_reject_aps(IntelTxtState *s);
+/* True if this ISA DMA transaction overlaps the locked TXT DPR. */
+bool intel_txt_dpr_blocks(IntelTxtState *s, hwaddr addr, size_t len);
 /* Is SMI inhibition currently engaged (between SENTER and SEXIT/SMCTRL)? */
 bool intel_txt_smi_inhibited(IntelTxtState *s);
 /* Hold one SMI on this CPU until the inhibition is released. */

@@ -26,6 +26,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/i386/x86-iommu.h"
 #include "migration/vmstate.h"
+#include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qom/object.h"
 #include "system/runstate.h"
@@ -98,6 +99,31 @@ struct IntelTxtState {
  * smaller or misaligned accesses are rejected by the memory core.
  */
 
+/* DPR has 1 MiB granularity and protects a half-open physical range. */
+static bool intel_txt_dpr_range(uint64_t dpr, uint64_t *base, uint64_t *top)
+{
+    uint64_t size = (dpr >> 4) & 0xff;
+    uint64_t top_mb = (dpr >> 20) & 0xfff;
+
+    if (!(dpr & TXT_DPR_LOCK) || !size || size > top_mb) {
+        return false;
+    }
+    *base = (top_mb - size) << 20;
+    *top = top_mb << 20;
+    return true;
+}
+
+bool intel_txt_dpr_blocks(IntelTxtState *s, hwaddr addr, size_t len)
+{
+    uint64_t base, top;
+
+    if (!len || !intel_txt_dpr_range(qatomic_read(&s->dpr), &base, &top) ||
+        addr >= top) {
+        return false;
+    }
+    return addr >= base || len > base - addr;
+}
+
 static uint64_t intel_txt_reg_read64(IntelTxtState *s, hwaddr addr)
 {
     /*
@@ -149,6 +175,18 @@ static uint64_t intel_txt_reg_read64(IntelTxtState *s, hwaddr addr)
         return 0;
     }
 }
+
+#ifdef CONFIG_TPM
+static IntelIOMMUState *intel_txt_iommu(void)
+{
+    X86IOMMUState *x86_iommu = x86_iommu_get_default();
+    Object *iommu = x86_iommu ?
+        object_dynamic_cast(OBJECT(&x86_iommu->busdev),
+                            TYPE_INTEL_IOMMU_DEVICE) : NULL;
+
+    return iommu ? INTEL_IOMMU_DEVICE(iommu) : NULL;
+}
+#endif
 
 static void intel_txt_reg_write64(IntelTxtState *s, hwaddr addr,
                                   uint64_t val)
@@ -205,9 +243,29 @@ static void intel_txt_reg_write64(IntelTxtState *s, hwaddr addr,
             trace_txt_reg_write_ignored("public", addr, val);
             break;
         }
-        s->dpr = val & TXT_DPR_MASK;
-        if (s->dpr & TXT_DPR_LOCK) {
-            trace_txt_dpr_locked(s->dpr);
+        val &= TXT_DPR_MASK;
+#ifdef CONFIG_TPM
+        if ((val & TXT_DPR_LOCK) && ((val >> 4) & 0xff)) {
+            uint64_t base, top;
+            IntelIOMMUState *iommu = intel_txt_iommu();
+            Error *err = NULL;
+
+            if (!intel_txt_dpr_range(val, &base, &top) || !iommu) {
+                error_report("TXT: cannot lock a nonempty DPR without "
+                             "valid bounds and an intel-iommu device");
+                trace_txt_reg_write_ignored("public", addr, val);
+                break;
+            }
+            if (!intel_iommu_set_txt_dpr(iommu, base, top, &err)) {
+                error_report_err(err);
+                trace_txt_reg_write_ignored("public", addr, val);
+                break;
+            }
+        }
+#endif
+        qatomic_set(&s->dpr, val);
+        if (val & TXT_DPR_LOCK) {
+            trace_txt_dpr_locked(val);
         }
         break;
     case TXT_CMD_OPEN_LOCALITY1:
@@ -2323,7 +2381,16 @@ static void intel_txt_reset_hold(Object *obj, ResetType type)
     s->mseg_base = 0;
     s->mseg_size = 0;
     s->biosacm_errorcode = 0;
-    s->dpr = 0;
+    qatomic_set(&s->dpr, 0);
+#ifdef CONFIG_TPM
+    {
+        IntelIOMMUState *iommu = intel_txt_iommu();
+
+        if (iommu) {
+            intel_iommu_clear_txt_dpr(iommu);
+        }
+    }
+#endif
     s->e2sts = 0;
     s->smi_inhibit = false;
 }
@@ -2385,7 +2452,35 @@ static const Property intel_txt_properties[] = {
                       INTEL_TXT_DIDVID_DEFAULT),
 };
 
+#ifdef CONFIG_TPM
+static int intel_txt_post_load(void *opaque, int version_id)
+{
+    IntelTxtState *s = opaque;
+    IntelIOMMUState *iommu = intel_txt_iommu();
+    uint64_t base, top;
+    Error *err = NULL;
+
+    if (intel_txt_dpr_range(s->dpr, &base, &top)) {
+        if (!iommu || !intel_iommu_set_txt_dpr(iommu, base, top, &err)) {
+            if (err) {
+                error_report_err(err);
+            }
+            return -EINVAL;
+        }
+    } else if ((s->dpr & TXT_DPR_LOCK) && ((s->dpr >> 4) & 0xff)) {
+        /* Never restore an invalid, locked DPR as an unprotected one. */
+        return -EINVAL;
+    } else if (iommu) {
+        intel_iommu_clear_txt_dpr(iommu);
+    }
+    return 0;
+}
+#endif
+
 static const VMStateDescription vmstate_intel_txt = {
+#ifdef CONFIG_TPM
+    .post_load = intel_txt_post_load,
+#endif
     .name = TYPE_INTEL_TXT,
     .version_id = 2,
     .minimum_version_id = 1,

@@ -17,6 +17,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/qdev-properties.h"
+#include "qapi/error.h"
 #include "hw/usb/hcd-ehci.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -132,6 +133,17 @@ static void usb_ehci_pci_write_config(PCIDevice *dev, uint32_t addr,
         return;
     }
     busmaster = pci_get_word(dev->config + PCI_COMMAND) & PCI_COMMAND_MASTER;
+    /*
+     * The historical direct-memory fallback would bypass TXT DPR on
+     * q35 if the guest cleared bus mastering while EHCI was active.
+     * Keep ordinary machines unchanged; TXT uses the PCI bus-master
+     * address space even when the bus-master bit is off.
+     */
+    if (object_property_find(OBJECT(qdev_get_machine()), "txt") &&
+        object_property_get_bool(OBJECT(qdev_get_machine()), "txt",
+                                 &error_abort)) {
+        busmaster = true;
+    }
     i->ehci.as = busmaster ? pci_get_address_space(dev) : &address_space_memory;
 }
 

@@ -1,5 +1,8 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# i8257.c
+i8257_dma_filtered(uint64_t addr, int len, bool is_write) "DMA filtered addr=0x%"PRIx64" len=%d write=%d"
+
 # rc4030.c
 jazzio_read(uint64_t addr, uint32_t ret) "read reg[0x%"PRIx64"] = 0x%x"
 jazzio_write(uint64_t addr, uint32_t val) "write reg[0x%"PRIx64"] = 0x%x"

@@ -344,6 +344,13 @@ static bool pxb_dev_realize_common(PCIDevice *dev, enum BusType type,
     Error *local_err = NULL;
     MachineState *ms = MACHINE(qdev_get_machine());
 
+    if (pxb->bypass_iommu && object_property_find(OBJECT(ms), "txt") &&
+        object_property_get_bool(OBJECT(ms), "txt", &error_abort)) {
+        error_setg(errp, "TXT DPR cannot protect a PCI root bus "
+                   "with bypass_iommu=on");
+        return false;
+    }
+
     if (ms->numa_state == NULL) {
         error_setg(errp, "NUMA is not supported by this machine-type");
         return false;

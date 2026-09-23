@@ -279,6 +279,9 @@ struct IntelIOMMUState {
     bool root_scalable;             /* Type of root table (scalable or not) */
     bool dmar_enabled;              /* Set if DMA remapping is enabled */
     bool pmr_enabled;               /* PMEN.PRS; recomputed from CSR on load */
+    bool txt_dpr_enabled;           /* derived from TXT.DPR, not migrated */
+    uint64_t txt_dpr_base;
+    uint64_t txt_dpr_top;
 
     uint16_t iq_head;               /* Current invalidation queue head */
     uint16_t iq_tail;               /* Current invalidation queue tail */
@@ -337,5 +340,9 @@ bool intel_iommu_set_txt_pmr(IntelIOMMUState *s, uint64_t lo_base,
                              uint64_t lo_size, uint64_t hi_base,
                              uint64_t hi_size, Error **errp);
 void intel_iommu_clear_txt_pmr(IntelIOMMUState *s);
+/* DPR is separate from PMEN; keep it active before and after SENTER. */
+bool intel_iommu_set_txt_dpr(IntelIOMMUState *s, uint64_t base,
+                             uint64_t top, Error **errp);
+void intel_iommu_clear_txt_dpr(IntelIOMMUState *s);
 
 #endif

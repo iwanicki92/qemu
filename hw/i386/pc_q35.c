@@ -44,6 +44,7 @@
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
 #include "hw/i386/intel_txt.h"
+#include "hw/dma/i8257.h"
 #include "hw/core/sysbus.h"
 #include "hw/i386/amd_iommu.h"
 #include "hw/i386/intel_iommu.h"
@@ -66,6 +67,13 @@
 #include "hw/uefi/var-service-api.h"
 #include "hw/i386/acpi-build.h"
 #include "target/i386/cpu.h"
+
+#ifdef CONFIG_TPM
+static bool pc_q35_txt_dma_blocked(void *opaque, hwaddr addr, size_t len)
+{
+    return intel_txt_dpr_blocks(INTEL_TXT(opaque), addr, len);
+}
+#endif
 
 /* ICH9 AHCI has 6 ports */
 #define MAX_SATA_PORTS     6
@@ -155,6 +163,11 @@ static void pc_q35_init(MachineState *machine)
 
     assert(pcmc->pci_enabled);
 
+    if (pcms->txt_enabled && pcms->default_bus_bypass_iommu) {
+        error_report("txt=on cannot protect DPR when the PCI root bus "
+                     "bypasses the IOMMU");
+        exit(1);
+    }
     if (pcms->txt_vmx_compat &&
         (!pcms->txt_enabled || machine->smp.max_cpus != 1)) {
         error_report("txt-vmx-compat=on requires txt=on and exactly "
@@ -362,6 +375,9 @@ static void pc_q35_init(MachineState *machine)
             CPUState *cs;
 
             sysbus_realize_and_unref(SYS_BUS_DEVICE(txt), &error_fatal);
+
+            /* The Q35 ISA DMA controller bypasses the PCI VT-d path. */
+            i8257_dma_set_filter(isa_bus, pc_q35_txt_dma_blocked, txt);
 
             /*
              * Give every vCPU a pointer to the chipset device so that

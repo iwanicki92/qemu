@@ -19,7 +19,7 @@ an absent VT-d device or an unprotected MLE.
 **PMR denies device DMA into the protected windows**, not outside them. The
 low PMR ends at 0x3e000000; TXT heap at 0x3e300000 is in the **DPR**, not the
 PMR. PMR enforcement by itself cannot protect the heap/DMAR copy. DPR DMA
-enforcement is scoped separately.
+enforcement is implemented separately (see `intel-txt-dpr.md`).
 
 Linux `drivers/iommu/intel/iommu.c:iommu_disable_protect_mem_regions()` clears
 PMEN.EPM (bit 31), then waits for PMEN.PRS (bit 0) to clear. That guest-visible

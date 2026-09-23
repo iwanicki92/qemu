@@ -43,8 +43,15 @@ struct I8257State {
     int running;
     PortioList portio_page;
     PortioList portio_pageh;
+
+    /* Optional platform DMA exclusion hook (e.g. Q35 TXT DPR). */
+    bool (*dma_blocked)(void *opaque, hwaddr addr, size_t len);
+    void *dma_blocked_opaque;
 };
 
 void i8257_dma_init(Object *parent, ISABus *bus, bool high_page_enable);
+void i8257_dma_set_filter(ISABus *bus,
+                          bool (*blocked)(void *, hwaddr, size_t),
+                          void *opaque);
 
 #endif

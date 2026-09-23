@@ -1653,6 +1653,13 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         if (sum != 0) {
             fail_msg("SINIT-MLE DMAR copy fails its ACPI checksum", 16384);
         }
+        if (itd_dma(itd_find_bar(), TEST_HEAP_BASE + 0x68 + dmar_off) !=
+            ITD_ERR_TX_FAIL) {
+            fail_msg("DMA can overwrite the live TXT heap DMAR copy",
+                     16384);
+        } else {
+            ml_printf("PASS: DPR protects the measured DMAR copy\n");
+        }
     }
 
     /*
@@ -2072,6 +2079,22 @@ int main(void)
         txt_write64(TXT_OFF_HEAP_SIZE, TEST_HEAP_SIZE);
     }
     ml_printf("smx: SINIT/HEAP/DPR programmed\n");
+    {
+        uint32_t bar = itd_find_bar();
+        /* volatile: the CPU may still populate protected TXT heap RAM. */
+        volatile uint8_t *scratch = (volatile uint8_t *)(uintptr_t)
+            (TEST_HEAP_BASE + TEST_HEAP_SIZE - 1);
+        uint8_t saved = *scratch;
+
+        *scratch = 0xa5;
+        if (!bar || *scratch != 0xa5 ||
+            itd_dma(bar, TEST_HEAP_BASE) != ITD_ERR_TX_FAIL) {
+            fail_msg("locked DPR did not exclude prelaunch PCI DMA", 64);
+        } else {
+            ml_printf("PASS: locked DPR excludes DMA, allows CPU writes\n");
+        }
+        *scratch = saved;
+    }
 
     /* A protected SINIT alone is insufficient: the heap/DMAR must fit. */
     {

@@ -633,6 +633,9 @@ and the log's writable RAM backing before resetting PCRs. The Intel TXT
 Software Development Guide (Appendix F) explicitly says SINIT does
 *not* require or enforce DMA protection of the event-log memory; the
 log may be outside the PMRs (unlike the MLE and its page tables).
+The event-log pointer has no page-alignment requirement: tboot places
+its log at an unaligned address within the loader-owned OS-MLE heap
+section. A log overlapping other heap sections is rejected.
 It queries ``TPM2_GetCapability(PCRS)`` for active PCR17/18 banks;
 SHA-1, SHA-256, SHA-384 and SHA-512 are supported and an active bank
 outside that set rejects the launch rather than yielding an incomplete

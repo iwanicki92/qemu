@@ -1351,7 +1351,7 @@ static bool intel_txt_event_log_prepare(IntelTxtState *s,
                                         IntelTxtEventLog *log, Error **errp)
 {
     uint64_t bios_sz, os_mle_sz, os_sinit_sz, os_sinit, remaining, ext;
-    uint64_t ptab, mle_size, phys, pd, pt;
+    uint64_t ptab, mle_size, phys, pd, pt, os_mle_payload;
     uint32_t version, type, size, count = 0;
     uint8_t desc[20];
     bool found = false, ended = false;
@@ -1407,18 +1407,28 @@ static bool intel_txt_event_log_prepare(IntelTxtState *s,
             break;
         }
     }
+    /* The loader may reserve the event log within its OS-MLE data. */
+    os_mle_payload = s->heap_base + bios_sz + sizeof(uint64_t);
     if (!found || !ended ||
         log->size > TXT_LOG_MAX_SIZE ||
-        log->addr == 0 || (log->addr & 0xfff) ||
+        log->addr == 0 ||
         log->addr >= INTEL_TXT_GUEST_32BIT_LIMIT ||
         log->size > INTEL_TXT_GUEST_32BIT_LIMIT - log->addr ||
-        (log->addr < s->heap_base + s->heap_size &&
-         s->heap_base < log->addr + log->size) ||
+        ((log->addr < s->heap_base + s->heap_size &&
+          s->heap_base < log->addr + log->size) &&
+         (log->addr < os_mle_payload ||
+          log->size > os_mle_sz - sizeof(uint64_t) ||
+          log->addr - os_mle_payload >
+              os_mle_sz - sizeof(uint64_t) - log->size)) ||
         (log->addr < s->sinit_base + s->sinit_size &&
          s->sinit_base < log->addr + log->size) ||
         !intel_txt_log_is_ram(log->addr, log->size)) {
-        error_setg(errp, "invalid TPM2 event-log pointer, size or "
-                   "TXT-heap extended data");
+        error_setg(errp, "invalid TPM2 event-log pointer or heap data "
+                   "(log=0x%" PRIx64 "/%u, os_mle=0x%" PRIx64 "/0x%" PRIx64
+                   ", heap=0x%" PRIx64 "/0x%" PRIx64 ", found=%u, end=%u)",
+                   log->addr, log->size, os_mle_payload,
+                   os_mle_sz - sizeof(uint64_t), s->heap_base,
+                   s->heap_size, found, ended);
         return false;
     }
     /* The log must not overwrite bytes measured into PCR18 or its mappings. */

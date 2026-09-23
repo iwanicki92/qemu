@@ -207,8 +207,8 @@
 #define TEST_MLE_HDR_OFF       0x100ULL
 #define TEST_HEAP_SIZE         0x1000ULL
 #ifdef TEST_TXT_TPM2_LOG
-/* Outside the 16 MiB PMR: Intel TXT SDG Appendix F permits this. */
-#define TEST_EVENT_LOG_BASE    0x1100000ULL
+/* Outside the 16 MiB PMR and not page aligned: both are permitted. */
+#define TEST_EVENT_LOG_BASE    0x110014cULL
 #define TEST_EVENT_LOG_SIZE    0x1000U
 typedef volatile uint8_t txt_guest_u8;   /* SENTER accesses this guest RAM. */
 typedef volatile uint32_t txt_guest_u32; /* SENTER accesses this guest RAM. */

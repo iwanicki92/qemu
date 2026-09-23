@@ -12,9 +12,11 @@ Status: in progress. Local correctness work; upstream contributions are deferred
   and writes are ignored; public registers remain usable. SENTER reopens it.
   This access gate and its single-/multi-CPU TCG tests landed separately as
   `e00c6180ab`.
-- After a locked, nonempty DPR is configured, DMA into its half-open window
-  must be denied independently of PMR enablement, including when VT-d DMA
-  remapping is disabled. Validate the 1 MiB size/top encoding without wrapping.
+- A locked, nonempty, nonwrapping DPR must cover both SINIT and the entire
+  TXT heap before SENTER. This input check landed as `71e320daaa`; it is
+  **not** DMA exclusion. DMA into the half-open DPR window must be denied
+  independently of PMR enablement, including when VT-d DMA remapping is
+  disabled. Validate the 1 MiB size/top encoding without wrapping.
   CPU reads and writes remain available: firmware must populate the heap and
   SINIT reservation after locking DPR.
 - Fail closed rather than claim DMA safety if a DMA source bypasses the
@@ -35,7 +37,11 @@ Status: in progress. Local correctness work; upstream contributions are deferred
    i8257, whose `hw/dma/i8257.c` read/write callbacks use
    `physical_memory_read/write()` directly. Protect that path too, and
    inventory other direct `address_space_memory` users before claiming DPR
-   complete; otherwise narrow the documented contract with explicit approval.
+   complete. The PCI PCnet adapter's `physical_memory_*` wrappers actually
+   call `pci_dma_*` and traverse the PCI address space. PCI EHCI normally uses
+   `pci_get_address_space()` while bus mastering is enabled but retains a
+   direct-memory fallback when disabled; verify it cannot DMA in that mode.
+   Otherwise narrow the documented contract with explicit approval.
 2. Bind the TXT DPR source to the IOMMU without relying on `current_cpu`:
    DMA callbacks can run without a vCPU. On lock, refresh device address
    spaces and invalidate translations; ensure PMR and DPR coexist. Account

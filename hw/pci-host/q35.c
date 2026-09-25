@@ -342,6 +342,26 @@ static void mch_update_pciexbar(MCHPCIState *mch)
     pcie_host_mmcfg_update(pehb, enable, addr, length);
 }
 
+static void mch_mmcfg_msr_map(MCHPCIState *mch)
+{
+    BusState *bus = qdev_get_parent_bus(DEVICE(mch));
+
+    pcie_host_mmcfg_update(PCIE_HOST_BRIDGE(bus->parent),
+                           mch->mmcfg_msr_enable, mch->mmcfg_msr_base,
+                           mch->mmcfg_msr_size);
+}
+
+/* Maps MMCONFIG over PCIEXBAR's until either is written again */
+void mch_mmcfg_msr_update(MCHPCIState *mch, bool enable, hwaddr base,
+                          uint32_t size)
+{
+    mch->mmcfg_msr = true;
+    mch->mmcfg_msr_enable = enable;
+    mch->mmcfg_msr_base = base;
+    mch->mmcfg_msr_size = size;
+    mch_mmcfg_msr_map(mch);
+}
+
 /* PAM */
 static void mch_update_pam(MCHPCIState *mch)
 {
@@ -521,6 +541,7 @@ static void mch_write_config(PCIDevice *d,
 
     if (ranges_overlap(address, len, MCH_HOST_BRIDGE_PCIEXBAR,
                        MCH_HOST_BRIDGE_PCIEXBAR_SIZE)) {
+        mch->mmcfg_msr = false;
         mch_update_pciexbar(mch);
     }
 
@@ -565,8 +586,32 @@ static int mch_post_load(void *opaque, int version_id)
 {
     MCHPCIState *mch = opaque;
     mch_update(mch);
+    if (mch->mmcfg_msr) {
+        mch_mmcfg_msr_map(mch);
+    }
     return 0;
 }
+
+static bool mch_mmcfg_msr_needed(void *opaque)
+{
+    MCHPCIState *mch = opaque;
+
+    return mch->mmcfg_msr;
+}
+
+static const VMStateDescription vmstate_mch_mmcfg_msr = {
+    .name = "mch/mmcfg_msr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = mch_mmcfg_msr_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(mmcfg_msr, MCHPCIState),
+        VMSTATE_BOOL(mmcfg_msr_enable, MCHPCIState),
+        VMSTATE_UINT64(mmcfg_msr_base, MCHPCIState),
+        VMSTATE_UINT32(mmcfg_msr_size, MCHPCIState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_mch = {
     .name = "mch",
@@ -580,6 +625,10 @@ static const VMStateDescription vmstate_mch = {
          */
         VMSTATE_UNUSED(1),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_mch_mmcfg_msr,
+        NULL
     }
 };
 
@@ -590,6 +639,7 @@ static void mch_reset(DeviceState *qdev)
 
     pci_set_quad(d->config + MCH_HOST_BRIDGE_PCIEXBAR,
                  MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT);
+    mch->mmcfg_msr = false;
 
     if (mch->has_smm_ranges) {
         d->config[MCH_HOST_BRIDGE_SMRAM] = MCH_HOST_BRIDGE_SMRAM_DEFAULT;

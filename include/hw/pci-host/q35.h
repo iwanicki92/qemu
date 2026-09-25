@@ -57,6 +57,11 @@ struct MCHPCIState {
     uint64_t pci_hole64_size;
     uint16_t ext_tseg_mbytes;
     bool smn;
+    /* MMCONFIG as MSR_AMD64_MMIO_CONF_BASE mapped it, if it did last */
+    bool mmcfg_msr;
+    bool mmcfg_msr_enable;
+    uint64_t mmcfg_msr_base;
+    uint32_t mmcfg_msr_size;
 };
 
 struct Q35PCIHost {
@@ -205,5 +210,8 @@ struct Q35PCIHost {
  */
 #define Q35_PSEUDO_BUS_PLATFORM         (0xff)
 #define Q35_PSEUDO_DEVFN_IOAPIC         (0x00)
+
+void mch_mmcfg_msr_update(MCHPCIState *mch, bool enable, hwaddr base,
+                          uint32_t size);
 
 #endif /* HW_Q35_H */

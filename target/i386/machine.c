@@ -1645,6 +1645,24 @@ static const VMStateDescription vmstate_vm_cr = {
     }
 };
 
+static bool mmio_conf_base_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+
+    return cpu->env.mmio_conf_base != 0;
+}
+
+static const VMStateDescription vmstate_mmio_conf_base = {
+    .name = "cpu/mmio_conf_base",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = mmio_conf_base_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.mmio_conf_base, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool init_pending_needed(void *opaque)
 {
     X86CPU *cpu = opaque;
@@ -2022,6 +2040,7 @@ const VMStateDescription vmstate_x86_cpu = {
         &vmstate_msr_xfd,
         &vmstate_msr_hwcr,
         &vmstate_vm_cr,
+        &vmstate_mmio_conf_base,
         &vmstate_init_pending,
 #ifdef TARGET_X86_64
         &vmstate_msr_fred,

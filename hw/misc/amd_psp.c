@@ -141,7 +141,6 @@ static int amd_psp_tpm_run(AmdPspState *s, uint8_t *cmd, size_t len,
 {
     int ret;
 
-    stw_be_p(cmd + 2, 0);
     stl_be_p(cmd + 2, len);
     ret = tpm_run_command(s->tpm, PSP_TPM_LOCALITY, cmd, len, rsp, rsp_len);
     if (ret < 0) {

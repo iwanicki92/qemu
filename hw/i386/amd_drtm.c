@@ -342,17 +342,10 @@ static void amd_drtm_platform_reset_hold(Object *obj, ResetType type)
     amd_drtm_clear_blocks(p);
 }
 
+/* The DMA blocks live in the IOMMU's views, which a migration does not carry */
 static const VMStateDescription vmstate_amd_drtm_platform = {
     .name = TYPE_AMD_DRTM_PLATFORM,
-    .version_id = 1,
-    .minimum_version_id = 1,
-    .fields = (const VMStateField[]) {
-        VMSTATE_BOOL(launched, AmdDrtmPlatform),
-        VMSTATE_UINT64(slb_base, AmdDrtmPlatform),
-        VMSTATE_UINT16(slb_length, AmdDrtmPlatform),
-        VMSTATE_BOOL(sl_dev, AmdDrtmPlatform),
-        VMSTATE_END_OF_LIST()
-    }
+    .unmigratable = 1,
 };
 
 static const Property amd_drtm_platform_properties[] = {

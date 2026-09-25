@@ -18,6 +18,7 @@
 #include "crypto/hash.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/i386/amd_drtm.h"
+#include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
@@ -1175,6 +1176,12 @@ static const Property amd_psp_properties[] = {
                        AMD_PSP_TCG_LOG_BASE),
 };
 
+/* None of the service's state, or the locks it set, survives a migration */
+static const VMStateDescription vmstate_amd_psp = {
+    .name = TYPE_AMD_PSP,
+    .unmigratable = 1,
+};
+
 static void amd_psp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1187,6 +1194,7 @@ static void amd_psp_class_init(ObjectClass *klass, const void *data)
     k->class_id = PCI_CLASS_CRYPT_OTHER;
     dc->desc = "AMD Secure Processor (mailbox registers, DRTM service)";
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+    dc->vmsd = &vmstate_amd_psp;
     device_class_set_legacy_reset(dc, amd_psp_reset);
     device_class_set_props(dc, amd_psp_properties);
 }

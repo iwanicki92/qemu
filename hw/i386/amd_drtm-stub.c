@@ -50,6 +50,11 @@ void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name)
 {
 }
 
+void amd_drtm_set_psp(AmdDrtmPlatform *p, AmdPspDrtmInfo *(*query)(void *),
+                      void *psp)
+{
+}
+
 uint32_t amd_drtm_cpu_signature(void)
 {
     return 0;

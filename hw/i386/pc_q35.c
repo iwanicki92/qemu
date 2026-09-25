@@ -138,8 +138,7 @@ static void pc_q35_mmio_conf_base(Notifier *n, void *data)
     Q35PCIHost *phb = container_of(n, Q35PCIHost, mmio_conf_notifier);
     X86MmioConfBase *conf = data;
 
-    pcie_host_mmcfg_update(PCIE_HOST_BRIDGE(phb), conf->enable, conf->base,
-                           conf->size);
+    mch_mmcfg_msr_update(&phb->mch, conf->enable, conf->base, conf->size);
 }
 
 /*

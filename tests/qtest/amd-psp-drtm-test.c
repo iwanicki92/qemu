@@ -405,13 +405,19 @@ static void test_delayed_command(void)
     QTestState *s = qtest_initf(PLATFORM PSP ",command-delay=100,"
                                 "delayed-command=%d",
                                 AMD_PSP_DRTM_CMD_TMR_RELEASE);
+    int i;
 
     mbox_kick(s);
     g_assert_cmphex(mbox_command(s, cap), ==, AMD_PSP_DRTM_NO_ERROR);
 
+    /* Held past the reads the other commands answer within */
     qtest_writel(s, MBOX_CMD, release);
+    for (i = 0; i < 200; i++) {
+        g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, release);
+    }
+    qtest_clock_step(s, 99 * SCALE_MS);
     g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, release);
-    qtest_clock_step(s, 100 * SCALE_MS);
+    qtest_clock_step(s, SCALE_MS);
     mbox_wait_ready(s);
     qtest_quit(s);
 }
@@ -1203,6 +1209,7 @@ static void test_post_launch_regions(const void *data)
     }
     g_assert_cmpuint(sum, ==, 0);
     qtest_writel(s, AMD_PSP_IVRS_BASE, 0);
+    qtest_memread(s, AMD_PSP_IVRS_BASE, ivrs, 4);
     g_assert_cmpmem(ivrs, 4, "IVRS", 4);
 
     /* A reset empties the three regions and forgets the launch */

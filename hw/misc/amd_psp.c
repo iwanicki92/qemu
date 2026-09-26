@@ -900,8 +900,13 @@ static uint16_t amd_psp_cmd_allocate_shared_memory(AmdPspState *s)
  */
 static uint16_t amd_psp_cmd_get_ivrs_table_info(AmdPspState *s)
 {
-    if (s->launch != AMD_PSP_LAUNCH_STATE_OK || !s->ivrs ||
-        s->ivrs->len > AMD_PSP_IVRS_SIZE) {
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK || !s->ivrs) {
+        return AMD_PSP_DRTM_GET_IVRS_TABLE_FAILED;
+    }
+    if (s->ivrs->len > AMD_PSP_IVRS_SIZE) {
+        warn_report_once("amd-psp: the IVRS is %u bytes, more than the %d "
+                         "its region holds, so GET_IVRS_TABLE_INFO fails",
+                         s->ivrs->len, AMD_PSP_IVRS_SIZE);
         return AMD_PSP_DRTM_GET_IVRS_TABLE_FAILED;
     }
     amd_psp_region_write(&s->ivrs_mr, s->ivrs->data, s->ivrs->len);
@@ -1192,6 +1197,38 @@ static AmdPspDrtmInfo *amd_psp_drtm_info(void *opaque)
     return info;
 }
 
+/* The service's four regions and the ASPT window, none on another */
+static bool amd_psp_regions_apart(AmdPspState *s, Error **errp)
+{
+    const struct {
+        const char *name;
+        hwaddr base;
+        hwaddr size;
+    } r[] = {
+        { "tcg-log-base", s->tcg_log_base, AMD_PSP_TCG_LOG_SIZE },
+        { "ivrs-base", s->ivrs_base, AMD_PSP_IVRS_SIZE },
+        { "tmr-desc-base", s->tmr_desc_base, AMD_PSP_TMR_DESC_SIZE },
+        { "shared-base", s->shared_base, AMD_PSP_SHARED_SIZE },
+        { "the ASPT window", AMD_PSP_ASPT_BASE, AMD_PSP_ASPT_SIZE },
+    };
+    size_t i, j;
+
+    for (i = 0; i < ARRAY_SIZE(r); i++) {
+        if (r[i].base + r[i].size < r[i].base) {
+            error_setg(errp, "%s wraps past the top of memory", r[i].name);
+            return false;
+        }
+        for (j = 0; j < i; j++) {
+            if (r[i].base < r[j].base + r[j].size &&
+                r[j].base < r[i].base + r[i].size) {
+                error_setg(errp, "%s overlaps %s", r[i].name, r[j].name);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
 {
     AmdPspState *s = AMD_PSP(pci_dev);
@@ -1224,18 +1261,20 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
                        "be 4 KiB aligned, shared-base 64 KiB aligned");
             return;
         }
-        s->bh = qemu_bh_new_guarded(amd_psp_run_command, s,
-                                    &DEVICE(s)->mem_reentrancy_guard);
-        s->delay_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                      amd_psp_delay_expired, s);
-        /* The event log, read like memory, written by the service alone */
-        if (!memory_region_init_rom(&s->tcg_log, OBJECT(s), "amd-psp-tcg-log",
-                                    AMD_PSP_TCG_LOG_SIZE, errp)) {
+        if (!amd_psp_regions_apart(s, errp)) {
             return;
         }
-        memory_region_add_subregion(get_system_memory(), s->tcg_log_base,
-                                    &s->tcg_log);
-        if (!memory_region_init_rom(&s->ivrs_mr, OBJECT(s), "amd-psp-ivrs",
+        if (s->delayed_command && !s->command_delay) {
+            error_setg(errp, "delayed-command needs a command-delay");
+            return;
+        }
+        /*
+         * The event log and the other two ROMs are read like memory and
+         * written by the service alone. All exist before any is mapped.
+         */
+        if (!memory_region_init_rom(&s->tcg_log, OBJECT(s), "amd-psp-tcg-log",
+                                    AMD_PSP_TCG_LOG_SIZE, errp) ||
+            !memory_region_init_rom(&s->ivrs_mr, OBJECT(s), "amd-psp-ivrs",
                                     AMD_PSP_IVRS_SIZE, errp) ||
             !memory_region_init_rom(&s->tmr_desc, OBJECT(s),
                                     "amd-psp-tmr-desc", AMD_PSP_TMR_DESC_SIZE,
@@ -1244,6 +1283,12 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
                                     AMD_PSP_SHARED_SIZE, errp)) {
             return;
         }
+        s->bh = qemu_bh_new_guarded(amd_psp_run_command, s,
+                                    &DEVICE(s)->mem_reentrancy_guard);
+        s->delay_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                      amd_psp_delay_expired, s);
+        memory_region_add_subregion(get_system_memory(), s->tcg_log_base,
+                                    &s->tcg_log);
         memory_region_add_subregion(get_system_memory(), s->ivrs_base,
                                     &s->ivrs_mr);
         memory_region_add_subregion(get_system_memory(), s->tmr_desc_base,

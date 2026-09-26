@@ -625,6 +625,16 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
 
     amd_psp_check_soc_flags(s, slb);
 
+    /*
+     * Our reading of "SPL is enabled and in an untrusted state": an image
+     * whose SecPatchLevel is below the platform's.
+     */
+    if (sec_patch_level < s->min_spl) {
+        return amd_psp_launch_failed(s, "SecPatchLevel %u is below the "
+                                     "platform's %u", sec_patch_level,
+                                     s->min_spl);
+    }
+
     if (!s->tpm) {
         return amd_psp_launch_failed(s, "no TPM to read PCR 17 from");
     }
@@ -753,6 +763,14 @@ static uint16_t amd_psp_cmd_extend_ossl_digest(AmdPspState *s)
                              "no TMR", size, base);
         return AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED;
     }
+    /* The guide's appendix E.1 taken literally */
+    if (base & (AMD_PSP_MLE_ALIGN - 1) || size > AMD_PSP_MLE_ALIGN) {
+        amd_drtm_guest_error(s->platform, "amd-psp: EXTEND_OSSL_DIGEST of "
+                             "0x%" PRIx64 " bytes at 0x%" PRIx64 " is not a "
+                             "64 MiB aligned MLE of at most 64 MiB", size,
+                             base);
+        return AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED;
+    }
     if (!amd_psp_hash_range(base, size, digest)) {
         amd_drtm_guest_error(s->platform, "amd-psp: EXTEND_OSSL_DIGEST of "
                              "0x%" PRIx64 " bytes at 0x%" PRIx64 " is not "
@@ -802,6 +820,90 @@ static uint16_t amd_psp_cmd_get_tcg_logs(AmdPspState *s)
     s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG1] = s->tcg_log_base;
     s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG2] = s->tcg_log_base >> 32;
     trace_amd_psp_drtm_get_tcg_logs(s->tcg_log_base, s->tcg_log_len);
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
+static void amd_psp_answer_region(AmdPspState *s, uint64_t base,
+                                  uint32_t len)
+{
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG0] = len;
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG1] = base;
+    s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG2] = base >> 32;
+}
+
+static void amd_psp_region_write(MemoryRegion *mr, const void *buf,
+                                 size_t len)
+{
+    memcpy(memory_region_get_ram_ptr(mr), buf, len);
+    memory_region_set_dirty(mr, 0, len);
+}
+
+/*
+ * One 12-byte descriptor per TMR index below the count, base then size,
+ * the size in the 64 KiB units TMR_SETUP took (our reading, the guide
+ * names no unit). An index never set reads as zero.
+ */
+static uint16_t amd_psp_cmd_get_tmr_descriptors(AmdPspState *s)
+{
+    uint8_t desc[AMD_PSP_DRTM_TMR_MAX * AMD_PSP_TMR_DESC_LEN] = { 0 };
+    uint32_t len = s->tmr_count * AMD_PSP_TMR_DESC_LEN;
+    unsigned i;
+
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK) {
+        return AMD_PSP_DRTM_NOT_SUPPORTED;
+    }
+    for (i = 0; i < s->tmr_count; i++) {
+        AmdPspTmr *tmr = &s->tmr[i];
+        uint8_t *d = desc + i * AMD_PSP_TMR_DESC_LEN;
+
+        if (tmr->set) {
+            stl_le_p(d, tmr->base);
+            stl_le_p(d + 4, tmr->base >> 32);
+            stl_le_p(d + 8, tmr->len / AMD_PSP_DRTM_TMR_UNIT);
+        }
+    }
+    amd_psp_region_write(&s->tmr_desc, desc, len);
+    amd_psp_answer_region(s, s->tmr_desc_base, len);
+    trace_amd_psp_drtm_region("TMR descriptors", s->tmr_desc_base, len);
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
+/*
+ * Up to 64 KiB of a RAM region of the device's own, from its start. The
+ * guide lists DRTM_OUT_OF_RESOURCES_ERROR before a launch, and it is also
+ * the answer to a size of zero or above what the region holds.
+ */
+static uint16_t amd_psp_cmd_allocate_shared_memory(AmdPspState *s)
+{
+    uint32_t size = s->c2pmsg[AMD_PSP_C2PMSG_DRTM_ARG0];
+
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK) {
+        return AMD_PSP_DRTM_OUT_OF_RESOURCES_ERROR;
+    }
+    if (!size || size > AMD_PSP_SHARED_SIZE) {
+        amd_drtm_guest_error(s->platform, "amd-psp: ALLOCATE_SHARED_MEMORY "
+                             "of 0x%x bytes, the buffer holds 1 to 0x%x",
+                             size, AMD_PSP_SHARED_SIZE);
+        return AMD_PSP_DRTM_OUT_OF_RESOURCES_ERROR;
+    }
+    amd_psp_answer_region(s, s->shared_base, size);
+    trace_amd_psp_drtm_region("shared memory", s->shared_base, size);
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
+/*
+ * The IVRS the machine's ACPI carries, copied into a read-only region.
+ * Refusing it before a launch is our reading of the guide.
+ */
+static uint16_t amd_psp_cmd_get_ivrs_table_info(AmdPspState *s)
+{
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK || !s->ivrs ||
+        s->ivrs->len > AMD_PSP_IVRS_SIZE) {
+        return AMD_PSP_DRTM_GET_IVRS_TABLE_FAILED;
+    }
+    amd_psp_region_write(&s->ivrs_mr, s->ivrs->data, s->ivrs->len);
+    amd_psp_answer_region(s, s->ivrs_base, s->ivrs->len);
+    trace_amd_psp_drtm_region("IVRS", s->ivrs_base, s->ivrs->len);
     return AMD_PSP_DRTM_NO_ERROR;
 }
 
@@ -889,10 +991,11 @@ static uint16_t amd_psp_dispatch(AmdPspState *s, uint8_t cmd, unsigned index)
     case AMD_PSP_DRTM_CMD_GET_TCG_LOGS:
         return amd_psp_cmd_get_tcg_logs(s);
     case AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS:
+        return amd_psp_cmd_get_tmr_descriptors(s);
     case AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY:
+        return amd_psp_cmd_allocate_shared_memory(s);
     case AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO:
-        /* The three the fork never issues, not modelled */
-        return AMD_PSP_DRTM_NOT_SUPPORTED;
+        return amd_psp_cmd_get_ivrs_table_info(s);
     default:
         return AMD_PSP_DRTM_INVALID_SERVICE_ID_ERROR;
     }
@@ -1037,6 +1140,13 @@ static void amd_psp_reset(DeviceState *dev)
             amd_psp_tmr_release(s, i);
         }
         amd_psp_log_clear(s);
+        memset(memory_region_get_ram_ptr(&s->ivrs_mr), 0, AMD_PSP_IVRS_SIZE);
+        memory_region_set_dirty(&s->ivrs_mr, 0, AMD_PSP_IVRS_SIZE);
+        memset(memory_region_get_ram_ptr(&s->tmr_desc), 0,
+               AMD_PSP_TMR_DESC_SIZE);
+        memory_region_set_dirty(&s->tmr_desc, 0, AMD_PSP_TMR_DESC_SIZE);
+        memset(memory_region_get_ram_ptr(&s->shared), 0, AMD_PSP_SHARED_SIZE);
+        memory_region_set_dirty(&s->shared, 0, AMD_PSP_SHARED_SIZE);
     }
     s->kicked = false;
     s->busy = false;
@@ -1102,9 +1212,12 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
                        "2^24");
             return;
         }
-        if (s->tcg_log_base & (AMD_PSP_TCG_LOG_SIZE - 1)) {
-            error_setg(errp, "tcg-log-base must be aligned to 0x%x",
-                       AMD_PSP_TCG_LOG_SIZE);
+        if (s->tcg_log_base & (AMD_PSP_TCG_LOG_SIZE - 1) ||
+            s->ivrs_base & (AMD_PSP_IVRS_SIZE - 1) ||
+            s->tmr_desc_base & (AMD_PSP_TMR_DESC_SIZE - 1) ||
+            s->shared_base & (AMD_PSP_SHARED_SIZE - 1)) {
+            error_setg(errp, "tcg-log-base, ivrs-base and tmr-desc-base must "
+                       "be 4 KiB aligned, shared-base 64 KiB aligned");
             return;
         }
         s->bh = qemu_bh_new_guarded(amd_psp_run_command, s,
@@ -1118,6 +1231,21 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
         }
         memory_region_add_subregion(get_system_memory(), s->tcg_log_base,
                                     &s->tcg_log);
+        if (!memory_region_init_rom(&s->ivrs_mr, OBJECT(s), "amd-psp-ivrs",
+                                    AMD_PSP_IVRS_SIZE, errp) ||
+            !memory_region_init_rom(&s->tmr_desc, OBJECT(s),
+                                    "amd-psp-tmr-desc", AMD_PSP_TMR_DESC_SIZE,
+                                    errp) ||
+            !memory_region_init_ram(&s->shared, OBJECT(s), "amd-psp-shared",
+                                    AMD_PSP_SHARED_SIZE, errp)) {
+            return;
+        }
+        memory_region_add_subregion(get_system_memory(), s->ivrs_base,
+                                    &s->ivrs_mr);
+        memory_region_add_subregion(get_system_memory(), s->tmr_desc_base,
+                                    &s->tmr_desc);
+        memory_region_add_subregion(get_system_memory(), s->shared_base,
+                                    &s->shared);
         amd_drtm_set_psp(s->platform, amd_psp_drtm_info, s);
     }
 
@@ -1146,9 +1274,13 @@ static void amd_psp_exit(PCIDevice *pci_dev)
     if (s->drtm_service) {
         amd_drtm_set_psp(s->platform, NULL, NULL);
         memory_region_del_subregion(get_system_memory(), &s->tcg_log);
+        memory_region_del_subregion(get_system_memory(), &s->ivrs_mr);
+        memory_region_del_subregion(get_system_memory(), &s->tmr_desc);
+        memory_region_del_subregion(get_system_memory(), &s->shared);
         timer_free(s->delay_timer);
         qemu_bh_delete(s->bh);
     }
+    amd_psp_set_ivrs(s, NULL, 0);
 }
 
 static const Property amd_psp_properties[] = {
@@ -1174,6 +1306,14 @@ static const Property amd_psp_properties[] = {
     DEFINE_PROP_BOOL("locality-locks", AmdPspState, locality_locks, true),
     DEFINE_PROP_UINT64("tcg-log-base", AmdPspState, tcg_log_base,
                        AMD_PSP_TCG_LOG_BASE),
+    DEFINE_PROP_UINT64("ivrs-base", AmdPspState, ivrs_base,
+                       AMD_PSP_IVRS_BASE),
+    DEFINE_PROP_UINT64("tmr-desc-base", AmdPspState, tmr_desc_base,
+                       AMD_PSP_TMR_DESC_BASE),
+    DEFINE_PROP_UINT64("shared-base", AmdPspState, shared_base,
+                       AMD_PSP_SHARED_BASE),
+    /* The platform's SecPatchLevel, below which LAUNCH fails */
+    DEFINE_PROP_UINT32("min-spl", AmdPspState, min_spl, 0),
 };
 
 /* None of the service's state, or the locks it set, survives a migration */

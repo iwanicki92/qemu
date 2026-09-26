@@ -239,32 +239,36 @@ static void test_bar(void)
     qtest_quit(s);
 }
 
-/* The four commands the fork never issues, and every value that is none */
+/*
+ * Every post-launch command before a launch, with the status the guide's
+ * appendix A gives it, and every value that is no command
+ */
 static void test_unsupported(void)
 {
-    static const uint8_t unsupported[] = {
-        AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS,
-        AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY,
-        AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO,
-    };
-    static const uint8_t before_launch[] = {
-        AMD_PSP_DRTM_CMD_EXTEND_OSSL_DIGEST,
-        AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS,
+    static const struct {
+        uint8_t cmd;
+        uint16_t status;
+    } before_launch[] = {
+        { AMD_PSP_DRTM_CMD_EXTEND_OSSL_DIGEST, AMD_PSP_DRTM_NOT_SUPPORTED },
+        { AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS, AMD_PSP_DRTM_NOT_SUPPORTED },
+        { AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS, AMD_PSP_DRTM_NOT_SUPPORTED },
+        { AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY,
+          AMD_PSP_DRTM_OUT_OF_RESOURCES_ERROR },
+        { AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO,
+          AMD_PSP_DRTM_GET_IVRS_TABLE_FAILED },
     };
     static const uint8_t invalid[] = { 0x5, 0x6, 0xd, 0x10, 0xff };
     QTestState *s = qtest_init(PLATFORM PSP);
     int i;
 
     mbox_kick(s);
-    for (i = 0; i < ARRAY_SIZE(unsupported); i++) {
-        g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(unsupported[i], 0)),
-                        ==, AMD_PSP_DRTM_NOT_SUPPORTED);
-        assert_psp(s, true, "none", "none", unsupported[i],
-                   AMD_PSP_DRTM_NOT_SUPPORTED);
-    }
     for (i = 0; i < ARRAY_SIZE(before_launch); i++) {
-        g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(before_launch[i], 0)),
-                        ==, AMD_PSP_DRTM_NOT_SUPPORTED);
+        qtest_writel(s, MBOX_ARG0, 0x1000);
+        g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(before_launch[i].cmd,
+                                                         0)),
+                        ==, before_launch[i].status);
+        assert_psp(s, true, "none", "none", before_launch[i].cmd,
+                   before_launch[i].status);
     }
     for (i = 0; i < ARRAY_SIZE(invalid); i++) {
         g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(invalid[i], 0)), ==,
@@ -853,8 +857,10 @@ static void test_launch_signature(const void *data)
  * wrapping or uncovered range. TPM_LOCALITY_ACCESS locks locality 2 and
  * opens 4. Both are unsupported before the launch.
  */
-#define DLME_BASE   0x300000
+#define DLME_BASE   0x4000000
 #define DLME_LEN    0x1234
+/* A TMR over the first 256 MiB, which holds the SLB and the MLE */
+#define TMR_UNITS   0x1000
 
 static uint32_t extend_ossl_digest(QTestState *s, uint64_t base,
                                    uint32_t size)
@@ -892,7 +898,7 @@ static void test_after_launch(const void *data)
     }
     qtest_memwrite(s, DLME_BASE, dlme, sizeof(dlme));
     mbox_kick(s);
-    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(tmr_setup(s, 0, 0, TMR_UNITS), ==, AMD_PSP_DRTM_NO_ERROR);
 
     /* Not before the launch */
     g_assert_cmphex(extend_ossl_digest(s, DLME_BASE, DLME_LEN), ==,
@@ -904,14 +910,21 @@ static void test_after_launch(const void *data)
     pcr_read(s, 17, pcr17);
     pcr_read(s, 18, pcr18);
 
-    /* Empty, wrapping, and past the TMR's 4 MiB: nothing extended */
+    /*
+     * Empty, wrapping, past the TMR's 256 MiB, off a 64 MiB boundary and
+     * longer than 64 MiB: nothing extended
+     */
     g_assert_cmphex(extend_ossl_digest(s, DLME_BASE, 0), ==,
                     AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
     g_assert_cmphex(extend_ossl_digest(s, 0xfffffffffffff000ull, 0x2000), ==,
                     AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
-    g_assert_cmphex(extend_ossl_digest(s, 0x3ff000, 0x2000), ==,
+    g_assert_cmphex(extend_ossl_digest(s, 0xc000000, 0x4000001), ==,
                     AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
-    g_assert_cmphex(extend_ossl_digest(s, 0x400000, 0x1000), ==,
+    g_assert_cmphex(extend_ossl_digest(s, 0x10000000, 0x1000), ==,
+                    AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
+    g_assert_cmphex(extend_ossl_digest(s, DLME_BASE + 0x10000, DLME_LEN), ==,
+                    AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
+    g_assert_cmphex(extend_ossl_digest(s, 0, 0x4000001), ==,
                     AMD_PSP_DRTM_EXTEND_OSSL_DIGEST_FAILED);
     assert_pcr(s, 17, pcr17);
     assert_pcr(s, 18, pcr18);
@@ -933,6 +946,15 @@ static void test_after_launch(const void *data)
     g_assert_cmphex(tis_access(s, 1), !=, 0xffffffff);
     g_assert_cmphex(tis_access(s, 2), ==, 0xffffffff);
     g_assert_cmphex(tis_access(s, 4), !=, 0xffffffff);
+
+    /* A request for locality 2 afterwards is dropped, 0 stays usable */
+    qtest_writeb(s, TIS_REG(2, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_REQUEST_USE);
+    g_assert_cmphex(tis_access(s, 2), ==, 0xffffffff);
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_REQUEST_USE);
+    g_assert_cmphex(tis_access(s, 0) & TPM_TIS_ACCESS_ACTIVE_LOCALITY, ==,
+                    TPM_TIS_ACCESS_ACTIVE_LOCALITY);
 
     tpm_stop(s, swtpm_pid, addr);
 }
@@ -1022,7 +1044,7 @@ static void test_tcg_logs(const void *data)
     }
     qtest_memwrite(s, DLME_BASE, dlme, sizeof(dlme));
     mbox_kick(s);
-    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(tmr_setup(s, 0, 0, TMR_UNITS), ==, AMD_PSP_DRTM_NO_ERROR);
     g_assert_cmphex(mbox_command(s, get_logs), ==,
                     AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR);
 
@@ -1074,6 +1096,227 @@ static void test_tcg_logs(const void *data)
     tpm_stop(s, swtpm_pid, addr);
 }
 
+/* A kicked service, a TMR over the SLB and the MLE, and a launch */
+static void launch_ok(QTestState *s, uint8_t *slb)
+{
+    build_slb(slb);
+    qtest_memwrite(s, SLB_BASE, slb, AMD_PSP_SLB_SIZE);
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, TMR_UNITS), ==, AMD_PSP_DRTM_NO_ERROR);
+    skinit(s, SLB_MEASURED);
+    g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH,
+                                                     0)),
+                    ==, AMD_PSP_DRTM_NO_ERROR);
+}
+
+static uint64_t region_base(QTestState *s)
+{
+    return qtest_readl(s, MBOX_ARG1) |
+           (uint64_t)qtest_readl(s, MBOX_ARG2) << 32;
+}
+
+/*
+ * The three commands no loader issues, after a launch: the TMR
+ * descriptors in 64 KiB units, a shared buffer the guest can write, and a
+ * copy of the IVRS the machine's ACPI carries. A reset empties all three.
+ */
+static void test_post_launch_regions(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t get_tmrs = AMD_PSP_DRTM_CMD(
+                                  AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS, 0);
+    const uint32_t allocate = AMD_PSP_DRTM_CMD(
+                                  AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY, 0);
+    const uint32_t get_ivrs = AMD_PSP_DRTM_CMD(
+                                  AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO, 0);
+    uint8_t slb[AMD_PSP_SLB_SIZE], ivrs[AMD_PSP_IVRS_SIZE], sum = 0;
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    uint32_t len, i;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, PSP ",verify=off,tmr-count=2", &swtpm_pid, &addr);
+    launch_ok(s, slb);
+
+    /* Index 0 as TMR_SETUP took it, index 1 never set */
+    g_assert_cmphex(mbox_command(s, get_tmrs), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, 2 * AMD_PSP_TMR_DESC_LEN);
+    g_assert_cmphex(region_base(s), ==, AMD_PSP_TMR_DESC_BASE);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_TMR_DESC_BASE), ==, 0);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_TMR_DESC_BASE + 4), ==, 0);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_TMR_DESC_BASE + 8), ==, TMR_UNITS);
+    for (i = 12; i < 24; i += 4) {
+        g_assert_cmphex(qtest_readl(s, AMD_PSP_TMR_DESC_BASE + i), ==, 0);
+    }
+    qtest_writel(s, AMD_PSP_TMR_DESC_BASE + 8, 0xdeadbeef);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_TMR_DESC_BASE + 8), ==, TMR_UNITS);
+
+    /* Nothing, or more than the buffer holds, is refused */
+    qtest_writel(s, MBOX_ARG0, 0);
+    g_assert_cmphex(mbox_command(s, allocate), ==,
+                    AMD_PSP_DRTM_OUT_OF_RESOURCES_ERROR);
+    qtest_writel(s, MBOX_ARG0, AMD_PSP_SHARED_SIZE + 1);
+    g_assert_cmphex(mbox_command(s, allocate), ==,
+                    AMD_PSP_DRTM_OUT_OF_RESOURCES_ERROR);
+    qtest_writel(s, MBOX_ARG0, AMD_PSP_SHARED_SIZE);
+    g_assert_cmphex(mbox_command(s, allocate), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, AMD_PSP_SHARED_SIZE);
+    g_assert_cmphex(region_base(s), ==, AMD_PSP_SHARED_BASE);
+    qtest_writel(s, AMD_PSP_SHARED_BASE, 0x5a5aa5a5);
+    qtest_writel(s, AMD_PSP_SHARED_BASE + AMD_PSP_SHARED_SIZE - 4, 0x12345678);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SHARED_BASE), ==, 0x5a5aa5a5);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SHARED_BASE +
+                                AMD_PSP_SHARED_SIZE - 4), ==, 0x12345678);
+
+    /* The IVRS whole: its signature, length and checksum */
+    g_assert_cmphex(mbox_command(s, get_ivrs), ==, AMD_PSP_DRTM_NO_ERROR);
+    len = qtest_readl(s, MBOX_ARG0);
+    g_assert_cmphex(region_base(s), ==, AMD_PSP_IVRS_BASE);
+    g_assert_cmpuint(len, >=, 48);
+    g_assert_cmpuint(len, <=, sizeof(ivrs));
+    qtest_memread(s, AMD_PSP_IVRS_BASE, ivrs, len);
+    g_assert_cmpmem(ivrs, 4, "IVRS", 4);
+    g_assert_cmpuint(ldl_le_p(ivrs + 4), ==, len);
+    for (i = 0; i < len; i++) {
+        sum += ivrs[i];
+    }
+    g_assert_cmpuint(sum, ==, 0);
+    qtest_writel(s, AMD_PSP_IVRS_BASE, 0);
+    g_assert_cmpmem(ivrs, 4, "IVRS", 4);
+
+    /* A reset empties the three regions and forgets the launch */
+    qtest_system_reset(s);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_TMR_DESC_BASE + 8), ==, 0);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SHARED_BASE), ==, 0);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_IVRS_BASE), ==, 0);
+    mbox_kick(s);
+    g_assert_cmphex(mbox_command(s, get_tmrs), ==, AMD_PSP_DRTM_NOT_SUPPORTED);
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
+/* A machine whose ACPI has no IVRS gives the service none to hand out */
+static void test_no_ivrs(const void *data)
+{
+    const char *tpm_path = data;
+    uint8_t slb[AMD_PSP_SLB_SIZE];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, "-global amd-iommu.ivrs=off " PSP ",verify=off",
+                  &swtpm_pid, &addr);
+    launch_ok(s, slb);
+    g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(
+                                     AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO, 0)),
+                    ==, AMD_PSP_DRTM_GET_IVRS_TABLE_FAILED);
+    tpm_stop(s, swtpm_pid, addr);
+}
+
+/* min-spl fails a launch whose SecPatchLevel is below it, and only then */
+static void test_min_spl(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t launch = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH, 0);
+    uint8_t slb[AMD_PSP_SLB_SIZE];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    char props[64];
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    snprintf(props, sizeof(props), PSP ",verify=off,min-spl=%u",
+             SEC_PATCH_LEVEL + 1);
+    s = tpm_start(tpm_path, props, &swtpm_pid, &addr);
+    build_slb(slb);
+    qtest_memwrite(s, SLB_BASE, slb, sizeof(slb));
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, TMR_UNITS), ==, AMD_PSP_DRTM_NO_ERROR);
+    skinit(s, SLB_MEASURED);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+    tpm_stop(s, swtpm_pid, addr);
+
+    snprintf(props, sizeof(props), PSP ",verify=off,min-spl=%u",
+             SEC_PATCH_LEVEL);
+    s = tpm_start(tpm_path, props, &swtpm_pid, &addr);
+    launch_ok(s, slb);
+    tpm_stop(s, swtpm_pid, addr);
+}
+
+/*
+ * A TMR over [0, 4 GiB), the one drtm sets up, covers the interrupt
+ * window: the PIT's message from the IO-APIC goes through the IOMMU's
+ * view and is dropped, and arrives once TMR_RELEASE lifts the block.
+ */
+#define IOAPIC_BASE     0xfec00000
+#define PIT_PIN         2
+#define PROBE_VECTOR    0x40
+
+static bool probe_pending(QTestState *s)
+{
+    g_autofree char *out = qtest_hmp(s, "info lapic 0");
+    g_auto(GStrv) lines = g_strsplit(out, "\n", -1);
+    g_autofree char *want = g_strdup_printf(" %u ", PROBE_VECTOR);
+    char **l;
+
+    for (l = lines; *l; l++) {
+        if (g_str_has_prefix(*l, "IRR")) {
+            return strstr(*l, want) != NULL;
+        }
+    }
+    g_assert_not_reached();
+}
+
+static void test_tmr_probe(void)
+{
+    QTestState *s;
+
+    if (!qtest_has_device("amd-iommu")) {
+        g_test_skip("amd-iommu not available");
+        return;
+    }
+
+    s = qtest_init(PLATFORM "-device amd-iommu " PSP);
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x10000), ==, AMD_PSP_DRTM_NO_ERROR);
+    assert_one_block(s, "tmr0", 0, 0x100000000ULL, true);
+
+    /* Pin 2, fixed, physical, edge, active high, unmasked, to APIC 0 */
+    qtest_writel(s, IOAPIC_BASE, 0x10 + 2 * PIT_PIN + 1);
+    qtest_writel(s, IOAPIC_BASE + 0x10, 0);
+    qtest_writel(s, IOAPIC_BASE, 0x10 + 2 * PIT_PIN);
+    qtest_writel(s, IOAPIC_BASE + 0x10, PROBE_VECTOR);
+    /* PIT channel 0, rate generator, about 1 kHz */
+    qtest_outb(s, 0x43, 0x34);
+    qtest_outb(s, 0x40, 1193 & 0xff);
+    qtest_outb(s, 0x40, 1193 >> 8);
+
+    qtest_clock_step(s, 20 * SCALE_MS);
+    g_assert_false(probe_pending(s));
+
+    g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(
+                                     AMD_PSP_DRTM_CMD_TMR_RELEASE, 0)),
+                    ==, AMD_PSP_DRTM_NO_ERROR);
+    assert_no_blocks(s);
+    qtest_clock_step(s, 20 * SCALE_MS);
+    g_assert_true(probe_pending(s));
+    qtest_quit(s);
+}
+
 /* locality-locks=off leaves the TIS as it is without a PSP */
 static void test_locks_off(const void *data)
 {
@@ -1119,6 +1362,7 @@ int main(int argc, char **argv)
     qtest_add_func("/amd-psp/drtm/tmr", test_tmr);
     qtest_add_func("/amd-psp/drtm/busy-and-delay", test_busy_and_delay);
     qtest_add_func("/amd-psp/drtm/reset", test_reset);
+    qtest_add_func("/amd-psp/drtm/tmr-probe", test_tmr_probe);
     qtest_add_data_func("/amd-psp/drtm/launch", tpm_path, test_launch);
     qtest_add_data_func("/amd-psp/drtm/launch-fails", tpm_path,
                         test_launch_fails);
@@ -1127,6 +1371,10 @@ int main(int argc, char **argv)
     qtest_add_data_func("/amd-psp/drtm/after-launch", tpm_path,
                         test_after_launch);
     qtest_add_data_func("/amd-psp/drtm/tcg-logs", tpm_path, test_tcg_logs);
+    qtest_add_data_func("/amd-psp/drtm/post-launch-regions", tpm_path,
+                        test_post_launch_regions);
+    qtest_add_data_func("/amd-psp/drtm/no-ivrs", tpm_path, test_no_ivrs);
+    qtest_add_data_func("/amd-psp/drtm/min-spl", tpm_path, test_min_spl);
     qtest_add_data_func("/amd-psp/drtm/locks-off", tpm_path, test_locks_off);
 
     ret = g_test_run();

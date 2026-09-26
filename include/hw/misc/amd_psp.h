@@ -108,6 +108,22 @@ enum {
 #define AMD_PSP_EV_OS_SL_LOAD       0x8006
 #define AMD_PSP_EV_AMD_SL_SEPARATOR 0x8007
 
+/*
+ * The regions the other post-launch commands answer with, beside the log:
+ * a copy of the IVRS, the TMR descriptors, and the buffer
+ * ALLOCATE_SHARED_MEMORY grants, the only one the guest may write.
+ */
+#define AMD_PSP_IVRS_BASE           0xfedb1000ULL
+#define AMD_PSP_IVRS_SIZE           0x1000
+#define AMD_PSP_TMR_DESC_BASE       0xfedb2000ULL
+#define AMD_PSP_TMR_DESC_SIZE       0x1000
+#define AMD_PSP_TMR_DESC_LEN        12
+#define AMD_PSP_SHARED_BASE         0xfedc0000ULL
+#define AMD_PSP_SHARED_SIZE         0x10000
+
+/* The MLE EXTEND_OSSL_DIGEST takes: this aligned, at most this long */
+#define AMD_PSP_MLE_ALIGN           0x4000000ULL
+
 /* GET_CAPABILITY: C2PMSG_93 flags, _94 the version, _95 alignment and count */
 #define AMD_PSP_DRTM_CAP_ENABLED (1u << 0)
 #define AMD_PSP_DRTM_CAP_TSME (1u << 1)
@@ -159,6 +175,7 @@ struct AmdPspState {
     bool verify;
     uint32_t command_delay;
     bool locality_locks;
+    uint32_t min_spl;
 
     MemoryRegion mmio;
     MemoryRegion window;
@@ -175,6 +192,14 @@ struct AmdPspState {
     MemoryRegion tcg_log;
     uint32_t tcg_log_len;
     bool tcg_log_full;
+    uint64_t ivrs_base;
+    MemoryRegion ivrs_mr;
+    uint64_t tmr_desc_base;
+    MemoryRegion tmr_desc;
+    uint64_t shared_base;
+    MemoryRegion shared;
+    /* The IVRS the machine's ACPI carries, NULL when it has none */
+    GByteArray *ivrs;
     bool kicked;
     bool busy;
     uint8_t command;
@@ -186,5 +211,32 @@ struct AmdPspState {
     QEMUBH *bh;
     QEMUTimer *delay_timer;
 };
+
+/*
+ * The IVRS the BIOS would hand the PSP: ACPI building passes the table it
+ * makes, or @len 0 when it makes none. The checksum is the firmware's to
+ * fill in, so the copy gets the one the guest's table will carry.
+ */
+static inline void amd_psp_set_ivrs(AmdPspState *s, const void *table,
+                                    size_t len)
+{
+    uint8_t sum = 0;
+    size_t i;
+
+    if (s->ivrs) {
+        g_byte_array_unref(s->ivrs);
+        s->ivrs = NULL;
+    }
+    if (!len) {
+        return;
+    }
+    s->ivrs = g_byte_array_sized_new(len);
+    g_byte_array_append(s->ivrs, table, len);
+    s->ivrs->data[9] = 0;
+    for (i = 0; i < len; i++) {
+        sum += s->ivrs->data[i];
+    }
+    s->ivrs->data[9] = -sum;
+}
 
 #endif

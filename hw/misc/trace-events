@@ -480,3 +480,4 @@ amd_psp_drtm_extend_ossl_digest(uint64_t base, uint64_t size, const char *digest
 amd_psp_drtm_tpm_locality_access(void) ""
 amd_psp_drtm_log_event(unsigned pcr, uint16_t type, uint32_t len) "PCR %u type 0x%x with %u bytes of event data"
 amd_psp_drtm_get_tcg_logs(uint64_t base, uint32_t len) "log at 0x%" PRIx64 " of %u bytes"
+amd_psp_drtm_region(const char *what, uint64_t base, uint32_t len) "%s at 0x%" PRIx64 " of %u bytes"

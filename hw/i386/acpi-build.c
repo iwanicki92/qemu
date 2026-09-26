@@ -2135,6 +2135,7 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
     GArray *tables_blob = tables->table_data;
     AcpiSlicOem slic_oem = { .id = NULL, .table_id = NULL };
     Object *vmgenid_dev, *vmclock_dev, *psp;
+    unsigned ivrs_offset = 0, ivrs_len = 0;
     char *oem_id;
     char *oem_table_id;
 
@@ -2257,9 +2258,11 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
          * describe one does, so the guest finds it in PCI space alone.
          */
         if (AMD_IOMMU_DEVICE(iommu)->ivrs) {
+            ivrs_offset = tables_blob->len;
             acpi_add_table(table_offsets, tables_blob);
             build_amd_iommu(tables_blob, tables->linker, x86ms->oem_id,
                             x86ms->oem_table_id);
+            ivrs_len = tables_blob->len - ivrs_offset;
         }
     } else if (object_dynamic_cast(OBJECT(iommu), TYPE_INTEL_IOMMU_DEVICE)) {
         acpi_add_table(table_offsets, tables_blob);
@@ -2274,6 +2277,10 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
     }
 
     psp = object_resolve_path_type("", TYPE_AMD_PSP, NULL);
+    if (psp) {
+        amd_psp_set_ivrs(AMD_PSP(psp), tables_blob->data + ivrs_offset,
+                         ivrs_len);
+    }
     if (psp && AMD_PSP(psp)->aspt) {
         /*
          * aspt=off leaves the Secure Processor's registers where they are

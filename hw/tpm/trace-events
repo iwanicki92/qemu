@@ -27,6 +27,7 @@ tpm_tis_run_command(uint8_t locty, size_t len, int ret) "locality %u len %zu ret
 tpm_tis_seized_by_agent(uint8_t from, uint8_t locty) "locality %u seized by the agent at locality %u"
 tpm_tis_locality_locks(uint8_t locked) "locked localities mask 0x%x"
 tpm_tis_locked(uint8_t locty, bool is_write) "locality %u locked, write %d"
+tpm_tis_burst_wait(uint8_t locty) "locality %u moved a FIFO byte past the burst count"
 
 # tpm_ppi.c
 tpm_ppi_memset(uint8_t *ptr, size_t size) "memset: %p %zu"

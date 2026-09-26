@@ -252,6 +252,7 @@ static void test_unsupported(void)
         { AMD_PSP_DRTM_CMD_EXTEND_OSSL_DIGEST, AMD_PSP_DRTM_NOT_SUPPORTED },
         { AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS, AMD_PSP_DRTM_NOT_SUPPORTED },
         { AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS, AMD_PSP_DRTM_NOT_SUPPORTED },
+        { AMD_PSP_DRTM_CMD_GET_TCG_LOGS, AMD_PSP_DRTM_NOT_SUPPORTED },
         { AMD_PSP_DRTM_CMD_ALLOCATE_SHARED_MEMORY,
           AMD_PSP_DRTM_OUT_OF_RESOURCES_ERROR },
         { AMD_PSP_DRTM_CMD_GET_IVRS_TABLE_INFO,
@@ -274,10 +275,6 @@ static void test_unsupported(void)
         g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(invalid[i], 0)), ==,
                         AMD_PSP_DRTM_INVALID_SERVICE_ID_ERROR);
     }
-    /* The log is empty before a launch */
-    g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(
-                                     AMD_PSP_DRTM_CMD_GET_TCG_LOGS, 0)),
-                    ==, AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR);
 
     /* LAUNCH with no SKINIT recorded is the guide's first failed step */
     g_assert_cmphex(mbox_command(s, AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH,
@@ -1065,7 +1062,7 @@ static void test_tcg_logs(const void *data)
     mbox_kick(s);
     g_assert_cmphex(tmr_setup(s, 0, 0, TMR_UNITS), ==, AMD_PSP_DRTM_NO_ERROR);
     g_assert_cmphex(mbox_command(s, get_logs), ==,
-                    AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR);
+                    AMD_PSP_DRTM_NOT_SUPPORTED);
 
     skinit(s, SLB_MEASURED);
     g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_NO_ERROR);
@@ -1109,7 +1106,7 @@ static void test_tcg_logs(const void *data)
     qtest_system_reset(s);
     mbox_kick(s);
     g_assert_cmphex(mbox_command(s, get_logs), ==,
-                    AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR);
+                    AMD_PSP_DRTM_NOT_SUPPORTED);
     g_assert_cmphex(qtest_readl(s, AMD_PSP_TCG_LOG_BASE + 4), ==, 0);
 
     tpm_stop(s, swtpm_pid, addr);

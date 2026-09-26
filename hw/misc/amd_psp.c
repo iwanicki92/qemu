@@ -808,11 +808,14 @@ static uint16_t amd_psp_cmd_tpm_locality_access(AmdPspState *s)
 
 /*
  * The log's size in C2PMSG_93 and its address in _94 and _95, as the
- * board answered. What the board answers before any launch is untested:
- * an empty log is taken as the failed status.
+ * board answered. Before a successful launch, the guide's appendix A
+ * status, and a full log the failed one.
  */
 static uint16_t amd_psp_cmd_get_tcg_logs(AmdPspState *s)
 {
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK) {
+        return AMD_PSP_DRTM_NOT_SUPPORTED;
+    }
     if (!s->tcg_log_len || s->tcg_log_full) {
         return AMD_PSP_DRTM_GET_TCG_LOGS_FAILED_ERROR;
     }

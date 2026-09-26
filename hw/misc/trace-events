@@ -458,7 +458,7 @@ amd_psp_drtm_soc_flags(uint32_t cpu, uint32_t count, bool match) "cpu 0x%x in a 
 amd_psp_drtm_pcr_read(unsigned pcr, const char *digest) "PCR %u = %s"
 amd_psp_drtm_pcr_extend(unsigned pcr, const char *digest) "PCR %u extended with %s"
 amd_psp_drtm_locks(uint8_t locked) "locked localities mask 0x%x"
-amd_psp_drtm_extend_ossl_digest(uint64_t base, uint64_t size, const char *digest) "0x%" PRIx64 " bytes at 0x%" PRIx64 " hash %s"
+amd_psp_drtm_extend_ossl_digest(uint64_t base, uint64_t size, const char *digest) "base 0x%" PRIx64 " size 0x%" PRIx64 " hash %s"
 amd_psp_drtm_tpm_locality_access(void) ""
 amd_psp_drtm_log_event(unsigned pcr, uint16_t type, uint32_t len) "PCR %u type 0x%x with %u bytes of event data"
 amd_psp_drtm_get_tcg_logs(uint64_t base, uint32_t len) "log at 0x%" PRIx64 " of %u bytes"

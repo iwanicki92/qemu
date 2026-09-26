@@ -174,6 +174,7 @@ struct AmdPspState {
     uint32_t splt_version;
     bool verify;
     uint32_t command_delay;
+    uint8_t delayed_command;
     bool locality_locks;
     uint32_t min_spl;
 

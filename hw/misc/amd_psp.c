@@ -1024,7 +1024,8 @@ static void amd_psp_run_command(void *opaque)
     s->command = (word >> AMD_PSP_DRTM_CMD_SHIFT) & AMD_PSP_DRTM_CMD_MASK;
     s->status = amd_psp_dispatch(s, s->command, index);
 
-    if (s->command_delay) {
+    if (s->command_delay &&
+        (!s->delayed_command || s->delayed_command == s->command)) {
         trace_amd_psp_drtm_ready_held(s->command_delay);
         timer_mod(s->delay_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->command_delay);
@@ -1303,6 +1304,8 @@ static const Property amd_psp_properties[] = {
     DEFINE_PROP_BOOL("verify", AmdPspState, verify, true),
     /* Milliseconds the ready bit stays clear after each command */
     DEFINE_PROP_UINT32("command-delay", AmdPspState, command_delay, 0),
+    /* The one command code the delay applies to, 0 for every command */
+    DEFINE_PROP_UINT8("delayed-command", AmdPspState, delayed_command, 0),
     DEFINE_PROP_BOOL("locality-locks", AmdPspState, locality_locks, true),
     DEFINE_PROP_UINT64("tcg-log-base", AmdPspState, tcg_log_base,
                        AMD_PSP_TCG_LOG_BASE),

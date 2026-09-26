@@ -400,6 +400,25 @@ static void test_busy_and_delay(void)
     qtest_quit(s);
 }
 
+/* delayed-command narrows the delay to one command code */
+static void test_delayed_command(void)
+{
+    const uint32_t cap = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_GET_CAPABILITY, 0);
+    const uint32_t release = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_TMR_RELEASE, 0);
+    QTestState *s = qtest_initf(PLATFORM PSP ",command-delay=100,"
+                                "delayed-command=%d",
+                                AMD_PSP_DRTM_CMD_TMR_RELEASE);
+
+    mbox_kick(s);
+    g_assert_cmphex(mbox_command(s, cap), ==, AMD_PSP_DRTM_NO_ERROR);
+
+    qtest_writel(s, MBOX_CMD, release);
+    g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, release);
+    qtest_clock_step(s, 100 * SCALE_MS);
+    mbox_wait_ready(s);
+    qtest_quit(s);
+}
+
 /* Reset takes the kick, the TMRs and the registers back to the start */
 static void test_reset(void)
 {
@@ -1361,6 +1380,7 @@ int main(int argc, char **argv)
     qtest_add_func("/amd-psp/drtm/unsupported", test_unsupported);
     qtest_add_func("/amd-psp/drtm/tmr", test_tmr);
     qtest_add_func("/amd-psp/drtm/busy-and-delay", test_busy_and_delay);
+    qtest_add_func("/amd-psp/drtm/delayed-command", test_delayed_command);
     qtest_add_func("/amd-psp/drtm/reset", test_reset);
     qtest_add_func("/amd-psp/drtm/tmr-probe", test_tmr_probe);
     qtest_add_data_func("/amd-psp/drtm/launch", tpm_path, test_launch);

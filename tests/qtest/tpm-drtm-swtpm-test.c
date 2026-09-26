@@ -1,6 +1,7 @@
 /*
  * QTest testcase for the locality 4 hash an AMD dynamic launch sends to
- * swtpm through the TPM TIS frontend
+ * swtpm through the TPM TIS frontend, and for the FIFO burst limit a
+ * launch's TPM driver is tested against
  *
  * Copyright (c) 2026 iwanicki92 <iwanicki92@gmail.com>
  *
@@ -81,9 +82,13 @@ static void expected_pcr17(const unsigned char *image, size_t len,
     g_assert_cmpuint(digest_len, ==, SHA256_LEN);
 }
 
-/* swtpm and QEMU with tpm-tis on it, started past TPM2_Startup */
+/*
+ * swtpm and QEMU with tpm-tis on it, started past TPM2_Startup, which goes
+ * through tx.
+ */
 static QTestState *drtm_qtest_start(const char *tpm_path, const char *devices,
-                                    GPid *swtpm_pid, SocketAddress **addr)
+                                    tx_func *tx, GPid *swtpm_pid,
+                                    SocketAddress **addr)
 {
     GError *error = NULL;
     QTestState *s;
@@ -102,7 +107,7 @@ static QTestState *drtm_qtest_start(const char *tpm_path, const char *devices,
     g_free(args);
 
     /* Before TPM2_Startup the sequence would land in PCR 0 as an H-CRTM. */
-    tpm_util_startup(s, tpm_tis_transfer);
+    tpm_util_startup(s, tx);
     return s;
 }
 
@@ -165,7 +170,8 @@ static void tpm_drtm_swtpm_test(const void *data)
     }
 
     s = drtm_qtest_start(tpm_path, "-device tpm-tis,tpmdev=tpm0 "
-                         "-device amd-drtm-platform", &swtpm_pid, &addr);
+                         "-device amd-drtm-platform", tpm_tis_transfer,
+                         &swtpm_pid, &addr);
 
     fill_image(image, sizeof(image));
     qtest_memwrite(s, IMAGE_BASE, image, sizeof(image));
@@ -223,7 +229,7 @@ static void tpm_drtm_locality4_test(const void *data)
     }
 
     s = drtm_qtest_start(tpm_path, "-device tpm-tis,tpmdev=tpm0,locality4=on",
-                         &swtpm_pid, &addr);
+                         tpm_tis_transfer, &swtpm_pid, &addr);
 
     fill_image(image, sizeof(image));
     expected_pcr17(image, sizeof(image), expected);
@@ -244,6 +250,139 @@ static void tpm_drtm_locality4_test(const void *data)
     drtm_qtest_stop(s, swtpm_pid, addr);
 }
 
+#define BURST_LIMIT 8
+
+/* What burst_transfer saw of the burst counts */
+static unsigned bursts_stalled;
+static unsigned bursts_largest;
+
+/*
+ * The burst count at locality 0, read a byte at a time as a driver does,
+ * polled until the FIFO has refilled.
+ */
+static uint16_t burst_wait(QTestState *s)
+{
+    uint16_t burst;
+    int tries;
+
+    for (tries = 0; tries < 100; tries++) {
+        burst = qtest_readb(s, TIS_REG(0, TPM_TIS_REG_STS) + 1) |
+                qtest_readb(s, TIS_REG(0, TPM_TIS_REG_STS) + 2) << 8;
+        if (burst) {
+            bursts_largest = MAX(bursts_largest, burst);
+            return burst;
+        }
+        bursts_stalled++;
+    }
+    g_assert_not_reached();
+}
+
+/* A command and its response, never moving more than the burst count */
+static void burst_transfer(QTestState *s,
+                           const unsigned char *req, size_t req_size,
+                           unsigned char *rsp, size_t rsp_size)
+{
+    size_t done, size, n, burst;
+    uint8_t sts;
+    int tries;
+
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS), TPM_TIS_ACCESS_REQUEST_USE);
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_STS), TPM_TIS_STS_COMMAND_READY);
+
+    for (done = 0; done < req_size;) {
+        burst = burst_wait(s);
+        for (n = 0; n < burst && done < req_size; n++) {
+            qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_DATA_FIFO), req[done++]);
+        }
+    }
+    sts = qtest_readb(s, TIS_REG(0, TPM_TIS_REG_STS));
+    g_assert_cmphex(sts & (TPM_TIS_STS_VALID | TPM_TIS_STS_EXPECT), ==,
+                    TPM_TIS_STS_VALID);
+
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_STS), TPM_TIS_STS_TPM_GO);
+    for (tries = 0; tries < 5000; tries++) {
+        sts = qtest_readb(s, TIS_REG(0, TPM_TIS_REG_STS));
+        if (sts & TPM_TIS_STS_DATA_AVAILABLE) {
+            break;
+        }
+        g_usleep(1000);
+    }
+    g_assert_cmphex(sts & TPM_TIS_STS_DATA_AVAILABLE, !=, 0);
+
+    /* The size is in the 10-byte header, read in the first bursts */
+    memset(rsp, 0, rsp_size);
+    size = 10;
+    for (done = 0; done < size;) {
+        burst = burst_wait(s);
+        for (n = 0; n < burst && done < size; n++) {
+            rsp[done++] = qtest_readb(s, TIS_REG(0, TPM_TIS_REG_DATA_FIFO));
+            if (done == 6) {
+                size = ldl_be_p(&rsp[2]);
+                g_assert_cmpuint(size, <=, rsp_size);
+            }
+        }
+    }
+    sts = qtest_readb(s, TIS_REG(0, TPM_TIS_REG_STS));
+    g_assert_cmphex(sts & TPM_TIS_STS_DATA_AVAILABLE, ==, 0);
+
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_ACTIVE_LOCALITY);
+}
+
+/*
+ * With burst-limit, a driver that waits out each burst sees bursts of the
+ * limit and gets whole commands and responses through. One that ignores
+ * the burst count gets them through too, as hardware would after waiting.
+ */
+static void tpm_burst_limit_test(const void *data)
+{
+    const char *tpm_path = data;
+    unsigned char rsp[1024];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    uint8_t sts;
+    size_t i;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    bursts_stalled = 0;
+    bursts_largest = 0;
+    s = drtm_qtest_start(tpm_path, "-device tpm-tis,tpmdev=tpm0,burst-limit="
+                         stringify(BURST_LIMIT), burst_transfer,
+                         &swtpm_pid, &addr);
+
+    /* Nothing has extended PCR 17 since TPM2_Startup reset it to ones */
+    burst_transfer(s, tpm2_pcrread_17, sizeof(tpm2_pcrread_17),
+                   rsp, sizeof(rsp));
+    g_assert_cmphex(ldl_be_p(&rsp[2]), ==, PCRREAD_RESP_LEN);
+    g_assert_cmphex(ldl_be_p(&rsp[6]), ==, 0);
+    g_assert_cmphex(lduw_be_p(&rsp[PCRREAD_DIGEST_OFF - 2]), ==, SHA256_LEN);
+    for (i = 0; i < SHA256_LEN; i++) {
+        g_assert_cmphex(rsp[PCRREAD_DIGEST_OFF + i], ==, 0xff);
+    }
+    g_assert_cmpuint(bursts_largest, ==, BURST_LIMIT);
+    g_assert_cmpuint(bursts_stalled, >=, PCRREAD_RESP_LEN / BURST_LIMIT);
+
+    /* The whole command at once, past every burst count */
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS), TPM_TIS_ACCESS_REQUEST_USE);
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_STS), TPM_TIS_STS_COMMAND_READY);
+    for (i = 0; i < sizeof(tpm2_pcrread_17); i++) {
+        qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_DATA_FIFO), tpm2_pcrread_17[i]);
+    }
+    sts = qtest_readb(s, TIS_REG(0, TPM_TIS_REG_STS));
+    g_assert_cmphex(sts & (TPM_TIS_STS_VALID | TPM_TIS_STS_EXPECT), ==,
+                    TPM_TIS_STS_VALID);
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_STS), TPM_TIS_STS_COMMAND_READY);
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_ACTIVE_LOCALITY);
+
+    drtm_qtest_stop(s, swtpm_pid, addr);
+}
+
 int main(int argc, char **argv)
 {
     char *tpm_path;
@@ -258,6 +397,8 @@ int main(int argc, char **argv)
                         tpm_drtm_swtpm_test);
     qtest_add_data_func("/tpm/drtm-swtpm/locality4", tpm_path,
                         tpm_drtm_locality4_test);
+    qtest_add_data_func("/tpm/drtm-swtpm/burst-limit", tpm_path,
+                        tpm_burst_limit_test);
     ret = g_test_run();
 
     tpm_util_rmdir(tpm_path);

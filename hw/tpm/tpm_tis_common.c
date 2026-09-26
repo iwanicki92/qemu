@@ -262,6 +262,42 @@ void tpm_tis_request_completed(TPMState *s, int ret)
 }
 
 /*
+ * Spend a byte of the current burst. A byte past its end still moves, as
+ * a TPM inserts wait states for it on the bus (PTP, TPM_STS burstCount).
+ */
+static void tpm_tis_burst_spend(TPMState *s, uint8_t locty)
+{
+    if (!s->burst_limit) {
+        return;
+    }
+    if (!s->burst_left) {
+        trace_tpm_tis_burst_wait(locty);
+        return;
+    }
+    s->burst_left--;
+}
+
+/*
+ * The burst count a read of STS shows. With a burst limit it is what is
+ * left of the current burst, and 0 once that is spent. Only a read that
+ * covers the burst count bytes and shows the 0 starts the next burst.
+ */
+static uint32_t tpm_tis_burst_count(TPMState *s, hwaddr addr, unsigned size,
+                                    uint32_t avail)
+{
+    unsigned first = addr & 0x3;
+
+    if (!s->burst_limit || first + size <= 1 || first > 2) {
+        return avail;
+    }
+    if (!s->burst_left) {
+        s->burst_left = s->burst_limit;
+        return 0;
+    }
+    return MIN(avail, s->burst_left);
+}
+
+/*
  * Read a byte of response data
  */
 static uint32_t tpm_tis_data_read(TPMState *s, uint8_t locty)
@@ -270,6 +306,7 @@ static uint32_t tpm_tis_data_read(TPMState *s, uint8_t locty)
     uint16_t len;
 
     if ((s->loc[locty].sts & TPM_TIS_STS_DATA_AVAILABLE)) {
+        tpm_tis_burst_spend(s, locty);
         len = MIN(tpm_cmd_get_size(&s->buffer),
                   s->be_buffer_size);
 
@@ -387,10 +424,8 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
     case TPM_TIS_REG_STS:
         if (s->active_locty == locty) {
             if ((s->loc[locty].sts & TPM_TIS_STS_DATA_AVAILABLE)) {
-                val = TPM_TIS_BURST_COUNT(
-                       MIN(tpm_cmd_get_size(&s->buffer),
-                           s->be_buffer_size)
-                       - s->rw_offset) | s->loc[locty].sts;
+                avail = MIN(tpm_cmd_get_size(&s->buffer),
+                            s->be_buffer_size) - s->rw_offset;
             } else {
                 avail = s->be_buffer_size - s->rw_offset;
                 /*
@@ -400,8 +435,9 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
                 if (size == 1 && avail > 0xff) {
                     avail = 0xff;
                 }
-                val = TPM_TIS_BURST_COUNT(avail) | s->loc[locty].sts;
             }
+            avail = tpm_tis_burst_count(s, addr, size, avail);
+            val = TPM_TIS_BURST_COUNT(avail) | s->loc[locty].sts;
         }
         break;
     case TPM_TIS_REG_DATA_FIFO:
@@ -803,6 +839,7 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
             }
 
             while ((s->loc[locty].sts & TPM_TIS_STS_EXPECT) && size > 0) {
+                tpm_tis_burst_spend(s, locty);
                 if (s->rw_offset < s->be_buffer_size) {
                     s->buffer[s->rw_offset++] =
                         (uint8_t)val;
@@ -950,6 +987,7 @@ void tpm_tis_reset(TPMState *s, bool ppi_enabled)
     s->aborting_locty = TPM_TIS_NO_LOCALITY;
     s->hash_active = false;
     s->hash_len = 0;
+    s->burst_left = s->burst_limit;
 
     for (c = 0; c < TPM_TIS_NUM_LOCALITIES; c++) {
         s->loc[c].access = TPM_TIS_ACCESS_TPM_REG_VALID_STS;

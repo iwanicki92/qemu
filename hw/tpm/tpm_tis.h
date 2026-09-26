@@ -93,6 +93,16 @@ typedef struct TPMState {
      * interface's reset leaves it alone and it does not migrate.
      */
     uint8_t locked;
+
+    /*
+     * A FIFO that moves burst_limit bytes at most, then shows a burst
+     * count of 0 once before the next burst, as a FIFO TPM refilling does.
+     * A byte past the burst still moves, where hardware would wait. 0
+     * turns it off. burst_left does not migrate, a stale value only
+     * changes where the next burst ends.
+     */
+    uint16_t burst_limit;
+    uint16_t burst_left;
 } TPMState;
 
 extern const VMStateDescription vmstate_locty;

@@ -461,6 +461,10 @@ vmlaunch_reset_enter(void) ""
 vm_launchupdate_finalize(void) ""
 restore_host_x86_igvm(void) ""
 
+# amd_fch_pmio.c
+amd_fch_pmio_read(uint64_t offset, unsigned size, uint64_t value) "offset 0x%" PRIx64 " size %u value 0x%" PRIx64
+amd_fch_pmio_write(uint64_t offset, unsigned size, uint64_t value) "offset 0x%" PRIx64 " size %u value 0x%" PRIx64
+
 # isa_post_code.c
 isa_post_code_write(uint64_t port, unsigned size, uint64_t value) "port 0x%" PRIx64 " size %u value 0x%" PRIx64
 

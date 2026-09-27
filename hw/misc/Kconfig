@@ -30,6 +30,11 @@ config AMD_PSP
     default y if TEST_DEVICES
     depends on PCI && I386
 
+config AMD_FCH_PMIO
+    bool
+    default y if TEST_DEVICES
+    depends on ISA_BUS && I386
+
 config ISA_POST_CODE
     bool
     default y if TEST_DEVICES

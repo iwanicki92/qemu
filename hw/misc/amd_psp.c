@@ -915,6 +915,56 @@ static uint16_t amd_psp_cmd_get_ivrs_table_info(AmdPspState *s)
     return AMD_PSP_DRTM_NO_ERROR;
 }
 
+/*
+ * Client firmware's two SMM commands, which server firmware refuses (the
+ * guide's appendix H.2). These answers are what AMD's client SL accepts,
+ * not what firmware returns: zero hashes and a policy with no entries.
+ */
+static void amd_psp_smm_fill(AmdPspState *s)
+{
+    uint8_t *p = memory_region_get_ram_ptr(&s->smm);
+    uint32_t hash = AMD_PSP_SMM_BASE + AMD_PSP_SMM_HASH;
+
+    /* Image hash then public key hash, each low, high and size */
+    stl_le_p(p, hash);
+    stl_le_p(p + 8, AMD_PSP_SMM_HASH_LEN);
+    stl_le_p(p + 12, hash + AMD_PSP_SMM_HASH_LEN);
+    stl_le_p(p + 20, AMD_PSP_SMM_HASH_LEN);
+    /* Version and size, the memory, IO and MSR entries all left at zero */
+    stl_le_p(p + AMD_PSP_SMM_POLICY, 2);
+    stl_le_p(p + AMD_PSP_SMM_POLICY + 4, AMD_PSP_SMM_POLICY_LEN);
+    memory_region_set_dirty(&s->smm, 0, AMD_PSP_SMM_SIZE);
+}
+
+static uint16_t amd_psp_cmd_process_smm(AmdPspState *s)
+{
+    if (!s->client_smm) {
+        return AMD_PSP_DRTM_INVALID_SERVICE_ID_ERROR;
+    }
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK) {
+        return AMD_PSP_DRTM_NOT_SUPPORTED;
+    }
+    amd_psp_answer_region(s, AMD_PSP_SMM_BASE, AMD_PSP_SMM_OUTPUT_LEN);
+    trace_amd_psp_drtm_region("SMM hashes", AMD_PSP_SMM_BASE,
+                              AMD_PSP_SMM_OUTPUT_LEN);
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
+static uint16_t amd_psp_cmd_get_smm_policy(AmdPspState *s)
+{
+    uint64_t base = AMD_PSP_SMM_BASE + AMD_PSP_SMM_POLICY;
+
+    if (!s->client_smm) {
+        return AMD_PSP_DRTM_INVALID_SERVICE_ID_ERROR;
+    }
+    if (s->launch != AMD_PSP_LAUNCH_STATE_OK) {
+        return AMD_PSP_DRTM_NOT_SUPPORTED;
+    }
+    amd_psp_answer_region(s, base, AMD_PSP_SMM_POLICY_LEN);
+    trace_amd_psp_drtm_region("SMM policy", base, AMD_PSP_SMM_POLICY_LEN);
+    return AMD_PSP_DRTM_NO_ERROR;
+}
+
 static uint16_t amd_psp_cmd_get_capability(AmdPspState *s)
 {
     /* The board's values: DRTM enabled, TSME off, anti-rollback set */
@@ -992,6 +1042,10 @@ static uint16_t amd_psp_dispatch(AmdPspState *s, uint8_t cmd, unsigned index)
         return amd_psp_cmd_tmr_release(s);
     case AMD_PSP_DRTM_CMD_LAUNCH:
         return amd_psp_cmd_launch(s);
+    case AMD_PSP_DRTM_CMD_PROCESS_SMM:
+        return amd_psp_cmd_process_smm(s);
+    case AMD_PSP_DRTM_CMD_GET_SMM_POLICY:
+        return amd_psp_cmd_get_smm_policy(s);
     case AMD_PSP_DRTM_CMD_EXTEND_OSSL_DIGEST:
         return amd_psp_cmd_extend_ossl_digest(s);
     case AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS:
@@ -1202,7 +1256,7 @@ static AmdPspDrtmInfo *amd_psp_drtm_info(void *opaque)
     return info;
 }
 
-/* The service's four regions and the ASPT window, none on another */
+/* The service's regions and the ASPT window, none on another */
 static bool amd_psp_regions_apart(AmdPspState *s, Error **errp)
 {
     const struct {
@@ -1214,6 +1268,8 @@ static bool amd_psp_regions_apart(AmdPspState *s, Error **errp)
         { "ivrs-base", s->ivrs_base, AMD_PSP_IVRS_SIZE },
         { "tmr-desc-base", s->tmr_desc_base, AMD_PSP_TMR_DESC_SIZE },
         { "shared-base", s->shared_base, AMD_PSP_SHARED_SIZE },
+        { "the SMM answers", AMD_PSP_SMM_BASE,
+          s->client_smm ? AMD_PSP_SMM_SIZE : 0 },
         { "the ASPT window", AMD_PSP_ASPT_BASE, AMD_PSP_ASPT_SIZE },
     };
     size_t i, j;
@@ -1240,6 +1296,10 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
 
     pci_set_word(pci_dev->config + PCI_DEVICE_ID, s->device_id);
 
+    if (s->client_smm && !s->drtm_service) {
+        error_setg(errp, "client-smm=on needs drtm-service=on");
+        return;
+    }
     if (s->drtm_service) {
         s->platform = amd_drtm_platform_find();
         if (!s->platform) {
@@ -1288,6 +1348,15 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
                                     AMD_PSP_SHARED_SIZE, errp)) {
             return;
         }
+        if (s->client_smm) {
+            if (!memory_region_init_rom(&s->smm, OBJECT(s), "amd-psp-smm",
+                                        AMD_PSP_SMM_SIZE, errp)) {
+                return;
+            }
+            amd_psp_smm_fill(s);
+            memory_region_add_subregion(get_system_memory(), AMD_PSP_SMM_BASE,
+                                        &s->smm);
+        }
         s->bh = qemu_bh_new_guarded(amd_psp_run_command, s,
                                     &DEVICE(s)->mem_reentrancy_guard);
         s->delay_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
@@ -1331,6 +1400,9 @@ static void amd_psp_exit(PCIDevice *pci_dev)
         memory_region_del_subregion(get_system_memory(), &s->ivrs_mr);
         memory_region_del_subregion(get_system_memory(), &s->tmr_desc);
         memory_region_del_subregion(get_system_memory(), &s->shared);
+        if (s->client_smm) {
+            memory_region_del_subregion(get_system_memory(), &s->smm);
+        }
         timer_free(s->delay_timer);
         qemu_bh_delete(s->bh);
     }
@@ -1370,6 +1442,8 @@ static const Property amd_psp_properties[] = {
                        AMD_PSP_SHARED_BASE),
     /* The platform's SecPatchLevel, below which LAUNCH fails */
     DEFINE_PROP_UINT32("min-spl", AmdPspState, min_spl, 0),
+    /* Answer PROCESS_SMM and GET_SMM_POLICY, as client firmware does */
+    DEFINE_PROP_BOOL("client-smm", AmdPspState, client_smm, false),
 };
 
 /* None of the service's state, or the locks it set, survives a migration */

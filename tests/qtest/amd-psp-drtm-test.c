@@ -878,6 +878,48 @@ static void test_launch_signature(const void *data)
 }
 
 /*
+ * A SizeFWSigned naming the image alone, as AMD's EPYC SL gives it, still
+ * finds the signature and the token behind the header. One inside the
+ * header fits neither form and fails.
+ */
+static void test_launch_image_only_size(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t launch = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_LAUNCH, 0);
+    uint8_t slb[AMD_PSP_SLB_SIZE];
+    uint8_t pcr18[SHA256_LEN];
+    uint32_t words[1];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, PSP ",verify=off", &swtpm_pid, &addr);
+    build_slb(slb);
+    stl_le_p(slb + SIG_HDR_OFF + 0x14, SIG_HDR_OFF + 0x80);
+    qtest_memwrite(s, SLB_BASE, slb, sizeof(slb));
+    mbox_kick(s);
+    g_assert_cmphex(tmr_setup(s, 0, 0, 0x40), ==, AMD_PSP_DRTM_NO_ERROR);
+    skinit(s, SLB_MEASURED);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_LAUNCH_ERROR);
+
+    qtest_writel(s, SLB_BASE + SIG_HDR_OFF + 0x14, SIG_HDR_OFF);
+    skinit(s, SLB_MEASURED);
+    pcr_read(s, 18, pcr18);
+    g_assert_cmphex(mbox_command(s, launch), ==, AMD_PSP_DRTM_NO_ERROR);
+    extend(pcr18, slb + TOKEN_OFF, TOKEN_LEN);
+    words[0] = cpu_to_le32(SEC_PATCH_LEVEL);
+    extend(pcr18, words, sizeof(words));
+    assert_pcr(s, 18, pcr18);
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
+/*
  * After a launch: EXTEND_OSSL_DIGEST hashes a range inside a TMR into
  * PCR 17 and PCR 18, then the AMDSL marker after it, and refuses an empty,
  * wrapping or uncovered range. TPM_LOCALITY_ACCESS locks locality 2 and
@@ -1450,6 +1492,8 @@ int main(int argc, char **argv)
                         test_launch_fails);
     qtest_add_data_func("/amd-psp/drtm/launch-signature", tpm_path,
                         test_launch_signature);
+    qtest_add_data_func("/amd-psp/drtm/launch-image-only-size", tpm_path,
+                        test_launch_image_only_size);
     qtest_add_data_func("/amd-psp/drtm/after-launch", tpm_path,
                         test_after_launch);
     qtest_add_data_func("/amd-psp/drtm/tcg-logs", tpm_path, test_tcg_logs);

@@ -1090,7 +1090,12 @@ static uint64_t amd_psp_read(void *opaque, hwaddr addr, unsigned size)
     if (addr < AMD_PSP_C2PMSG_BASE || offset >= sizeof(s->c2pmsg)) {
         return 0;
     }
-    return s->c2pmsg[offset / sizeof(s->c2pmsg[0])];
+    /*
+     * The memory core passes a narrower access at its own address, so a
+     * byte of a register is shifted down here. AMD's SL polls byte 3 of
+     * C2PMSG_72 for the ready bit.
+     */
+    return s->c2pmsg[offset / sizeof(s->c2pmsg[0])] >> ((offset & 3) * 8);
 }
 
 /*

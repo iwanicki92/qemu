@@ -46,7 +46,7 @@
 /*
  * The key token: the sizes in bits, then the exponent and the modulus,
  * each little-endian in a 512-byte field. The signature is RSA-PSS over
- * the first SizeFWSigned bytes with SHA-384, MGF1 and a salt as long as
+ * the image and its header with SHA-384, MGF1 and a salt as long as
  * the hash (RFC 8017), little-endian too.
  */
 #define KEY_HDR_EXP_BITS            56
@@ -597,6 +597,13 @@ static uint16_t amd_psp_cmd_launch(AmdPspState *s)
                                      "0x%x", hdr_off + SIG_HDR_TAG);
     }
     signed_len = ldl_le_p(slb + hdr_off + SIG_HDR_SIZE_FW_SIGNED);
+    /*
+     * AMD's EPYC SL from 1.10.4 on gives the image alone, where its
+     * signature still covers the header too, as every other SL's does.
+     */
+    if (signed_len == hdr_off) {
+        signed_len += SIG_HDR_LEN;
+    }
     if (signed_len < hdr_off + SIG_HDR_LEN ||
         signed_len > AMD_PSP_SLB_SIZE - SIG_LEN - TOKEN_LEN) {
         return amd_psp_launch_failed(s, "SizeFWSigned 0x%x does not fit the "

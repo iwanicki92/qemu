@@ -443,6 +443,10 @@ iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actu
 iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
 
+# amd_fch_pmio.c
+amd_fch_pmio_read(uint64_t offset, unsigned size, uint64_t value) "offset 0x%" PRIx64 " size %u value 0x%" PRIx64
+amd_fch_pmio_write(uint64_t offset, unsigned size, uint64_t value) "offset 0x%" PRIx64 " size %u value 0x%" PRIx64
+
 # isa_post_code.c
 isa_post_code_write(uint64_t port, unsigned size, uint64_t value) "port 0x%" PRIx64 " size %u value 0x%" PRIx64
 

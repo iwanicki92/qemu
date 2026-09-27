@@ -1250,6 +1250,60 @@ static void test_no_ivrs(const void *data)
     tpm_stop(s, swtpm_pid, addr);
 }
 
+/*
+ * client-smm=on answers the two SMM commands after a launch: descriptors
+ * of two hashes, then a policy header, in a region the guest cannot write.
+ */
+static void test_client_smm(const void *data)
+{
+    const char *tpm_path = data;
+    const uint32_t process = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_PROCESS_SMM, 0);
+    const uint32_t policy = AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_GET_SMM_POLICY,
+                                             0);
+    const uint64_t hash = AMD_PSP_SMM_BASE + AMD_PSP_SMM_HASH;
+    const uint64_t policy_base = AMD_PSP_SMM_BASE + AMD_PSP_SMM_POLICY;
+    uint8_t slb[AMD_PSP_SLB_SIZE];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = tpm_start(tpm_path, PSP ",verify=off,client-smm=on", &swtpm_pid,
+                  &addr);
+    mbox_kick(s);
+    g_assert_cmphex(mbox_command(s, process), ==, AMD_PSP_DRTM_NOT_SUPPORTED);
+    g_assert_cmphex(mbox_command(s, policy), ==, AMD_PSP_DRTM_NOT_SUPPORTED);
+    launch_ok(s, slb);
+
+    g_assert_cmphex(mbox_command(s, process), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, AMD_PSP_SMM_OUTPUT_LEN);
+    g_assert_cmphex(region_base(s), ==, AMD_PSP_SMM_BASE);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SMM_BASE), ==, hash);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SMM_BASE + 4), ==, 0);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SMM_BASE + 8), ==,
+                    AMD_PSP_SMM_HASH_LEN);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SMM_BASE + 12), ==,
+                    hash + AMD_PSP_SMM_HASH_LEN);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SMM_BASE + 16), ==, 0);
+    g_assert_cmphex(qtest_readl(s, AMD_PSP_SMM_BASE + 20), ==,
+                    AMD_PSP_SMM_HASH_LEN);
+
+    g_assert_cmphex(mbox_command(s, policy), ==, AMD_PSP_DRTM_NO_ERROR);
+    g_assert_cmphex(qtest_readl(s, MBOX_ARG0), ==, AMD_PSP_SMM_POLICY_LEN);
+    g_assert_cmphex(region_base(s), ==, policy_base);
+    g_assert_cmphex(qtest_readl(s, policy_base + 4), ==,
+                    AMD_PSP_SMM_POLICY_LEN);
+    qtest_writel(s, policy_base + 4, 0xdeadbeef);
+    g_assert_cmphex(qtest_readl(s, policy_base + 4), ==,
+                    AMD_PSP_SMM_POLICY_LEN);
+
+    tpm_stop(s, swtpm_pid, addr);
+}
+
 /* min-spl fails a launch whose SecPatchLevel is below it, and only then */
 static void test_min_spl(const void *data)
 {
@@ -1402,6 +1456,8 @@ int main(int argc, char **argv)
     qtest_add_data_func("/amd-psp/drtm/post-launch-regions", tpm_path,
                         test_post_launch_regions);
     qtest_add_data_func("/amd-psp/drtm/no-ivrs", tpm_path, test_no_ivrs);
+    qtest_add_data_func("/amd-psp/drtm/client-smm", tpm_path,
+                        test_client_smm);
     qtest_add_data_func("/amd-psp/drtm/min-spl", tpm_path, test_min_spl);
     qtest_add_data_func("/amd-psp/drtm/locks-off", tpm_path, test_locks_off);
 

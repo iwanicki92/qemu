@@ -68,6 +68,8 @@ enum {
     AMD_PSP_DRTM_CMD_TMR_SETUP = 0x2,
     AMD_PSP_DRTM_CMD_TMR_RELEASE = 0x3,
     AMD_PSP_DRTM_CMD_LAUNCH = 0x4,
+    AMD_PSP_DRTM_CMD_PROCESS_SMM = 0x5,
+    AMD_PSP_DRTM_CMD_GET_SMM_POLICY = 0x6,
     AMD_PSP_DRTM_CMD_GET_TCG_LOGS = 0x7,
     AMD_PSP_DRTM_CMD_TPM_LOCALITY_ACCESS = 0x8,
     AMD_PSP_DRTM_CMD_GET_TMR_DESCRIPTORS = 0x9,
@@ -120,6 +122,18 @@ enum {
 #define AMD_PSP_TMR_DESC_LEN        12
 #define AMD_PSP_SHARED_BASE         0xfedc0000ULL
 #define AMD_PSP_SHARED_SIZE         0x10000
+
+/*
+ * With client-smm=on, what PROCESS_SMM and GET_SMM_POLICY answer: the two
+ * hashes' descriptors, the hashes, then an empty policy.
+ */
+#define AMD_PSP_SMM_BASE            0xfedb3000ULL
+#define AMD_PSP_SMM_SIZE            0x1000
+#define AMD_PSP_SMM_OUTPUT_LEN      0x18
+#define AMD_PSP_SMM_HASH            0x100
+#define AMD_PSP_SMM_HASH_LEN        32
+#define AMD_PSP_SMM_POLICY          0x200
+#define AMD_PSP_SMM_POLICY_LEN      0x20
 
 /* The MLE EXTEND_OSSL_DIGEST takes: this aligned, at most this long */
 #define AMD_PSP_MLE_ALIGN           0x4000000ULL
@@ -177,6 +191,7 @@ struct AmdPspState {
     uint8_t delayed_command;
     bool locality_locks;
     uint32_t min_spl;
+    bool client_smm;
 
     MemoryRegion mmio;
     MemoryRegion window;
@@ -199,6 +214,7 @@ struct AmdPspState {
     MemoryRegion tmr_desc;
     uint64_t shared_base;
     MemoryRegion shared;
+    MemoryRegion smm;
     /* The IVRS the machine's ACPI carries, NULL when it has none */
     GByteArray *ivrs;
     bool kicked;

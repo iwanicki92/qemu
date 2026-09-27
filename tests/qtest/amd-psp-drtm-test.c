@@ -134,6 +134,10 @@ static void test_service_off(void)
     QDict *info;
 
     g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, AMD_PSP_DRTM_READY);
+    /* A byte of a register is that byte, as AMD's SL polls the ready bit */
+    g_assert_cmphex(qtest_readb(s, MBOX_CMD + 3), ==, AMD_PSP_DRTM_READY >> 24);
+    g_assert_cmphex(qtest_readb(s, MBOX_CMD), ==, 0);
+    g_assert_cmphex(qtest_readw(s, MBOX_CMD + 2), ==, AMD_PSP_DRTM_READY >> 16);
     qtest_writel(s, MBOX_CMD, AMD_PSP_DRTM_CMD(AMD_PSP_DRTM_CMD_GET_CAPABILITY,
                                                0));
     g_assert_cmphex(qtest_readl(s, MBOX_CMD), ==, AMD_PSP_DRTM_READY);

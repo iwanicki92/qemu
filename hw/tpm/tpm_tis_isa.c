@@ -121,6 +121,9 @@ static const Property tpm_tis_isa_properties[] = {
     DEFINE_PROP_TPMBE("tpmdev", TPMStateISA, state.be_driver),
     /* Lets software drive the locality 4 hash, which no hardware allows */
     DEFINE_PROP_BOOL("locality4", TPMStateISA, state.locality4, false),
+    /* Drops the locality 4 hash while locality 0 is active */
+    DEFINE_PROP_BOOL("locality0-drops-hash", TPMStateISA,
+                     state.locality0_drops_hash, false),
     /* Makes a driver wait for the FIFO between bursts, 0 for no limit */
     DEFINE_PROP_UINT16("burst-limit", TPMStateISA, state.burst_limit, 0),
 };

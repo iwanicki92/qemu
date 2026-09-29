@@ -1,7 +1,8 @@
 /*
  * QTest testcase for the locality 4 hash an AMD dynamic launch sends to
- * swtpm through the TPM TIS frontend, and for the FIFO burst limit a
- * launch's TPM driver is tested against
+ * swtpm through the TPM TIS frontend, the same hash dropped while locality
+ * 0 is active, and the FIFO burst limit a launch's TPM driver is tested
+ * against
  *
  * Copyright (c) 2026 iwanicki92 <iwanicki92@gmail.com>
  *
@@ -250,6 +251,77 @@ static void tpm_drtm_locality4_test(const void *data)
     drtm_qtest_stop(s, swtpm_pid, addr);
 }
 
+/*
+ * With locality0-drops-hash=on, a hash sent while locality 0 is active,
+ * by SKINIT or through the registers, leaves PCR 17 as it was. Once
+ * locality 0 is relinquished the same launch measures.
+ */
+static void tpm_drtm_locality0_drops_test(const void *data)
+{
+    const char *tpm_path = data;
+    unsigned char image[IMAGE_LENGTH];
+    unsigned char expected[SHA256_LEN];
+    unsigned char digest[SHA256_LEN];
+    unsigned char before[SHA256_LEN];
+    SocketAddress *addr = NULL;
+    GPid swtpm_pid;
+    QTestState *s;
+    QDict *rsp;
+
+    if (!tpm_util_swtpm_has_tpm2()) {
+        g_test_skip("swtpm not in PATH or missing --tpm2 support");
+        return;
+    }
+
+    s = drtm_qtest_start(tpm_path, "-device tpm-tis,tpmdev=tpm0,locality4=on,"
+                         "locality0-drops-hash=on "
+                         "-device amd-drtm-platform", tpm_tis_transfer,
+                         &swtpm_pid, &addr);
+
+    fill_image(image, sizeof(image));
+    qtest_memwrite(s, IMAGE_BASE, image, sizeof(image));
+    expected_pcr17(image, sizeof(image), expected);
+    pcr17_read(s, before);
+
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_REQUEST_USE);
+    g_assert_cmphex(qtest_readb(s, TIS_REG(0, TPM_TIS_REG_ACCESS)) &
+                    TPM_TIS_ACCESS_ACTIVE_LOCALITY, ==,
+                    TPM_TIS_ACCESS_ACTIVE_LOCALITY);
+
+    qtest_qmp_assert_success(s,
+        "{ 'execute': 'x-amd-drtm-launch', "
+        "'arguments': { 'base': %" PRIu64 ", 'length': %d } }",
+        (uint64_t)IMAGE_BASE, IMAGE_LENGTH);
+    rsp = qtest_qmp_assert_success_ref(s, "{ 'execute': 'query-amd-drtm' }");
+    g_assert_cmpstr(qdict_get_str(rsp, "hash"), ==, "dropped");
+    qobject_unref(rsp);
+
+    hash_through_registers(s, image, sizeof(image));
+
+    /* Neither sequence reached the TPM, so it has seen no launch */
+    g_assert_cmphex(qtest_readb(s, TIS_REG(0, TPM_TIS_REG_ACCESS)) &
+                    TPM_TIS_ACCESS_TPM_ESTABLISHMENT, ==,
+                    TPM_TIS_ACCESS_TPM_ESTABLISHMENT);
+    qtest_writeb(s, TIS_REG(0, TPM_TIS_REG_ACCESS),
+                 TPM_TIS_ACCESS_ACTIVE_LOCALITY);
+    pcr17_read(s, digest);
+    g_assert_cmpmem(digest, sizeof(digest), before, sizeof(before));
+
+    /* pcr17_read relinquished locality 0 when it finished */
+    qtest_qmp_assert_success(s,
+        "{ 'execute': 'x-amd-drtm-launch', "
+        "'arguments': { 'base': %" PRIu64 ", 'length': %d } }",
+        (uint64_t)IMAGE_BASE, IMAGE_LENGTH);
+    rsp = qtest_qmp_assert_success_ref(s, "{ 'execute': 'query-amd-drtm' }");
+    g_assert_cmpstr(qdict_get_str(rsp, "hash"), ==, "ok");
+    qobject_unref(rsp);
+    pcr17_read(s, digest);
+    g_assert_cmpmem(digest, sizeof(digest), expected, sizeof(expected));
+
+    drtm_qtest_stop(s, swtpm_pid, addr);
+}
+
 #define BURST_LIMIT 8
 
 /* What burst_transfer saw of the burst counts */
@@ -397,6 +469,8 @@ int main(int argc, char **argv)
                         tpm_drtm_swtpm_test);
     qtest_add_data_func("/tpm/drtm-swtpm/locality4", tpm_path,
                         tpm_drtm_locality4_test);
+    qtest_add_data_func("/tpm/drtm-swtpm/locality0-drops-hash", tpm_path,
+                        tpm_drtm_locality0_drops_test);
     qtest_add_data_func("/tpm/drtm-swtpm/burst-limit", tpm_path,
                         tpm_burst_limit_test);
     ret = g_test_run();

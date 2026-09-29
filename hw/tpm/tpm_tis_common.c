@@ -507,6 +507,16 @@ uint16_t tpm_tis_get_checksum(TPMState *s)
     return bswap16(crc_ccitt(0, s->buffer, s->rw_offset));
 }
 
+/* With locality0-drops-hash, a hash sequence starting now is lost */
+static bool tpm_tis_hash_dropped(TPMState *s)
+{
+    if (s->locality0_drops_hash && s->active_locty == 0) {
+        trace_tpm_tis_hash_dropped(s->active_locty);
+        return true;
+    }
+    return false;
+}
+
 static void tpm_tis_hash_flush(TPMState *s)
 {
     if (s->hash_len) {
@@ -528,6 +538,10 @@ static void tpm_tis_hash_write(TPMState *s, uint16_t off, uint64_t val,
 
     switch (off) {
     case TPM_TIS_REG_HASH_START:
+        if (tpm_tis_hash_dropped(s)) {
+            s->hash_active = false;
+            break;
+        }
         ret = tpm_backend_hash_start(s->be_driver);
         trace_tpm_tis_hash_start(ret);
         s->hash_active = ret == 0;
@@ -915,10 +929,16 @@ enum TPMVersion tpm_tis_get_tpm_version(TPMState *s)
  * The locality 4 hash a processor sends at a dynamic launch. It reaches the
  * backend directly: the interface registers only observe its outcome, so
  * the active locality, the status bits and the FIFO stay as they are.
+ * Returns -EBUSY when locality0-drops-hash drops it.
  */
 int tpm_tis_hash_image(TPMState *s, const uint8_t *data, size_t len)
 {
-    int ret = tpm_backend_hash_image(s->be_driver, data, len);
+    int ret;
+
+    if (tpm_tis_hash_dropped(s)) {
+        return -EBUSY;
+    }
+    ret = tpm_backend_hash_image(s->be_driver, data, len);
 
     trace_tpm_tis_hash_image(len, ret);
 

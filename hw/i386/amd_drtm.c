@@ -102,6 +102,11 @@ static void amd_drtm_hash(AmdDrtmPlatform *p)
                              "(tpm-tis on a swtpm with hashing is needed), "
                              "PCR 17 stays unmeasured");
         p->hash = AMD_DRTM_HASH_RESULT_UNSUPPORTED;
+    } else if (ret == -EBUSY) {
+        amd_drtm_guest_error(p, "amd-drtm: SKINIT with TPM locality 0 "
+                             "active, the TPM dropped the measurement and "
+                             "PCR 17 stays unmeasured");
+        p->hash = AMD_DRTM_HASH_RESULT_DROPPED;
     } else {
         warn_report("amd-drtm: TPM hash of the SLB failed: %s",
                     strerror(-ret));

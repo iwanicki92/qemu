@@ -83,6 +83,11 @@ typedef struct TPMState {
      * processor's own hash. A sequence in flight does not migrate.
      */
     bool locality4;
+    /*
+     * Drop the locality 4 hash, the processor's or software's, while
+     * locality 0 is active, as a discrete TPM seen on hardware does.
+     */
+    bool locality0_drops_hash;
     bool hash_active;
     uint16_t hash_len;
     uint8_t hash_buf[TPM_BACKEND_HASH_CHUNK];

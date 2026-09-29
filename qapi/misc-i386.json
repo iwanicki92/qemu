@@ -486,10 +486,14 @@
 #
 # @failed: the block could not be read or the TPM refused the hash
 #
+# @dropped: the TPM dropped the hash because locality 0 was active
+#     (tpm-tis locality0-drops-hash=on), so PCRs 17 to 22 kept their
+#     values
+#
 # Since: 11.2
 ##
 { 'enum': 'AmdDrtmHashResult',
-  'data': [ 'none', 'ok', 'unsupported', 'failed' ] }
+  'data': [ 'none', 'ok', 'unsupported', 'failed', 'dropped' ] }
 
 ##
 # @AmdDrtmDmaBlock:

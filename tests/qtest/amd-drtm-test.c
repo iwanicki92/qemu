@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "libqtest.h"
 #include "libqos/pci.h"
 #include "libqos/pci-pc.h"
@@ -16,6 +17,10 @@
 #include "hw/pci-host/q35.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
+#include "qemu/module.h"
+#include "qapi/qapi-types-sockets.h"
+#include "backends/tpm/tpm_ioctl.h"
+#include "tpm-emu.h"
 
 #define SLB_BASE    0x200000
 #define SLB_LENGTH  0x1234
@@ -401,8 +406,57 @@ static void test_machine(void)
     qtest_quit(s);
 }
 
+/*
+ * A swtpm without PTM_CAP_HASHING has no locality 4 path, so the launch
+ * is unsupported rather than failed.
+ */
+static void test_tpm_without_hashing(void)
+{
+    g_autofree char *dir = g_dir_make_tmp("amd-drtm-test.XXXXXX", NULL);
+    TPMTestState test = { 0 };
+    GThread *thread;
+    QTestState *s;
+    QDict *info;
+
+    if (!tpm_model_is_available("-machine q35", "tpm-tis")) {
+        g_test_skip("tpm-tis not available");
+        g_rmdir(dir);
+        return;
+    }
+
+    test.addr = g_new0(SocketAddress, 1);
+    test.addr->type = SOCKET_ADDRESS_TYPE_UNIX;
+    test.addr->u.q_unix.path = g_build_filename(dir, "sock", NULL);
+    g_mutex_init(&test.data_mutex);
+    g_cond_init(&test.data_cond);
+    test.tpm_version = TPM_VERSION_2_0;
+    tpm_emu_caps &= ~PTM_CAP_HASHING;
+
+    thread = g_thread_new(NULL, tpm_emu_ctrl_thread, &test);
+    tpm_emu_test_wait_cond(&test);
+
+    s = qtest_initf("-M q35 -device amd-drtm-platform "
+                    "-chardev socket,id=chr,path=%s "
+                    "-tpmdev emulator,id=dev,chardev=chr "
+                    "-device tpm-tis,tpmdev=dev",
+                    test.addr->u.q_unix.path);
+    qtest_qmp_assert_success(s, "{ 'execute': 'x-amd-drtm-launch', "
+                             "'arguments': { 'base': %d, 'length': %d } }",
+                             SLB_BASE, SLB_LENGTH);
+    info = query_amd_drtm(s);
+    g_assert_cmpstr(qdict_get_str(info, "hash"), ==, "unsupported");
+    qobject_unref(info);
+    qtest_quit(s);
+
+    g_thread_join(thread);
+    g_unlink(test.addr->u.q_unix.path);
+    qapi_free_SocketAddress(test.addr);
+    g_rmdir(dir);
+}
+
 int main(int argc, char **argv)
 {
+    module_call_init(MODULE_INIT_QOM);
     g_test_init(&argc, &argv, NULL);
 
     if (!qtest_has_machine("q35")) {
@@ -414,6 +468,8 @@ int main(int argc, char **argv)
     qtest_add_func("/q35/amd-drtm/sl-dev", test_sl_dev);
     qtest_add_func("/q35/amd-drtm/tmr-fetch", test_tmr_fetch);
     qtest_add_func("/q35/amd-drtm/strict", test_strict);
+    qtest_add_func("/q35/amd-drtm/tpm-without-hashing",
+                   test_tpm_without_hashing);
     qtest_add_func("/q35/amd-drtm/second-instance-rejected",
                    test_second_instance_rejected);
     qtest_add_func("/q35/amd-drtm/machine", test_machine);

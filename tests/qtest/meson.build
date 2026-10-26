@@ -438,6 +438,7 @@ qtests = {
   'qos-test': [chardev, io, qos_test_ss.apply({}).sources()],
   'tpm-crb-swtpm-test': [io, tpmemu_files],
   'tpm-crb-test': [io, tpmemu_files],
+  'amd-drtm-test': [io, 'tpm-emu.c'],
   'amd-psp-drtm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'tpm-drtm-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'tpm-tis-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],

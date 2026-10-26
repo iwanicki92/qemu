@@ -18,23 +18,34 @@ qemu_def_args = ['-display', 'none',
                  '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x4',
                  '-kernel']
 
-# Multi arch tests
-multi_src = []
-foreach t: tcg_tests['multiarch-softmmu']['tests']
-  foreach src, setup: t
-    new_cflags = cflags
-    if fs.stem(src) == 'memory'
-      new_cflags += '-DCHECK_UNALIGNED=1'
-    endif
-    if src not in multi_src
-      setup += {'cflags': [new_cflags]}
-      multi_src += src
-    endif
-    tests += {src: setup + {'qemu_args': qemu_def_args}}
-  endforeach
-endforeach
-
+# The images are 32-bit Multiboot kernels, which qemu-system-x86_64 loads
+# too, so they run on it when qemu-system-i386 is not built
 if 'qemu-system-i386' in emulators
+  i386_system_qemu = emulators['qemu-system-i386']
+elif 'qemu-system-x86_64' in emulators
+  i386_system_qemu = emulators['qemu-system-x86_64']
+endif
+
+# Multi arch tests, on the i386 binary only: they already run under
+# x86_64-softmmu, and their gdbstub tests expect an i386 target
+if 'qemu-system-i386' in emulators
+  multi_src = []
+  foreach t: tcg_tests['multiarch-softmmu']['tests']
+    foreach src, setup: t
+      new_cflags = cflags
+      if fs.stem(src) == 'memory'
+        new_cflags += '-DCHECK_UNALIGNED=1'
+      endif
+      if src not in multi_src
+        setup += {'cflags': [new_cflags]}
+        multi_src += src
+      endif
+      tests += {src: setup + {'qemu_args': qemu_def_args}}
+    endforeach
+  endforeach
+endif
+
+if is_variable('i386_system_qemu')
   # GETSEC/SMX test; smx is not part of any default CPU model.
   # -fno-pie/-Wl,-no-pie: the #UD gate is naked and must keep its
   # entry point on hosts with default-PIE compilers; -fno-stack-protector
@@ -162,7 +173,7 @@ if 'qemu-system-i386' in emulators
       'cc_docker_host_arch': cc_docker_host_arch,
       'folder': 'i386/system',
       'gdb_arch': 'i386',
-      'qemu': emulators['qemu-system-i386'],
+      'qemu': i386_system_qemu,
       'tests': tests,
     }
   }

@@ -539,7 +539,7 @@ static int tpm_emulator_hash_start(TPMBackend *tb, uint8_t locty,
     if (!TPM_EMULATOR_IMPLEMENTS_ALL_CAPS(tpm_emu, PTM_CAP_HASHING)) {
         error_setg(errp, "tpm-emulator: TPM does not support hashing "
                    "(PTM_CAP_HASHING)");
-        return -1;
+        return -ENOTSUP;
     }
 
     if (tpm_emulator_set_locality(tpm_emu, locty, errp) < 0) {
@@ -558,6 +558,9 @@ static int tpm_emulator_hash_start(TPMBackend *tb, uint8_t locty,
                    "0x%x %s", res, tpm_emulator_strerror(res));
         return -1;
     }
+
+    /* the sequence sets the TPM Established flag, so the cache is stale */
+    tpm_emu->established_flag_cached = 0;
 
     trace_tpm_emulator_hash_start(locty);
 

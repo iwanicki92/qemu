@@ -103,6 +103,7 @@ struct TPMBackendClass {
      * makes the whole sequence a silent no-op on at least swtpm: the
      * commands still succeed but no PCR changes, so callers must not
      * treat a zero return as proof that a measurement landed.
+     * hash_start returns -ENOTSUP when the TPM has no hash sequence.
      */
     int (*hash_start)(TPMBackend *t, uint8_t locty, Error **errp);
     int (*hash_data)(TPMBackend *t, const uint8_t *data, size_t len,
@@ -289,6 +290,21 @@ int tpm_backend_hash_sequence(TPMBackend *s, const uint8_t *data, size_t len,
  * command interface.
  */
 bool tpm_backend_has_hash_sequence(TPMBackend *s);
+
+/**
+ * tpm_backend_hash_image:
+ * @s: the backend
+ * @data: the image to measure
+ * @len: its length in bytes
+ *
+ * Run the locality 4 hash sequence over @data: PCRs 17 to 22 reset,
+ * PCR 17 extended with the image digest in every active bank. No guest
+ * command may be in flight.
+ *
+ * Returns 0 on success, -ENOTSUP if the backend has no locality 4 path,
+ * -EBUSY with a command in flight, or another negative errno.
+ */
+int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len);
 
 TPMBackend *qemu_find_tpm_be(const char *id);
 TPMBackend *qemu_find_tpm_be_any(void);

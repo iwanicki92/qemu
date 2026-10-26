@@ -5350,8 +5350,10 @@ static void vtd_init(IntelIOMMUState *s)
     s->root_scalable = false;
     s->dmar_enabled = false;
     s->pmr_enabled = false;
-    s->txt_dpr_enabled = false;
-    s->txt_dpr_base = s->txt_dpr_top = 0;
+    /*
+     * The TXT DPR stays: the TXT device's reset clears it in hold and
+     * txt-firmware=on sets it in exit, whichever device resets first.
+     */
     s->intr_enabled = false;
     s->iq_head = 0;
     s->iq_tail = 0;

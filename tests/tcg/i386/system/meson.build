@@ -94,6 +94,25 @@ if is_variable('i386_system_qemu')
     },
   }
 
+  # The platform txt-firmware=on leaves for the kernel SeaBIOS boots.
+  # txt-vmx-compat=on gives the CPU VMX, so QEMU would otherwise hand
+  # SeaBIOS a feature control value to write over the locked MSR.
+  tests += {
+    'test-txt-firmware.c': {
+      'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                          '-fno-stack-protector'],
+      'qemu_args': ['-machine',
+                    'q35,txt=on,txt-firmware=on,txt-vmx-compat=on',
+                    '-cpu', 'qemu32,smx', '-m', '512M',
+                    '-device', 'intel-iommu',
+                    '-chardev',
+                    'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                    '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                    '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+      'wrapper': [run_swtpm_test],
+    },
+  }
+
   # Compile from the same source with a different define. A wrapper .c
   # that #includes the test is not reliably rebuilt by the TCG cross
   # compiler's depfile when the included file changes.

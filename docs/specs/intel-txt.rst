@@ -71,6 +71,32 @@ Notes:
   TCG **does not execute VMX instructions**. The option rejects
   ``txt=off``, more than one possible vCPU, or a CPU without SMX; it
   is unsafe for general guest use. Default: off.
+- ``-machine q35,txt=on,txt-firmware=on`` leaves the platform as TXT
+  firmware would, at power-on and after every reset, so firmware with
+  no TXT support (SeaBIOS, OVMF without SMM, coreboot without its TXT
+  code) boots a TXT launch unchanged:
+
+  - ``IA32_FEATURE_CONTROL`` on every vCPU is ``0xff03``: locked,
+    VMX inside SMX, every SENTER function enabled, plus the bits QEMU
+    otherwise hands the firmware in ``etc/msr_feature_control``, which
+    it then leaves out.
+  - A 4 MiB DPR, locked, below TSEG with 32 MiB of RAM between them
+    for the firmware's own use (coreboot puts CBMEM there). The e820
+    table lists it as reserved between two RAM entries.
+  - The SINIT slot at DPR + 2 MiB (256 KiB) and the heap at
+    DPR + 3 MiB (1 MiB), in ``TXT.SINIT.BASE``/``SIZE`` and
+    ``TXT.HEAP_BASE``/``SIZE``.
+  - A version 6 ``bios_data_t`` with ``bios_sinit_size`` set and an
+    END element, so a loader uses the ACM in the slot.
+  - In the slot, a 32 KiB SINIT ACM QEMU makes: a header, a version 3
+    info table (OS-to-SINIT data version 7, both RLP wake methods,
+    TPM 2.0 event log format) and a chipset id list matching
+    ``TXT.DIDVID``. It holds no code and no signature.
+
+  Needs ``-device intel-iommu`` to lock the DPR, and at least 356 MiB
+  of RAM below 4 GiB with the default 64 MiB TSEG. OVMF built with SMM
+  takes the RAM below the DPR as all of low memory and misplaces TSEG.
+  Default: off.
 
 TXT public config register map
 ===============================

@@ -19,6 +19,8 @@
 #include "qemu/osdep.h"
 
 #include "e820_memory_layout.h"
+#include "fw_cfg.h"
+#include "hw/core/boards.h"
 #include "hw/i386/intel_iommu.h"
 #include "hw/i386/intel_txt.h"
 #include "hw/core/cpu.h"
@@ -28,6 +30,7 @@
 #include "migration/vmstate.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "qemu/units.h"
 #include "qom/object.h"
 #include "system/runstate.h"
 #include "system/tpm_util.h"
@@ -91,6 +94,9 @@ struct IntelTxtState {
 
     /* TXT.DIDVID, configurable for experimentation (see spec) */
     uint64_t didvid;
+
+    /* The DPR txt-firmware=on sets up on every reset, 0 without it */
+    uint64_t fw_dpr_base;
 
 #ifdef CONFIG_TPM
     /*
@@ -3027,7 +3033,158 @@ bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp)
     return true;
 }
 
+/*
+ * The SINIT ACM txt-firmware=on places: a header, info table, chipset
+ * id list and GDT that pass intel_txt_validate_acm() and the loaders'
+ * checks (GRUB's and tboot's acmod.c), and no code, as SENTER never
+ * runs it.  Unsigned, like every ACM this model accepts.
+ */
+#define FW_ACM_SIZE                 0x8000
+#define FW_ACM_HEADER_LEN           161     /* dwords, RSA-2048 header */
+#define FW_ACM_SCRATCH_SIZE         143     /* dwords */
+#define FW_ACM_INFO_OFF             ((FW_ACM_HEADER_LEN + \
+                                      FW_ACM_SCRATCH_SIZE) * 4)
+#define FW_ACM_ID_LIST_OFF          (FW_ACM_INFO_OFF + ACM_INFO_MIN_SIZE)
+#define FW_ACM_GDT_OFF              (FW_ACM_ID_LIST_OFF + \
+                                     ACM_CHIPSET_ID_LIST_HDR_SIZE + \
+                                     ACM_CHIPSET_ID_SIZE)
+#define FW_ACM_ENTRY_POINT          0x1000
+
+#define ACM_HDR_OFF_DATE            0x14    /* u32, BCD */
+#define ACM_HDR_OFF_KEY_SIZE        0x78    /* u32, dwords */
+#define ACM_INFO_OFF_LENGTH         0x12    /* u16 */
+#define ACM_INFO_OFF_OS_SINIT_VER   0x18    /* u32 */
+#define ACM_INFO_OFF_MIN_MLE_VER    0x1c    /* u32 */
+#define ACM_INFO_OFF_CAPABILITIES   0x20    /* u32 */
+
+/*
+ * SINIT capabilities (txt_caps_t): both RLP wake methods, the TPM 1.2
+ * PCR usage bits a TPM 2.0 SINIT also sets, the MTRR physical address
+ * width and the TPM 2.0 event log format
+ */
+#define FW_ACM_CAPABILITIES         (TXT_CAPS_RLP_WAKE_GETSEC | \
+                                     TXT_CAPS_RLP_WAKE_MONITOR | \
+                                     BIT(4) | BIT(5) | BIT(8) | BIT(9))
+
+static void intel_txt_fw_build_acm(IntelTxtState *s, uint8_t *acm)
+{
+    uint8_t *info = acm + FW_ACM_INFO_OFF;
+    uint8_t *id = acm + FW_ACM_ID_LIST_OFF + ACM_CHIPSET_ID_LIST_HDR_SIZE;
+    uint8_t *gdt = acm + FW_ACM_GDT_OFF;
+
+    memset(acm, 0, FW_ACM_SIZE);
+    stw_le_p(acm + ACM_HDR_OFF_MODULE_TYPE, ACM_TYPE_CHIPSET);
+    stw_le_p(acm + ACM_HDR_OFF_MODULE_SUBTYPE, ACM_SUBTYPE_SINIT);
+    stl_le_p(acm + ACM_HDR_OFF_HEADER_LEN, FW_ACM_HEADER_LEN);
+    stl_le_p(acm + ACM_HDR_OFF_MODULE_VENDOR, ACM_VENDOR_INTEL);
+    stl_le_p(acm + ACM_HDR_OFF_DATE, 0x20260101);
+    stl_le_p(acm + ACM_HDR_OFF_SIZE, FW_ACM_SIZE / 4);
+    stl_le_p(acm + ACM_HDR_OFF_GDT_LIMIT, 3 * 8 - 1);
+    stl_le_p(acm + ACM_HDR_OFF_GDT_BASE, FW_ACM_GDT_OFF);
+    stl_le_p(acm + ACM_HDR_OFF_SEG_SEL, 0x08);
+    stl_le_p(acm + ACM_HDR_OFF_ENTRY_POINT, FW_ACM_ENTRY_POINT);
+    stl_le_p(acm + ACM_HDR_OFF_KEY_SIZE, 256 / 4);
+    stl_le_p(acm + ACM_HDR_OFF_SCRATCH_SIZE, FW_ACM_SCRATCH_SIZE);
+
+    /* Version 3: no processor id list for a loader to match */
+    memcpy(info + ACM_INFO_OFF_UUID, intel_txt_acm_uuid,
+           sizeof(intel_txt_acm_uuid));
+    info[ACM_INFO_OFF_CHIPSET_ACM_TYPE] = ACM_CHIPSET_TYPE_SINIT;
+    info[ACM_INFO_OFF_VERSION] = ACM_INFO_MIN_VERSION;
+    stw_le_p(info + ACM_INFO_OFF_LENGTH, ACM_INFO_MIN_SIZE);
+    stl_le_p(info + ACM_INFO_OFF_CHIPSET_ID_LIST, FW_ACM_ID_LIST_OFF);
+    stl_le_p(info + ACM_INFO_OFF_OS_SINIT_VER, 7);
+    stl_le_p(info + ACM_INFO_OFF_MIN_MLE_VER, 0x00020000);
+    stl_le_p(info + ACM_INFO_OFF_CAPABILITIES, FW_ACM_CAPABILITIES);
+
+    /* One entry, this chipset's TXT.DIDVID */
+    stl_le_p(acm + FW_ACM_ID_LIST_OFF + ACM_CHIPSET_ID_LIST_OFF_COUNT, 1);
+    stw_le_p(id + ACM_CHIPSET_ID_OFF_VENDOR, s->didvid & 0xffff);
+    stw_le_p(id + ACM_CHIPSET_ID_OFF_DEVICE, (s->didvid >> 16) & 0xffff);
+    stw_le_p(id + ACM_CHIPSET_ID_OFF_REVISION, (s->didvid >> 32) & 0xffff);
+
+    /* Null, flat 32-bit ring 0 code, flat writable data */
+    stq_le_p(gdt + 0x08, 0x00cf9b000000ffffULL);
+    stq_le_p(gdt + 0x10, 0x00cf93000000ffffULL);
+}
+
+/* BIOS data (txt_bios_data_t) version 6, the TPM 2.0 one */
+#define FW_BIOS_DATA_VERSION        6
+#define FW_BIOS_DATA_SIZE           0x24
+#define FW_HEAP_EXT_END_SIZE        8
+
+/*
+ * Leave the platform as TXT firmware leaves it before the first guest
+ * instruction: what a BIOS ACM and coreboot's TXT setup would do.  Runs
+ * in the reset exit phase, after the CPU reset has cleared
+ * IA32_FEATURE_CONTROL in hold.
+ */
+static void intel_txt_fw_setup(IntelTxtState *s)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    uint64_t sinit = s->fw_dpr_base + INTEL_TXT_FW_SINIT_OFFSET;
+    uint64_t heap = s->fw_dpr_base + INTEL_TXT_FW_HEAP_OFFSET;
+    uint64_t dpr_top = s->fw_dpr_base + INTEL_TXT_FW_DPR_SIZE;
+    g_autofree uint8_t *dpr = g_malloc0(INTEL_TXT_FW_DPR_SIZE);
+    uint8_t *bios = dpr + INTEL_TXT_FW_HEAP_OFFSET;
+    CPUState *cs;
+
+    intel_txt_fw_build_acm(s, dpr + INTEL_TXT_FW_SINIT_OFFSET);
+
+    /* The heap's first section, its u64 size counting itself */
+    stq_le_p(bios, 8 + FW_BIOS_DATA_SIZE + FW_HEAP_EXT_END_SIZE);
+    bios += 8;
+    stl_le_p(bios + 0x00, FW_BIOS_DATA_VERSION);
+    stl_le_p(bios + 0x04, FW_ACM_SIZE);         /* bios_sinit_size */
+    stl_le_p(bios + 0x18, ms->smp.cpus);        /* num_logical_procs */
+    /* An END element after the fixed part, as from version 4 */
+    stl_le_p(bios + FW_BIOS_DATA_SIZE + 4, FW_HEAP_EXT_END_SIZE);
+
+    address_space_write(&address_space_memory, s->fw_dpr_base,
+                        MEMTXATTRS_UNSPECIFIED, dpr, INTEL_TXT_FW_DPR_SIZE);
+
+    s->sinit_base = sinit;
+    s->sinit_size = INTEL_TXT_FW_SINIT_SIZE;
+    s->heap_base = heap;
+    s->heap_size = INTEL_TXT_FW_HEAP_SIZE;
+    intel_txt_reg_write64(s, TXT_DPR, (dpr_top & ~0xfffffULL) |
+                          (INTEL_TXT_FW_DPR_SIZE / MiB) << 4 | TXT_DPR_LOCK);
+    if (!(s->dpr & TXT_DPR_LOCK)) {
+        error_report("txt-firmware=on cannot lock the DPR, it needs "
+                     "-device intel-iommu");
+        exit(1);
+    }
+
+    /* Locked, so with the bits the firmware would otherwise set too */
+    CPU_FOREACH(cs) {
+        X86CPU *cpu = X86_CPU(cs);
+
+        cpu->env.msr_ia32_feature_control =
+            fw_cfg_feature_control_bits(cpu) |
+            FEATURE_CONTROL_LOCKED |
+            FEATURE_CONTROL_VMXON_ENABLED_INSIDE_SMX |
+            FEATURE_CONTROL_SENTER_LOCAL_ENABLE |
+            FEATURE_CONTROL_SENTER_GLOBAL_ENABLE;
+    }
+    trace_txt_firmware_setup(s->fw_dpr_base, sinit, heap);
+}
+
 #endif /* CONFIG_TPM */
+
+uint64_t intel_txt_fw_dpr_base(uint64_t below_4g, uint64_t tseg,
+                               Error **errp)
+{
+    uint64_t below = tseg + INTEL_TXT_FW_GAP + INTEL_TXT_FW_DPR_SIZE;
+
+    /* Leave the firmware and the OS at least 256 MiB of RAM below it */
+    if (below_4g < below + 256 * MiB) {
+        error_setg(errp, "txt-firmware=on needs at least %" PRIu64
+                   " MiB of RAM below 4 GiB", (below + 256 * MiB) / MiB);
+        return 0;
+    }
+    /* DPR is in 1 MiB units */
+    return (below_4g - below) & ~(MiB - 1);
+}
 
 static const MemoryRegionOps intel_txt_private_ops = {
     .read = intel_txt_private_read,
@@ -3082,6 +3239,17 @@ static void intel_txt_reset_hold(Object *obj, ResetType type)
     s->e2sts = 0;
     s->smi_inhibit = false;
     s->rlp_wake_monitor = false;
+}
+
+static void intel_txt_reset_exit(Object *obj, ResetType type)
+{
+#ifdef CONFIG_TPM
+    IntelTxtState *s = INTEL_TXT(obj);
+
+    if (s->fw_dpr_base) {
+        intel_txt_fw_setup(s);
+    }
+#endif
 }
 
 static void intel_txt_realize(DeviceState *dev, Error **errp)
@@ -3139,6 +3307,8 @@ static void intel_txt_realize(DeviceState *dev, Error **errp)
 static const Property intel_txt_properties[] = {
     DEFINE_PROP_UINT64("didvid", IntelTxtState, didvid,
                       INTEL_TXT_DIDVID_DEFAULT),
+    /* Set by the machine for txt-firmware=on */
+    DEFINE_PROP_UINT64("firmware-dpr-base", IntelTxtState, fw_dpr_base, 0),
 };
 
 #ifdef CONFIG_TPM
@@ -3205,6 +3375,7 @@ static void intel_txt_class_init(ObjectClass *oc, const void *data)
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 
     rc->phases.hold = intel_txt_reset_hold;
+    rc->phases.exit = intel_txt_reset_exit;
 }
 
 static const TypeInfo intel_txt_info = {

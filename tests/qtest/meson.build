@@ -96,6 +96,8 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['tpm-tis-test'] : []) +              \
   (config_all_devices.has_key('CONFIG_Q35') and                                        \
    config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['txt-test'] : []) +               \
+  (config_all_devices.has_key('CONFIG_Q35') and                                        \
+   config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['txt-firmware-test'] : []) +      \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['tpm-tis-swtpm-test'] : []) +        \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') and                                     \
    config_all_devices.has_key('CONFIG_AMD_DRTM') ? ['tpm-drtm-swtpm-test'] : []) +          \
@@ -444,6 +446,7 @@ qtests = {
   'tpm-tis-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'tpm-tis-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'txt-test': [io, tpmemu_files],
+  'txt-firmware-test': [io, tpmemu_files],
   'tpm-tis-i2c-test': [io, tpmemu_files, 'tpm-tis-i2c-util.c', 'qtest_aspeed.c'],
   'tpm-tis-i2c-swtpm-test': [io, tpmemu_files, 'tpm-tis-i2c-util.c', 'qtest_aspeed.c'],
   'tpm-tis-device-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],

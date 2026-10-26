@@ -216,6 +216,10 @@ static void pc_q35_init(MachineState *machine)
                      "one possible vCPU");
         exit(1);
     }
+    if (pcms->txt_firmware && !pcms->txt_enabled) {
+        error_report("txt-firmware=on requires txt=on");
+        exit(1);
+    }
 
     /* Check whether RAM fits below 4G (leaving 1/2 GByte for IO memory
      * and 256 Mbytes for PCI Express Enhanced Configuration Access Mapping
@@ -272,6 +276,17 @@ static void pc_q35_init(MachineState *machine)
     pci_hole64_size = object_property_get_uint(phb,
                                                PCI_HOST_PROP_PCI_HOLE64_SIZE,
                                                &error_abort);
+
+    if (pcms->txt_firmware) {
+        Object *mch = object_resolve_path_component(phb, "mch");
+        uint64_t tseg = object_property_get_uint(mch, "extended-tseg-mbytes",
+                                                 &error_abort) * MiB;
+
+        /* Firmware picks the TSEG size, 8 MiB is the largest fixed one */
+        pcms->txt_dpr_base = intel_txt_fw_dpr_base(x86ms->below_4g_mem_size,
+                                                   MAX(tseg, 8 * MiB),
+                                                   &error_fatal);
+    }
 
     /* allocate ram and load rom/bios */
     memory_region_init(pci_memory, NULL, "pci", UINT64_MAX);
@@ -429,6 +444,8 @@ static void pc_q35_init(MachineState *machine)
             DeviceState *txt = qdev_new(TYPE_INTEL_TXT);
             CPUState *cs;
 
+            qdev_prop_set_uint64(txt, "firmware-dpr-base",
+                                 pcms->txt_dpr_base);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(txt), &error_fatal);
 
             /* The Q35 ISA DMA controller bypasses the PCI VT-d path. */
@@ -509,6 +526,17 @@ static void pc_q35_machine_set_txt_vmx_compat(Object *o, bool value,
     PC_MACHINE(o)->txt_vmx_compat = value;
 }
 
+static bool pc_q35_machine_get_txt_firmware(Object *o, Error **errp)
+{
+    return PC_MACHINE(o)->txt_firmware;
+}
+
+static void pc_q35_machine_set_txt_firmware(Object *o, bool value,
+                                             Error **errp)
+{
+    PC_MACHINE(o)->txt_firmware = value;
+}
+
 static bool pc_q35_machine_get_wdat(Object *o, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(o);
@@ -580,6 +608,14 @@ static void pc_q35_machine_options(MachineClass *m)
     object_class_property_set_description(oc, "txt-vmx-compat",
         "Advertise VMX for single-vCPU TXT integration only; VMX "
         "instructions are not implemented by TCG. Default: off");
+    object_class_property_add_bool(oc, "txt-firmware",
+        pc_q35_machine_get_txt_firmware,
+        pc_q35_machine_set_txt_firmware);
+    object_class_property_set_description(oc, "txt-firmware",
+        "Set the platform up as TXT firmware would on every reset: lock "
+        "IA32_FEATURE_CONTROL with SENTER enabled, reserve and lock a "
+        "DPR, fill the TXT heap's BIOS data and place a SINIT ACM, which "
+        "QEMU makes and does not sign. Needs txt=on. Default: off");
 
     object_class_property_add_bool(oc, "amd-drtm",
         pc_q35_machine_get_amd_drtm, pc_q35_machine_set_amd_drtm);

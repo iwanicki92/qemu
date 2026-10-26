@@ -9739,6 +9739,12 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
                 ~feature_word_info[w].no_autoenable_flags;
         }
 
+        /* TCG emulates SMX, but no AMD processor has it */
+        if (IS_AMD_CPU(env) &&
+            !(env->user_features[FEAT_1_ECX] & CPUID_EXT_SMX)) {
+            env->features[FEAT_1_ECX] &= ~CPUID_EXT_SMX;
+        }
+
         if ((env->features[FEAT_7_1_EDX] & CPUID_7_1_EDX_AVX10) && !env->avx10_version) {
             uint8_t version = x86_cpu_get_host_avx10_version();
 

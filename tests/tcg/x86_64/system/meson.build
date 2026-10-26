@@ -70,7 +70,24 @@ tests += {
     'cflags': cflags,
     'qemu_args': ['-cpu', 'max,vm-cr=0x18'] + qemu_def_args,
   },
+  # max is an AMD CPU under TCG, and no AMD CPU has SMX
+  'cpuid-smx.c': {
+    'cflags': cflags,
+    'qemu_args': ['-cpu', 'max'] + qemu_def_args,
+  },
 }
+
+# The same source where SMX belongs: an Intel max, and +smx asked for
+tests += {'cpuid-smx.c': {
+  'exe_name': 'cpuid-smx-intel',
+  'cflags': cflags + ['-DEXPECT_SMX=1'],
+  'qemu_args': ['-cpu', 'max,vendor=GenuineIntel'] + qemu_def_args,
+}}
+tests += {'cpuid-smx.c': {
+  'exe_name': 'cpuid-smx-requested',
+  'cflags': cflags + ['-DEXPECT_SMX=1'],
+  'qemu_args': ['-cpu', 'max,+smx'] + qemu_def_args,
+}}
 
 if 'qemu-system-x86_64' in emulators
   tcg_tests += {

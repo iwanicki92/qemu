@@ -36,6 +36,9 @@
 #define AMDVI_CAPAB_SIZE              0x18
 #define AMDVI_CAPAB_REG_SIZE          0x04
 
+/* Base Address Low bit 0, set by firmware once the MMIO base is programmed */
+#define AMDVI_CAPAB_BAR_LOW_ENABLE    (1 << 0)
+
 /* Capability header data */
 #define AMDVI_CAPAB_ID_SEC            0xf
 #define AMDVI_CAPAB_FLAT_EXT          (1 << 28)
@@ -311,6 +314,8 @@ struct AMDVIState {
     X86IOMMUState iommu;        /* IOMMU bus device             */
     AMDVIPCIState *pci;         /* IOMMU PCI device             */
     char *pci_id;               /* ID of AMDVI-PCI device, if user created */
+    bool firmware_enabled;      /* report the capability as enabled by firmware */
+    bool ivrs;                  /* describe the IOMMU in an ACPI IVRS table */
 
     uint32_t version;
 
@@ -351,6 +356,10 @@ struct AMDVIState {
     MemoryRegion mr_sys;
     MemoryRegion mr_nodma;
     MemoryRegion mr_ir;
+    AddressSpace as_sys;               /* device DMA once translated */
+    MemoryRegion mr_fetch;             /* the IOMMU's own accesses */
+    MemoryRegion mr_fetch_mem;
+    AddressSpace as_fetch;
     uint8_t mmior[AMDVI_MMIO_SIZE];    /* read/write MMIO              */
     uint8_t w1cmask[AMDVI_MMIO_SIZE];  /* read/write 1 clear mask      */
     uint8_t romask[AMDVI_MMIO_SIZE];   /* MMIO read/only mask          */
@@ -376,5 +385,15 @@ struct AMDVIState {
 };
 
 uint64_t amdvi_extended_feature_register(AMDVIState *s);
+
+/*
+ * Keep DMA out of a range: @mr joins the physical view every device's
+ * address space goes through, above memory. @fetch_mr, when given, joins
+ * the view the IOMMU's own table, command and log accesses go through.
+ */
+void amdvi_add_dma_block(AMDVIState *s, MemoryRegion *mr,
+                         MemoryRegion *fetch_mr, hwaddr base);
+void amdvi_del_dma_block(AMDVIState *s, MemoryRegion *mr,
+                         MemoryRegion *fetch_mr);
 
 #endif

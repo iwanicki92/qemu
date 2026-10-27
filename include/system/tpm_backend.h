@@ -80,7 +80,18 @@ struct TPMBackendClass {
     TpmTypeOptions *(*get_tpm_options)(TPMBackend *t);
 
     void (*handle_request)(TPMBackend *s, TPMBackendCmd *cmd, Error **errp);
+
+    /*
+     * optional: the locality 4 hash sequence a processor drives at a
+     * dynamic launch, chunks of at most TPM_BACKEND_HASH_CHUNK bytes
+     */
+    int (*hash_start)(TPMBackend *t);
+    int (*hash_data)(TPMBackend *t, const uint8_t *data, size_t len);
+    int (*hash_end)(TPMBackend *t);
 };
+
+/* what one hash_data call carries, the size of ptm_hdata's data field */
+#define TPM_BACKEND_HASH_CHUNK 4096
 
 /**
  * tpm_backend_get_type:
@@ -132,6 +143,20 @@ bool tpm_backend_had_startup_error(TPMBackend *s);
  * to the TPM implementation.
  */
 void tpm_backend_deliver_request(TPMBackend *s, TPMBackendCmd *cmd);
+
+/**
+ * tpm_backend_run_sync:
+ * @s: the backend
+ * @cmd: the command to run
+ *
+ * Run a command in the caller's thread and return once its response is
+ * in @cmd->out, after any request in flight has completed. For the
+ * agents beside the processor that need the answer before they go on.
+ * Only the main loop may call this, since the wait polls its context.
+ *
+ * Returns 0, or a negative errno when the backend could not run it.
+ */
+int tpm_backend_run_sync(TPMBackend *s, TPMBackendCmd *cmd);
 
 /**
  * tpm_backend_reset:
@@ -208,6 +233,31 @@ void tpm_backend_finish_sync(TPMBackend *s);
  * Returns newly allocated TPMInfo
  */
 TPMInfo *tpm_backend_query_tpm(TPMBackend *s);
+
+/**
+ * tpm_backend_hash_image:
+ * @s: the backend
+ * @data: the image to measure
+ * @len: its length in bytes
+ *
+ * Run the locality 4 hash sequence over @data: PCRs 17 to 22 reset,
+ * PCR 17 extended with the image digest in every active bank. No guest
+ * command may be in flight.
+ *
+ * Returns 0 on success, -ENOTSUP if the backend has no locality 4 path,
+ * -EBUSY with a command in flight, or another negative errno.
+ */
+int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len);
+
+/*
+ * The same sequence one signal at a time, for a frontend that receives it
+ * as register writes. hash_start returns -ENOTSUP without a locality 4
+ * path and -EBUSY with a guest command in flight. hash_data takes at most
+ * TPM_BACKEND_HASH_CHUNK bytes.
+ */
+int tpm_backend_hash_start(TPMBackend *s);
+int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len);
+int tpm_backend_hash_end(TPMBackend *s);
 
 TPMBackend *qemu_find_tpm_be(const char *id);
 

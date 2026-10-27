@@ -1,5 +1,8 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# amd_nb.c
+amd_nb_memprot_write(uint32_t val, bool platform) "MEMPROT_CR 0x%" PRIx32 " platform %d"
+
 # aspeed_pcie.c
 aspeed_pcie_rc_intx_set_irq(uint32_t id, int num, int level) "%d: num %d set IRQ leve %d"
 aspeed_pcie_rc_msi_notify(uint32_t id, uint64_t addr, uint64_t data) "%d: 0x%" PRIx64 " data 0x%" PRIx64

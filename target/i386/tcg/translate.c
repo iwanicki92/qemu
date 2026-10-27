@@ -3005,9 +3005,17 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 || !PE(s)) {
                 goto illegal_op;
             }
+            if (!check_cpl0(s)) {
+                break;
+            }
             gen_svm_check_intercept(s, SVM_EXIT_SKINIT);
-            /* If not intercepted, not implemented -- raise #UD. */
-            goto illegal_op;
+            gen_update_cc_op(s);
+            gen_update_eip_cur(s);
+            /* The helper resets the core, so nothing here is worth keeping */
+            gen_helper_skinit(tcg_env);
+            tcg_gen_exit_tb(NULL, 0);
+            s->base.is_jmp = DISAS_NORETURN;
+            break;
 
         case 0xdf: /* INVLPGA */
             if (!SVME(s) || !PE(s)) {

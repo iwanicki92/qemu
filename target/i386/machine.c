@@ -354,6 +354,11 @@ static int cpu_post_load(void *opaque, int version_id)
     env->hflags &= ~HF_CPL_MASK;
     env->hflags |= (env->segs[R_SS].flags >> DESC_DPL_SHIFT) & HF_CPL_MASK;
 
+    /* Without DIS_A20M the A20 line is the gate, whether or not it was sent */
+    if (!(env->vm_cr & MSR_VM_CR_DIS_A20M)) {
+        env->a20_gate = (env->a20_mask >> 20) & 1;
+    }
+
 #ifdef CONFIG_KVM
     if ((env->hflags & HF_GUEST_MASK) &&
         (!env->nested_state ||
@@ -1578,6 +1583,62 @@ static const VMStateDescription vmstate_msr_hwcr = {
     }
 };
 
+static bool vm_cr_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+    CPUX86State *env = &cpu->env;
+
+    return env->vm_cr != 0;
+}
+
+static const VMStateDescription vmstate_vm_cr = {
+    .name = "cpu/vm_cr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vm_cr_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.vm_cr, X86CPU),
+        VMSTATE_BOOL(env.a20_gate, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool mmio_conf_base_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+
+    return cpu->env.mmio_conf_base != 0;
+}
+
+static const VMStateDescription vmstate_mmio_conf_base = {
+    .name = "cpu/mmio_conf_base",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = mmio_conf_base_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.mmio_conf_base, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool init_pending_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+
+    return cpu->env.init_pending;
+}
+
+static const VMStateDescription vmstate_init_pending = {
+    .name = "cpu/init_pending",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = init_pending_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.init_pending, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 #ifdef TARGET_X86_64
 static bool intel_fred_msrs_needed(void *opaque)
 {
@@ -1905,6 +1966,9 @@ const VMStateDescription vmstate_x86_cpu = {
         &vmstate_pdptrs,
         &vmstate_msr_xfd,
         &vmstate_msr_hwcr,
+        &vmstate_vm_cr,
+        &vmstate_mmio_conf_base,
+        &vmstate_init_pending,
 #ifdef TARGET_X86_64
         &vmstate_msr_fred,
         &vmstate_amx_xtile,

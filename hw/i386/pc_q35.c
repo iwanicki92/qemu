@@ -38,12 +38,15 @@
 #include "system/tcg.h"
 #include "system/kvm.h"
 #include "hw/i386/kvm/clock.h"
+#include "hw/pci-host/amd_nb.h"
 #include "hw/pci-host/q35.h"
 #include "hw/pci/pcie_port.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
 #include "hw/i386/amd_iommu.h"
+#include "monitor/qdev.h"
+#include "qom/compat-properties.h"
 #include "hw/i386/intel_iommu.h"
 #include "hw/vfio/types.h"
 #include "hw/virtio/virtio-iommu.h"
@@ -62,6 +65,7 @@
 #include "hw/mem/nvdimm.h"
 #include "hw/uefi/var-service-api.h"
 #include "hw/i386/acpi-build.h"
+#include "hw/i386/amd_drtm.h"
 #include "target/i386/cpu.h"
 
 /* ICH9 AHCI has 6 ports */
@@ -128,6 +132,44 @@ static int ehci_create_ich9_with_companions(PCIBus *bus, int slot)
     return 0;
 }
 
+/* MSR_AMD64_MMIO_CONF_BASE maps MMCONFIG the way PCIEXBAR does */
+static void pc_q35_mmio_conf_base(Notifier *n, void *data)
+{
+    Q35PCIHost *phb = container_of(n, Q35PCIHost, mmio_conf_notifier);
+    X86MmioConfBase *conf = data;
+
+    mch_mmcfg_msr_update(&phb->mch, conf->enable, conf->base, conf->size);
+}
+
+/*
+ * The devices an AMD dynamic launch needs, as amd-drtm=on creates them:
+ * the launch record, the northbridge SKL releases SL_DEV through, and an
+ * IOMMU at 00:00.2 that firmware left enabled. Each works standalone too.
+ */
+static void pc_q35_amd_drtm_init(PCMachineState *pcms)
+{
+    PCIDevice *iommu_pci;
+    DeviceState *iommu;
+
+    sysbus_create_simple(TYPE_AMD_DRTM_PLATFORM, -1, NULL);
+    pci_create_simple(pcms->pcibus, AMD_NB_DEVFN, TYPE_AMD_NB);
+
+    iommu_pci = pci_new(PCI_DEVFN(0, 2), TYPE_AMD_IOMMU_PCI);
+    qdev_set_id(DEVICE(iommu_pci), g_strdup("amd-drtm-iommu"), &error_fatal);
+    pci_realize_and_unref(iommu_pci, pcms->pcibus, &error_fatal);
+
+    iommu = qdev_new(TYPE_AMD_IOMMU_DEVICE);
+    qdev_prop_set_string(iommu, "pci-id", "amd-drtm-iommu");
+    qdev_prop_set_bit(iommu, "firmware-enabled", true);
+    /*
+     * Translate rather than pass DMA through: an OS that builds a
+     * translated domain for its disk, as Linux does, gets nothing back
+     * from it otherwise.
+     */
+    qdev_prop_set_bit(iommu, "dma-remap", true);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(iommu), &error_fatal);
+}
+
 /* PC hardware initialisation */
 static void pc_q35_init(MachineState *machine)
 {
@@ -192,6 +234,9 @@ static void pc_q35_init(MachineState *machine)
     }
 
     pc_machine_init_sgx_epc(pcms);
+    if (pcms->amd_drtm_enabled) {
+        object_register_sugar_prop(TYPE_X86_CPU, "skinit", "on", true);
+    }
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
 
     if (kvm_enabled()) {
@@ -226,7 +271,17 @@ static void pc_q35_init(MachineState *machine)
                              pcms->default_bus_bypass_iommu, NULL);
     object_property_set_bool(phb, PCI_HOST_PROP_SMM_RANGES,
                              x86_machine_is_smm_enabled(x86ms), NULL);
+    if (pcms->amd_drtm_enabled) {
+        object_property_set_bool(phb, "mch-multifunction", true, &error_abort);
+        object_property_set_bool(phb, PCI_HOST_CF8_EXTENDED_CONFIG, true,
+                                 &error_abort);
+        object_property_set_bool(OBJECT(&Q35_HOST_DEVICE(phb)->mch), "smn",
+                                 true, &error_abort);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(phb), &error_fatal);
+    Q35_HOST_DEVICE(phb)->mmio_conf_notifier.notify = pc_q35_mmio_conf_base;
+    x86_cpu_mmio_conf_base_notifier_add(
+        &Q35_HOST_DEVICE(phb)->mmio_conf_notifier);
 
     /* pci */
     pcms->pcibus = PCI_BUS(qdev_get_child_bus(DEVICE(phb), "pcie.0"));
@@ -329,6 +384,10 @@ static void pc_q35_init(MachineState *machine)
                                x86_nvdimm_acpi_dsmio,
                                x86ms->fw_cfg, OBJECT(pcms));
     }
+
+    if (pcms->amd_drtm_enabled) {
+        pc_q35_amd_drtm_init(pcms);
+    }
 }
 
 static bool pc_q35_machine_get_wdat(Object *o, Error **errp)
@@ -341,6 +400,18 @@ static void pc_q35_machine_set_wdat(Object *o, bool value, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(o);
     pcms->wdat_enabled = value;
+}
+
+static bool pc_q35_machine_get_amd_drtm(Object *o, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(o);
+    return pcms->amd_drtm_enabled;
+}
+
+static void pc_q35_machine_set_amd_drtm(Object *o, bool value, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(o);
+    pcms->amd_drtm_enabled = value;
 }
 
 #define DEFINE_Q35_MACHINE(major, minor) \
@@ -374,10 +445,18 @@ static void pc_q35_machine_options(MachineClass *m)
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_RAMFB_DEVICE);
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_VMBUS_BRIDGE);
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_UEFI_VARS_X64);
+    machine_class_allow_dynamic_sysbus_dev(m, TYPE_AMD_DRTM_PLATFORM);
     object_class_property_add_bool(oc, "wdat",
         pc_q35_machine_get_wdat, pc_q35_machine_set_wdat);
     object_class_property_set_description(oc, "wdat",
         "Enable WDAT watchdog support. Default: off");
+    object_class_property_add_bool(oc, "amd-drtm",
+        pc_q35_machine_get_amd_drtm, pc_q35_machine_set_amd_drtm);
+    object_class_property_set_description(oc, "amd-drtm",
+        "Add what an AMD dynamic launch needs: the skinit feature, the "
+        "amd-drtm-platform, amd-nb at 00:18.0, an enabled amd-iommu at "
+        "00:00.2, the AMD routes to their registers and the SMN pair "
+        "that finds an amd-psp. Default: off");
 
     compat_props_add(m->compat_props,
                      pc_q35_compat_defaults, pc_q35_compat_defaults_len);

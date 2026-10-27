@@ -715,6 +715,10 @@ void qemu_system_guest_panicked(GuestPanicInformation *info)
             qemu_log_mask(LOG_GUEST_ERROR, "SEV termination (reason set: %d code: %d)",
                           info->u.sev.set,
                           info->u.sev.code);
+        } else if (info->type == GUEST_PANIC_INFORMATION_TYPE_AMD_DRTM) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "\nAMD dynamic launch rule broken: %s\n",
+                          info->u.amd_drtm.rule);
         }
 
         qapi_free_GuestPanicInformation(info);

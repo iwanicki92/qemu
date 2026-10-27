@@ -1817,13 +1817,21 @@ static void lapic_ipi(uint32_t icr_low)
     }
 }
 
-/* Start the AP in real mode at 0x8000, where it marks EDX and halts */
+/*
+ * Start the AP in real mode at 0x8000, where it marks EDX and halts, or
+ * spins with TEST_TXT_AP_RUNNING: SENTER parks an RLP that is not halted.
+ */
 static void start_marked_ap(void)
 {
     static const uint8_t code[] = {
         0x66, 0xba, 0x5a, 0xa5, 0x5a, 0xa5, /* mov $AP_EDX_MARK, %edx */
+#ifdef TEST_TXT_AP_RUNNING
+        0xf3, 0x90,                         /* pause */
+        0xeb, 0xfc,                         /* jmp back to pause */
+#else
         0xf4,                               /* hlt */
         0xeb, 0xfd,                         /* jmp back to hlt */
+#endif
     };
     /* Volatile: SIPI fetches these instruction bytes from guest RAM. */
     volatile uint8_t *dst = (volatile uint8_t *)0x8000;

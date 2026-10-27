@@ -223,7 +223,7 @@ TYPE_CODE = 1 (SINIT ACM); the reason is the PROGRESS_CODE):
   |             |                        | header, malformed or out-of-bounds info table, or a chipset    |
   |             |                        | id list that does not cover TXT.DIDVID.                        |
   +-------------+------------------------+----------------------------------------------------------------+
-  | 0x80070001  | APS_UNSUPPORTED        | An AP was not halted or could not enter TXT sleep              |
+  | 0x80070001  | APS_UNSUPPORTED        | An AP was in SMM or already in TXT sleep                       |
   +-------------+------------------------+----------------------------------------------------------------+
   | 0x80080001  | PMR_INVALID            | VT-d PMR fields invalid, or an MLE page not protected          |
   +-------------+------------------------+----------------------------------------------------------------+
@@ -491,9 +491,13 @@ parking strategies have very different requirements:
 The original single-vCPU path uses tboot's default VMX option, with
 ``txt-vmx-compat=on`` for its capability check only. The SMP path uses
 ``ap_wake_mwait=true`` and a CPU exposing ``monitor``; it does **not**
-advertise VMX instructions TCG cannot execute. SENTER requires every
-AP to be halted, rendezvouses with each vCPU and parks it before PCR
-measurement. Failed launches release the APs parked by that attempt.
+advertise VMX instructions TCG cannot execute. SENTER rendezvouses
+with each vCPU and parks it before PCR measurement. The SDM has software
+leave the other processors "in an idle loop, or asleep (such as after
+executing HLT)", which the hardware does not check, so a vCPU that is
+not halted is parked too (edk2 idles its APs in MWAIT). Failed launches
+release the APs parked by that attempt, and one that was not halted
+resumes.
 GETSEC[WAKEUP] transfers them to the validated join entry.
 
 Semantic measured launch (GETSEC[SENTER])
@@ -626,8 +630,8 @@ h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).
 i. Transfer BSP control to the MLE entry point (see below). APs were
-   halted and put into TXT sleep before measurement; a running AP
-   rejects the launch rather than executing outside the MLE.
+   put into TXT sleep before measurement, halted or not, so none
+   executes outside the MLE.
 
 SMI inhibition
 --------------
@@ -653,12 +657,12 @@ from its own teardown path via ``CMD_CLOSE_PRIVATE``
 open from reset, stays open across SENTER for the MLE's use, and is
 closed by the MLE or by a TXT reset.
 
-Current implementation: SENTER parks each halted AP on its own thread,
+Current implementation: SENTER parks each AP on its own thread,
 checks the launch inputs, measures the SINIT ACM and MLE, writes the
 SINIT-MLE heap section, sets the SENTER_DONE / MEM_CONFIG_LOCK /
 PRIVATE_OPEN status bits, and transfers BSP execution to the physical
-MLE entry with paging off. An AP that is still executing causes a
-pre-measure rejection; a failed launch rolls back the newly parked APs.
+MLE entry with paging off. An AP in SMM causes a pre-measure
+rejection; a failed launch rolls back the newly parked APs.
 The SINIT measurement uses the TIS ``_TPM_Hash_Start`` /
 ``_TPM_Hash_Data`` / ``_TPM_Hash_End`` signal sequence at locality 4.
 ``_TPM_Hash_Start`` resets the DRTM PCRs and ``_TPM_Hash_End`` extends
@@ -899,7 +903,7 @@ Deviations from real hardware
    own event types and its records match the extends exactly, but it
    covers only the events this model has inputs for; see *TPM event
    log* above for what is measured and what is deliberately absent.
-7. SMP APs must already be halted at SENTER. Both GETSEC[WAKEUP] and
+7. SMP APs must not be in SMM at SENTER. Both GETSEC[WAKEUP] and
    the MONITOR wake register join them to the MLE, but *guest*
    MONITOR/MWAIT does not track the monitored address: MWAIT
    degenerates to a spin under SMP (architecturally legal, since

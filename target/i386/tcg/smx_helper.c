@@ -89,21 +89,37 @@ static void getsec_load_mle_seg(CPUX86State *env, int reg, uint32_t selector,
 #endif
 
 #if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TPM)
-/* run_on_cpu() executes these callbacks on the RLP itself under the BQL. */
+/*
+ * run_on_cpu() executes these callbacks on the RLP itself under the BQL.
+ * SENTER puts every RLP to sleep unless it is in VMX operation (SDM,
+ * GETSEC[SENTER]), which TCG lacks. Software must leave the APs halted
+ * or in an idle loop, such as edk2's MWAIT (a pause under TCG SMP), but
+ * nothing checks it. SMM is refused.
+ */
 static void getsec_park_rlp(CPUState *cs, run_on_cpu_data data)
 {
+    CPUX86State *env = cpu_env(cs);
     bool *ready = data.host_ptr;
 
-    *ready = cs->halted && !cpu_env(cs)->txt_ap_parked;
+    *ready = !(env->hflags & HF_SMM_MASK) && !env->txt_ap_parked;
     if (*ready) {
-        cpu_env(cs)->txt_ap_parked = true;
+        env->txt_ap_was_running = !cs->halted;
+        env->txt_ap_parked = true;
+        cs->halted = 1;
         trace_getsec_ap_parked(cs->cpu_index);
     }
 }
 
+/* A failed launch resumes an RLP in the state SENTER found it in. */
 static void getsec_unpark_rlp(CPUState *cs, run_on_cpu_data data)
 {
-    cpu_env(cs)->txt_ap_parked = false;
+    CPUX86State *env = cpu_env(cs);
+
+    env->txt_ap_parked = false;
+    if (env->txt_ap_was_running) {
+        env->txt_ap_was_running = false;
+        cs->halted = 0;
+    }
 }
 
 static bool getsec_park_aps(void)
@@ -177,6 +193,7 @@ static void getsec_join_rlp(CPUState *cs, run_on_cpu_data data)
     /* INIT/SIPI pending during TXT sleep are not processed on WAKEUP. */
     cpu_reset_interrupt(cs, CPU_INTERRUPT_INIT | CPU_INTERRUPT_SIPI);
     env->txt_ap_parked = false;
+    env->txt_ap_was_running = false;
     cs->halted = 0;
     trace_getsec_ap_joined(cs->cpu_index, rlp->entry_point);
 }

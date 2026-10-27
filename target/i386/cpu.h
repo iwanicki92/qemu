@@ -2161,6 +2161,11 @@ typedef struct CPUArchState {
 
     /* TXT sleep persists across INIT; WAKEUP or machine reset releases it. */
     bool txt_ap_parked;
+    /*
+     * The AP was not halted when SENTER parked it. Only read if that SENTER
+     * fails, before the helper returns, so it is not migrated.
+     */
+    bool txt_ap_was_running;
 
     /* End of state preserved by INIT (dummy marker).  */
     struct {} end_init_save;

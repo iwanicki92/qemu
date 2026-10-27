@@ -92,6 +92,9 @@ struct IntelTxtState {
      */
     bool smi_inhibit;
 
+    /* TXT.CMD.RESET was written: the reset it requests keeps ERRORCODE */
+    bool txt_reset;
+
     /* TXT.DIDVID, configurable for experimentation (see spec) */
     uint64_t didvid;
 
@@ -220,6 +223,7 @@ static void intel_txt_reg_write64(IntelTxtState *s, hwaddr addr,
          * so the boot firmware can tell that a TXT reset occurred.
          */
         s->ests |= TXT_ESTS_TXT_RESET_STS;
+        s->txt_reset = true;
         trace_txt_reset_request();
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         break;
@@ -440,13 +444,27 @@ static void intel_txt_private_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned size)
 {
     IntelTxtState *s = INTEL_TXT(opaque);
+    bool mle_reg;
 
     /*
-     * The MLE publishes the RLP join block here after SENTER, while
-     * private space is open.  Other private registers are reserved for
-     * SINIT (which the semantic launch models without ACM execution).
+     * After SENTER, while private space is open, the MLE publishes the
+     * RLP join block here and performs a TXT reset with a sticky error
+     * code (ERRORCODE, NO_SECRETS, then RESET). Other private registers
+     * are reserved for SINIT (which the semantic launch models without
+     * ACM execution), and UNLOCK_MEM_CONFIG has no effect in the model.
      */
-    if ((addr & ~7) == TXT_MLE_JOIN &&
+    switch (addr & ~7) {
+    case TXT_MLE_JOIN:
+    case TXT_ERRORCODE:
+    case TXT_CMD_NO_SECRETS:
+    case TXT_CMD_RESET:
+        mle_reg = true;
+        break;
+    default:
+        mle_reg = false;
+        break;
+    }
+    if (mle_reg &&
         (s->sts & (TXT_STS_SENTER_DONE | TXT_STS_PRIVATE_OPEN)) ==
         (TXT_STS_SENTER_DONE | TXT_STS_PRIVATE_OPEN)) {
         trace_txt_reg_write("private", addr, val);
@@ -3216,7 +3234,11 @@ static void intel_txt_reset_hold(Object *obj, ResetType type)
 
     s->sts = 0;
     s->ests = txt_reset_sts;
-    s->errorcode = 0;
+    /* An MLE leaves a sticky error code for after its TXT reset */
+    if (!s->txt_reset) {
+        s->errorcode = 0;
+    }
+    s->txt_reset = false;
     s->spad = 0;
     s->sinit_base = 0;
     s->sinit_size = 0;

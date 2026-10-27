@@ -118,7 +118,8 @@ Off   Name                      Access        Semantics (QEMU)
 0x030 TXT.ERRORCODE             RO/RW         ACM error code (details below).
 0x038 TXT.CMD_RESET             WO            Write 1: perform a full platform reset
                                               (machine reset, like SINIT
-                                              ``ACMINPUT_RESET``).
+                                              ``ACMINPUT_RESET``). TXT.ERRORCODE
+                                              survives it.
 0x048 TXT.CMD_CLOSE_PRIVATE     WO            Write: close private config space (sets
                                               ``STS.private_open`` = 0).
 0x0A0 TXT.SPAD                  RO/RW         Scratchpad / ACM status (modern platforms;
@@ -197,7 +198,9 @@ TXT.ERRORCODE (ACMERROR) layout (coreboot)::
   [ 3: 0] TYPE_CODE (0 = BIOS ACM, 1 = SINIT ACM)
 
 On reset TXT.ERRORCODE reads 0 (bit 31 VALID clear = no error
-recorded; coreboot/tboot parse 0 as "no error"). DRTM PCRs 17-22
+recorded; coreboot/tboot parse 0 as "no error"), except after a
+reset requested through TXT.CMD_RESET, which keeps the code an MLE
+wrote before it. DRTM PCRs 17-22
 read all-ones before any launch; a successful SENTER resets them
 to zero and extends its measurements.
 
@@ -240,8 +243,10 @@ its function; the device implements:
   (some loaders poke private registers during bring-up debugging),
 - after launch, reads return all ones when private space is closed,
   including after SEXIT; public config remains accessible,
-- writes ignored except ``TXT.MLE_JOIN`` when ``STS.SENTER_DONE`` and
-  ``STS.PRIVATE_OPEN`` are both set (the MLE publishes its AP entry),
+- writes ignored except ``TXT.MLE_JOIN``, ``TXT.ERRORCODE``,
+  ``TXT.CMD_NO_SECRETS`` and ``TXT.CMD_RESET`` when ``STS.SENTER_DONE``
+  and ``STS.PRIVATE_OPEN`` are both set (the MLE publishes its AP
+  entry, and performs a TXT reset with a sticky error code),
 - ``TXT.CMD_CLOSE_PRIVATE`` closes it.
 
 DPR — DMA Protected Range

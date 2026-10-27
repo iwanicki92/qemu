@@ -1895,6 +1895,16 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
          TXT_STS_PRIVATE_OPEN) || txt_read64(TXT_OFF_ERRORCODE)) {
         fail_msg("MLE entry TXT status is wrong", 16384);
     }
+    /*
+     * The MLE sets its TXT reset error code through private space.
+     * Volatile: this is a guest MMIO register, not ordinary RAM.
+     */
+    *(volatile uint32_t *)(TXT_PRIVATE_BASE + TXT_OFF_ERRORCODE) =
+        0xc000800cU;
+    if (txt_read64(TXT_OFF_ERRORCODE) != 0xc000800cU) {
+        fail_msg("private ERRORCODE write after SENTER was ignored", 16384);
+    }
+    txt_write64(TXT_OFF_ERRORCODE, 0);
 #ifdef TEST_TXT_TPM2_LOG
     check_tpm2_event_log();
 #endif

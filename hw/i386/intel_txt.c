@@ -448,16 +448,24 @@ static void intel_txt_private_write(void *opaque, hwaddr addr,
 
     /*
      * After SENTER, while private space is open, the MLE publishes the
-     * RLP join block here and performs a TXT reset with a sticky error
-     * code (ERRORCODE, NO_SECRETS, then RESET). Other private registers
-     * are reserved for SINIT (which the semantic launch models without
-     * ACM execution), and UNLOCK_MEM_CONFIG has no effect in the model.
+     * RLP join block here, clears the error status, issues the TXT
+     * commands and sets the error code of a TXT reset. The other
+     * private registers are SINIT's, which the semantic launch models
+     * without ACM execution.
      */
     switch (addr & ~7) {
     case TXT_MLE_JOIN:
+    case TXT_ESTS:
     case TXT_ERRORCODE:
-    case TXT_CMD_NO_SECRETS:
     case TXT_CMD_RESET:
+    case TXT_CMD_CLOSE_PRIVATE:
+    case TXT_CMD_UNLOCK_MEM:
+    case TXT_CMD_OPEN_LOCALITY1:
+    case TXT_CMD_CLOSE_LOCALITY1:
+    case TXT_CMD_OPEN_LOCALITY2:
+    case TXT_CMD_CLOSE_LOCALITY2:
+    case TXT_CMD_SECRETS:
+    case TXT_CMD_NO_SECRETS:
         mle_reg = true;
         break;
     default:

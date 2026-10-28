@@ -98,7 +98,9 @@
 #define TXT_PUBLIC_BASE        0xFED30000U
 #define TXT_PRIVATE_BASE       0xFED20000U
 #define TXT_OFF_STS            0x000
+#define TXT_OFF_ESTS           0x008
 #define TXT_OFF_ERRORCODE      0x030
+#define TXT_OFF_CMD_CLOSE_PRIVATE 0x048
 #define TXT_OFF_SINIT_BASE     0x270
 #define TXT_OFF_SINIT_SIZE     0x278
 #define TXT_OFF_MLE_JOIN       0x290
@@ -107,6 +109,8 @@
 #define TXT_OFF_HEAP_SIZE      0x308
 #define TXT_OFF_DPR            0x330
 
+#define TXT_OFF_CMD_OPEN_LOCALITY1 0x380
+#define TXT_OFF_CMD_SECRETS    0x8e0
 #define TXT_OFF_E2STS          0x8f0
 
 #define TXT_STS_SENTER_DONE    (1ULL << 0)
@@ -333,6 +337,12 @@ static void txt_write64(uint32_t off, uint64_t v)
     asm volatile("movq %0, %%xmm0\n\t"
                  "movq %%xmm0, %1"
                  : : "m"(v), "m"(*p) : "xmm0");
+}
+
+static void txt_private_write32(uint32_t off, uint32_t v)
+{
+    /* Volatile: private TXT space is guest MMIO, not ordinary RAM. */
+    *(volatile uint32_t *)(TXT_PRIVATE_BASE + off) = v;
 }
 
 static uint32_t tis_readl(uint32_t off)
@@ -1914,6 +1924,17 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         fail_msg("private ERRORCODE write after SENTER was ignored", 16384);
     }
     txt_write64(TXT_OFF_ERRORCODE, 0);
+    /*
+     * Linux's MLE also clears the error status, sets the secrets flag
+     * and opens locality 1 there. SEXIT must clear the last two.
+     */
+    txt_private_write32(TXT_OFF_ESTS, 0xffffffffU);
+    txt_private_write32(TXT_OFF_CMD_SECRETS, 1);
+    txt_private_write32(TXT_OFF_CMD_OPEN_LOCALITY1, 1);
+    if (!(txt_read64(TXT_OFF_E2STS) & TXT_E2STS_SECRET_STS) ||
+        !(txt_read64(TXT_OFF_STS) & TXT_STS_LOCALITY1_OPEN)) {
+        fail_msg("private TXT commands after SENTER were ignored", 16384);
+    }
 #ifdef TEST_TXT_TPM2_LOG
     check_tpm2_event_log();
 #endif
@@ -2123,6 +2144,11 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         uint64_t dpr = txt_read64(TXT_OFF_DPR);
         uint64_t sts_after;
 
+        /* Linux closes private space itself before SEXIT */
+        txt_private_write32(TXT_OFF_CMD_CLOSE_PRIVATE, 1);
+        if (txt_read64(TXT_OFF_STS) & TXT_STS_PRIVATE_OPEN) {
+            fail_msg("private CMD.CLOSE-PRIVATE was ignored", 32768);
+        }
         asm volatile(".byte 0x0f, 0x37" : : "a"(5) : "memory");
 
         /* Reaching this instruction at all is half the test. */

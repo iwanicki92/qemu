@@ -243,10 +243,11 @@ its function; the device implements:
   (some loaders poke private registers during bring-up debugging),
 - after launch, reads return all ones when private space is closed,
   including after SEXIT; public config remains accessible,
-- writes ignored except ``TXT.MLE_JOIN``, ``TXT.ERRORCODE``,
-  ``TXT.CMD_NO_SECRETS`` and ``TXT.CMD_RESET`` when ``STS.SENTER_DONE``
-  and ``STS.PRIVATE_OPEN`` are both set (the MLE publishes its AP
-  entry, and performs a TXT reset with a sticky error code),
+- writes ignored except ``TXT.MLE_JOIN``, ``TXT.ESTS``,
+  ``TXT.ERRORCODE`` and the ``TXT.CMD_*`` registers when
+  ``STS.SENTER_DONE`` and ``STS.PRIVATE_OPEN`` are both set (the MLE
+  publishes its AP entry, clears the error status, issues the TXT
+  commands and performs a TXT reset with a sticky error code),
 - ``TXT.CMD_CLOSE_PRIVATE`` closes it.
 
 DPR — DMA Protected Range

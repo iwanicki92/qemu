@@ -65,7 +65,8 @@ Notes:
   guest's own TPM driver.
 - Under ``-machine txt=on`` the machine requires a TPM backend
   (tpm-tis + swtpm) and ``-device intel-iommu``, whose PMRs SENTER
-  programs; instantiation fails otherwise.
+  programs; instantiation fails otherwise. ``amd-drtm=on`` is refused
+  with it.
 - ``-machine q35,txt=on,txt-vmx-compat=on`` is an explicit single-vCPU
   bring-up option: it advertises ``CPUID.1.ECX.VMX`` only on that TXT
   machine, so real tboot can pass its prelaunch VMX capability check.

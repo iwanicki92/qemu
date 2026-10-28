@@ -220,6 +220,10 @@ static void pc_q35_init(MachineState *machine)
         error_report("txt-firmware=on requires txt=on");
         exit(1);
     }
+    if (pcms->txt_enabled && pcms->amd_drtm_enabled) {
+        error_report("txt=on and amd-drtm=on cannot be combined");
+        exit(1);
+    }
 
     /* Check whether RAM fits below 4G (leaving 1/2 GByte for IO memory
      * and 256 Mbytes for PCI Express Enhanced Configuration Access Mapping

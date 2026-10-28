@@ -441,9 +441,10 @@ on an advertisement it does not control:
   (0xfed302a0) in ``sinit_mle_data.rlp_wakeup_addr``.  The MLE's
   ordinary 32-bit store of a nonzero value to that address traps into
   the chipset model, which validates ``TXT.MLE_JOIN`` exactly as
-  GETSEC[WAKEUP] does and joins every parked RLP.  A zero store, an
-  unlaunched environment, or a launch that did not negotiate MONITOR
-  wake leaves the RLPs parked.
+  GETSEC[WAKEUP] does and joins every parked RLP.  The store returns
+  before the RLPs have joined: the MLE waits for them itself.  A zero
+  store, an unlaunched environment, or a launch that did not negotiate
+  MONITOR wake leaves the RLPs parked.
 
   On real hardware ``rlp_wakeup_addr`` is a platform-specific
   location chosen by the ACM; pointing it at an otherwise reserved

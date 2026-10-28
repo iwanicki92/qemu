@@ -1790,15 +1790,24 @@ static volatile uint32_t ap_joined;
 /* Volatile: the AP stores the EDX it joined with, read by the BSP. */
 static volatile uint32_t ap_edx;
 
+/* Volatile: the AP stores the heap base it read, checked by the BSP. */
+static volatile uint32_t ap_heap_base;
+
 /* What the AP puts in EDX before it halts, and keeps through its sleep */
 #define AP_EDX_MARK 0xa55aa55aU
 #define LAPIC_ICR_LOW  0xfee00300U
 #define LAPIC_ICR_HIGH 0xfee00310U
 
-/* The AP has no stack on entry. Use no C prologue and a private stack. */
+/*
+ * The AP has no stack on entry. Use no C prologue and a private stack.
+ * Like Linux's sl_txt_ap_entry, it reads TXT.HEAP_BASE first, while the
+ * BSP may still be inside the wake register's write.
+ */
 static void __attribute__((naked, noreturn, used)) ap_landing(void)
 {
     asm volatile("movl $0xe5f000, %%esp\n"
+                 "movl 0xfed20300, %%eax\n"
+                 "movl %%eax, ap_heap_base\n"
                  "movl %%edx, ap_edx\n"
                  "movl $1, ap_joined\n"
                  "1: hlt\n"
@@ -2048,6 +2057,14 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
                          16384);
             }
             *wake = 1;
+#ifdef TEST_TXT_WAKE_TWICE
+            /* A WAKEUP while the RLP is still joining has nothing to do. */
+            gp_count = 0;
+            asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
+            if (gp_count != 0) {
+                fail_msg("WAKEUP after a MONITOR wake raised #GP", 16384);
+            }
+#endif
             while (!ap_joined && retries--) {
                 asm volatile("pause" : : : "memory");
             }
@@ -2072,6 +2089,13 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             ml_printf("PASS: RLP joined MLE through TXT.MLE_JOIN\n");
         }
 #endif
+        if (ap_joined && ap_heap_base != TEST_HEAP_BASE) {
+            ml_printf("smx: AP read TXT.HEAP_BASE 0x%x\n", ap_heap_base);
+            fail_msg("the joined RLP could not read TXT private space",
+                     16384);
+        } else if (ap_joined) {
+            ml_printf("PASS: the joined RLP reads TXT private space\n");
+        }
         if (ap_joined && ap_edx != AP_EDX_MARK) {
             ml_printf("smx: AP joined with EDX=0x%x\n", ap_edx);
             fail_msg("an INIT reset the RLP in SENTER sleep", 16384);

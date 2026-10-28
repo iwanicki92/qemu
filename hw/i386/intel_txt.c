@@ -398,9 +398,9 @@ static void intel_txt_monitor_wake(IntelTxtState *s, uint64_t val)
         return;
     }
     trace_txt_monitor_wake(val);
-    /* Device dispatch already holds the BQL; run_on_cpu requires it. */
+    /* Like the hardware, return before the RLPs have joined. */
     BQL_LOCK_GUARD();
-    intel_txt_join_parked_rlps(&rlp);
+    intel_txt_queue_rlp_joins(&rlp);
 #else
     trace_txt_monitor_wake_ignored(val);
 #endif

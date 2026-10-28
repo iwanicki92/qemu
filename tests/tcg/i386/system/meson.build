@@ -166,6 +166,25 @@ if is_variable('i386_system_qemu')
     'wrapper': [run_swtpm_test],
   }}
 
+  # MONITOR wake followed at once by GETSEC[WAKEUP], while the RLP's
+  # join may still be pending.
+  tests += {'test-smx-getsec.c': {
+    'exe_name': 'test-smx-getsec-wake-twice',
+    'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                        '-fno-stack-protector', '-msse', '-DTEST_TXT_SMP=1',
+                        '-DTEST_TXT_MONITOR_WAKE=1',
+                        '-DTEST_TXT_WAKE_TWICE=1'],
+    'qemu_args': ['-machine', 'q35,txt=on',
+                  '-cpu', 'qemu32,smx,sse', '-smp', '2',
+                  '-device', 'intel-iommu',
+                  '-device', 'iommu-testdev',
+                  '-chardev',
+                  'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                  '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                  '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+    'wrapper': [run_swtpm_test],
+  }}
+
   # MLE Size not page aligned: the SDG's MLE Size is in bytes and the
   # final partial page is measured up to that size.
   tests += {'test-smx-getsec.c': {

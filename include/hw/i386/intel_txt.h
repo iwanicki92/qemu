@@ -267,6 +267,11 @@ bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp);
  * @rlp.  Defined by the TCG SMX helper; the BQL must be held.
  */
 void intel_txt_join_parked_rlps(IntelTxtRlpEntry *rlp);
+/*
+ * The same join queued on each parked AP, for callers in device
+ * dispatch.  The BQL must be held.
+ */
+void intel_txt_queue_rlp_joins(const IntelTxtRlpEntry *rlp);
 #endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

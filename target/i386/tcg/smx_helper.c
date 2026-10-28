@@ -90,7 +90,8 @@ static void getsec_load_mle_seg(CPUX86State *env, int reg, uint32_t selector,
 
 #if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TPM)
 /*
- * run_on_cpu() executes these callbacks on the RLP itself under the BQL.
+ * run_on_cpu() or async_run_on_cpu() executes these callbacks on the
+ * RLP itself under the BQL.
  * SENTER puts every RLP to sleep unless it is in VMX operation (SDM,
  * GETSEC[SENTER]), which TCG lacks. Software must leave the APs halted
  * or in an idle loop, such as edk2's MWAIT (a pause under TCG SMP), but
@@ -171,7 +172,11 @@ static void getsec_join_rlp(CPUState *cs, run_on_cpu_data data)
     const IntelTxtRlpEntry *rlp = data.host_ptr;
     CPUX86State *env = cpu_env(cs);
 
-    g_assert(env->txt_ap_parked && cs->halted);
+    /* A reset or an earlier wake may have released the RLP already. */
+    if (!env->txt_ap_parked) {
+        return;
+    }
+    g_assert(cs->halted);
     cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) &
                             ~(CR0_PG_MASK | CR0_AM_MASK | CR0_WP_MASK));
     cpu_x86_update_cr4(env, CR4_SMXE_MASK);
@@ -211,6 +216,32 @@ void intel_txt_join_parked_rlps(IntelTxtRlpEntry *rlp)
     CPU_FOREACH(cs) {
         if (cs != current_cpu && cpu_env(cs)->txt_ap_parked) {
             run_on_cpu(cs, getsec_join_rlp, RUN_ON_CPU_HOST_PTR(rlp));
+        }
+    }
+}
+
+static void getsec_join_rlp_queued(CPUState *cs, run_on_cpu_data data)
+{
+    g_autofree IntelTxtRlpEntry *rlp = data.host_ptr;
+
+    getsec_join_rlp(cs, RUN_ON_CPU_HOST_PTR(rlp));
+}
+
+/*
+ * The MONITOR wake register's handler runs in device dispatch, where
+ * run_on_cpu() would drop the BQL and let a joined RLP touch the TXT
+ * device before the write returns.  Queue the joins instead.
+ */
+void intel_txt_queue_rlp_joins(const IntelTxtRlpEntry *rlp)
+{
+    CPUState *cs;
+
+    g_assert(bql_locked());
+    CPU_FOREACH(cs) {
+        if (cs != current_cpu && cpu_env(cs)->txt_ap_parked) {
+            async_run_on_cpu(cs, getsec_join_rlp_queued,
+                             RUN_ON_CPU_HOST_PTR(g_memdup2(rlp,
+                                                           sizeof(*rlp))));
         }
     }
 }

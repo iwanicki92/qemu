@@ -213,14 +213,14 @@ static void test_no_feature_control_file(void)
     swtpm_stop(&tpm);
 }
 
-/* Without intel-iommu nothing can lock the DPR */
-static void test_requires_iommu(void)
+/* Without intel-iommu nothing can program the PMRs or lock the DPR */
+static void test_requires_iommu(const void *machine)
 {
     Swtpm tpm;
     g_autofree char *args =
-        g_strdup_printf("-machine q35,txt=on,txt-firmware=on "
-                        "-m %" PRIu64 "M " TPM_ARGS,
-                        RAM_SIZE / MiB, swtpm_start(&tpm));
+        g_strdup_printf("-machine %s -m %" PRIu64 "M " TPM_ARGS,
+                        (const char *)machine, RAM_SIZE / MiB,
+                        swtpm_start(&tpm));
     QTestState *qts = qtest_init_ext(NULL, args, NULL, false);
 
     qtest_set_expected_status(qts, 1);
@@ -237,7 +237,10 @@ int main(int argc, char **argv)
     qtest_add_func("/txt-firmware/setup", test_firmware_setup);
     qtest_add_func("/txt-firmware/no_feature_control_file",
                    test_no_feature_control_file);
-    qtest_add_func("/txt-firmware/requires_iommu", test_requires_iommu);
+    qtest_add_data_func("/txt-firmware/requires_iommu",
+                        "q35,txt=on,txt-firmware=on", test_requires_iommu);
+    qtest_add_data_func("/txt-firmware/txt_requires_iommu", "q35,txt=on",
+                        test_requires_iommu);
 
     return g_test_run();
 }

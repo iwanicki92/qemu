@@ -538,6 +538,17 @@ void pc_machine_done(Notifier *notifier, void *data)
         cxl_fmws_link_targets(&error_fatal);
     }
 
+    /*
+     * SENTER keeps DMA off the MLE with the VT-d PMRs. The IOMMU is a
+     * -device, so it can be checked for only now.
+     */
+    if (pcms->txt_enabled &&
+        !object_dynamic_cast(OBJECT(x86_iommu_get_default()),
+                             TYPE_INTEL_IOMMU_DEVICE)) {
+        error_report("txt=on requires -device intel-iommu");
+        exit(1);
+    }
+
     /* set the number of CPUs */
     x86_rtc_set_cpus_count(x86ms->rtc, x86ms->boot_cpus);
 

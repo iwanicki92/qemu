@@ -68,6 +68,7 @@ if is_variable('i386_system_qemu')
                           '-fno-stack-protector'],
       'qemu_args': ['-machine', 'q35,txt=on',
                     '-cpu', 'qemu32,smx,sse', '-smp', '2',
+                    '-device', 'intel-iommu',
                     '-chardev',
                     'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
                     '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',

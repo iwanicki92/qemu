@@ -64,7 +64,8 @@ Notes:
   the TPM backend to perform locality-4 measurements outside the
   guest's own TPM driver.
 - Under ``-machine txt=on`` the machine requires a TPM backend
-  (tpm-tis + swtpm); instantiation fails otherwise.
+  (tpm-tis + swtpm) and ``-device intel-iommu``, whose PMRs SENTER
+  programs; instantiation fails otherwise.
 - ``-machine q35,txt=on,txt-vmx-compat=on`` is an explicit single-vCPU
   bring-up option: it advertises ``CPUID.1.ECX.VMX`` only on that TXT
   machine, so real tboot can pass its prelaunch VMX capability check.
@@ -617,8 +618,7 @@ e. Populate ``sinit_mle_data_t`` version and GOOD MDRs from guest
    (``arch/x86/kernel/tboot.c``, ``tboot_get_dmar_table()``, which
    computes ``sinit_mle_data + vtd_dmars_off - sizeof(u64)``).
    Without it such a guest panics with "tboot: Failed to initialize
-   DMAR table".  A guest with no intel-iommu has no DMAR and the
-   fields stay zero.  The remaining hash/policy fields remain zero.
+   DMAR table".  The remaining hash/policy fields remain zero.
 f. The MLE writes ``TXT.MLE_JOIN`` in private MMIO after SENTER;
    GETSEC[WAKEUP] validates that block and its GDT before joining
    every sleeping AP. It is a no-op on a single-vCPU machine.

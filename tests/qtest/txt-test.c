@@ -175,6 +175,20 @@ static void txt_test_public_key(void)
     }
 }
 
+static void txt_test_errorcode_sticky(void)
+{
+    /* An MLE's error code survives the TXT reset it requests */
+    txt_write(TXT_ERRORCODE, 0xc000800c);
+    txt_write(TXT_CMD_RESET, 1);
+    qmp_eventwait("RESET");
+    g_assert_cmphex(txt_read(TXT_ERRORCODE), ==, 0xc000800c);
+
+    /* Any other reset clears it */
+    qobject_unref(qmp("{'execute': 'system_reset'}"));
+    qmp_eventwait("RESET");
+    g_assert_cmphex(txt_read(TXT_ERRORCODE), ==, 0);
+}
+
 static void txt_test_ests_w1c(void)
 {
     /*
@@ -298,9 +312,10 @@ int main(int argc, char **argv)
     qtest_add_func("/txt/test_public_key", txt_test_public_key);
     qtest_add_func("/txt/test_sinit_mle_data", txt_test_sinit_mle_data);
     /*
-     * Registered last: requests a machine reset as a side effect of
-     * testing the ESTS write-one-to-clear path.
+     * Registered last: these reset the machine, the second as a side
+     * effect of testing the ESTS write-one-to-clear path.
      */
+    qtest_add_func("/txt/test_errorcode_sticky", txt_test_errorcode_sticky);
     qtest_add_func("/txt/test_ests_w1c", txt_test_ests_w1c);
 
     ret = g_test_run();

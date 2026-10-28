@@ -49,6 +49,11 @@
 /* vendor-specific registers */
 #define TPM_TIS_REG_DEBUG                 0xf90
 
+/* Locality 4 only: the hash sequence a dynamic launch drives */
+#define TPM_TIS_REG_HASH_END              0x20
+#define TPM_TIS_REG_HASH_DATA             0x24
+#define TPM_TIS_REG_HASH_START            0x28
+
 #define TPM_TIS_STS_TPM_FAMILY_MASK         (0x3 << 26)/* TPM 2.0 */
 #define TPM_TIS_STS_TPM_FAMILY1_2           (0 << 26)  /* TPM 2.0 */
 #define TPM_TIS_STS_TPM_FAMILY2_0           (1 << 26)  /* TPM 2.0 */

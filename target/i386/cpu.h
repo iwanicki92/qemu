@@ -31,6 +31,7 @@
 #include "hw/i386/topology.h"
 #include "qapi/qapi-types-common.h"
 #include "qemu/cpu-float.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "standard-headers/asm-x86/kvm_para.h"
 #include "hw/hyperv/hvgdk_mini.h"
@@ -582,7 +583,18 @@ typedef enum X86Seg {
 
 #define MSR_K7_HWCR                     0xc0010015
 
+#define MSR_VM_CR                       0xc0010114
+#define MSR_VM_CR_DPD                   (1ULL << 0)
+#define MSR_VM_CR_R_INIT                (1ULL << 1)
+#define MSR_VM_CR_DIS_A20M              (1ULL << 2)
+#define MSR_VM_CR_LOCK                  (1ULL << 3)
+#define MSR_VM_CR_SVMDIS                (1ULL << 4)
 #define MSR_VM_HSAVE_PA                 0xc0010117
+
+#define MSR_AMD64_MMIO_CONF_BASE        0xc0010058
+#define MSR_AMD64_MMIO_CONF_ENABLE      (1ULL << 0)
+#define MSR_AMD64_MMIO_CONF_BUS_RANGE   (0xfULL << 2)
+#define MSR_AMD64_MMIO_CONF_BASE_ADDR   0x000ffffffff00000ULL
 
 #define MSR_IA32_XFD                    0x000001c4
 #define MSR_IA32_XFD_ERR                0x000001c5
@@ -1519,6 +1531,7 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define EXCP10_COPR     16
 #define EXCP11_ALGN     17
 #define EXCP12_MCHK     18
+#define EXCP1E_SX       30
 
 #define EXCP_VMEXIT     0x100 /* only for system emulation */
 #define EXCP_SYSCALL    0x101 /* only for user emulation */
@@ -2078,6 +2091,12 @@ typedef struct CPUArchState {
     uint64_t star;
 
     uint64_t vm_hsave;
+    uint64_t mmio_conf_base;
+    uint64_t vm_cr;
+    /* The A20 gate as the chipset set it, reapplied when DIS_A20M clears */
+    bool a20_gate;
+    /* An INIT that arrived with GIF clear, raised again by STGI */
+    bool init_pending;
 
 #ifdef TARGET_X86_64
     uint64_t lstar;
@@ -2142,6 +2161,11 @@ typedef struct CPUArchState {
 
     /* TXT sleep persists across INIT; WAKEUP or machine reset releases it. */
     bool txt_ap_parked;
+    /*
+     * The AP was not halted when SENTER parked it. Only read if that SENTER
+     * fails, before the helper returns, so it is not migrated.
+     */
+    bool txt_ap_was_running;
 
     /* End of state preserved by INIT (dummy marker).  */
     struct {} end_init_save;
@@ -2534,6 +2558,15 @@ struct ArchCPU {
      */
     bool pdcm_on_even_without_pmu;
 
+    /*
+     * Reset value of MSR_AMD64_MMIO_CONF_BASE, since no firmware sets it.
+     * Only a guest write remaps MMCONFIG, so name what firmware mapped.
+     */
+    uint64_t mmio_conf_base;
+
+    /* Reset value of MSR_VM_CR, the bits firmware or a launch left set */
+    uint64_t vm_cr;
+
     /* Number of physical address bits supported */
     uint32_t phys_bits;
 
@@ -2612,6 +2645,19 @@ struct X86CPUClass {
 
 #ifndef CONFIG_USER_ONLY
 extern const VMStateDescription vmstate_x86_cpu;
+
+/*
+ * What the BSP last wrote to MSR_AMD64_MMIO_CONF_BASE, decoded for the
+ * machine that maps MMCONFIG from it. Passed as the notifier's data.
+ */
+typedef struct X86MmioConfBase {
+    bool enable;
+    hwaddr base;
+    uint32_t size;
+} X86MmioConfBase;
+
+void x86_cpu_mmio_conf_base_notifier_add(Notifier *n);
+void x86_cpu_mmio_conf_base_notify(X86CPU *cpu);
 #endif
 
 int x86_cpu_write_elf64_note(WriteCoreDumpFunction f, CPUState *cpu,
@@ -2799,6 +2845,7 @@ static inline bool x86_has_cpuid_0x1f(X86CPU *cpu)
 
 /* helper.c */
 void x86_cpu_set_a20(X86CPU *cpu, int a20_state);
+void x86_cpu_apply_a20(X86CPU *cpu);
 void cpu_sync_avx_hflag(CPUX86State *env);
 
 typedef enum X86ASIdx {

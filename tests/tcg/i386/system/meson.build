@@ -18,23 +18,34 @@ qemu_def_args = ['-display', 'none',
                  '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x4',
                  '-kernel']
 
-# Multi arch tests
-multi_src = []
-foreach t: tcg_tests['multiarch-softmmu']['tests']
-  foreach src, setup: t
-    new_cflags = cflags
-    if fs.stem(src) == 'memory'
-      new_cflags += '-DCHECK_UNALIGNED=1'
-    endif
-    if src not in multi_src
-      setup += {'cflags': [new_cflags]}
-      multi_src += src
-    endif
-    tests += {src: setup + {'qemu_args': qemu_def_args}}
-  endforeach
-endforeach
-
+# The images are 32-bit Multiboot kernels, which qemu-system-x86_64 loads
+# too, so they run on it when qemu-system-i386 is not built
 if 'qemu-system-i386' in emulators
+  i386_system_qemu = emulators['qemu-system-i386']
+elif 'qemu-system-x86_64' in emulators
+  i386_system_qemu = emulators['qemu-system-x86_64']
+endif
+
+# Multi arch tests, on the i386 binary only: they already run under
+# x86_64-softmmu, and their gdbstub tests expect an i386 target
+if 'qemu-system-i386' in emulators
+  multi_src = []
+  foreach t: tcg_tests['multiarch-softmmu']['tests']
+    foreach src, setup: t
+      new_cflags = cflags
+      if fs.stem(src) == 'memory'
+        new_cflags += '-DCHECK_UNALIGNED=1'
+      endif
+      if src not in multi_src
+        setup += {'cflags': [new_cflags]}
+        multi_src += src
+      endif
+      tests += {src: setup + {'qemu_args': qemu_def_args}}
+    endforeach
+  endforeach
+endif
+
+if is_variable('i386_system_qemu')
   # GETSEC/SMX test; smx is not part of any default CPU model.
   # -fno-pie/-Wl,-no-pie: the #UD gate is naked and must keep its
   # entry point on hosts with default-PIE compilers; -fno-stack-protector
@@ -83,6 +94,25 @@ if 'qemu-system-i386' in emulators
     },
   }
 
+  # The platform txt-firmware=on leaves for the kernel SeaBIOS boots.
+  # txt-vmx-compat=on gives the CPU VMX, so QEMU would otherwise hand
+  # SeaBIOS a feature control value to write over the locked MSR.
+  tests += {
+    'test-txt-firmware.c': {
+      'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                          '-fno-stack-protector'],
+      'qemu_args': ['-machine',
+                    'q35,txt=on,txt-firmware=on,txt-vmx-compat=on',
+                    '-cpu', 'qemu32,smx', '-m', '512M',
+                    '-device', 'intel-iommu',
+                    '-chardev',
+                    'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                    '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                    '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+      'wrapper': [run_swtpm_test],
+    },
+  }
+
   # Compile from the same source with a different define. A wrapper .c
   # that #includes the test is not reliably rebuilt by the TCG cross
   # compiler's depfile when the included file changes.
@@ -101,6 +131,23 @@ if 'qemu-system-i386' in emulators
     'wrapper': [run_swtpm_test],
   }}
 
+  # Same SMP launch with an AP that spins instead of halting.
+  tests += {'test-smx-getsec.c': {
+    'exe_name': 'test-smx-getsec-smp-running',
+    'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                        '-fno-stack-protector', '-msse', '-DTEST_TXT_SMP=1',
+                        '-DTEST_TXT_AP_RUNNING=1'],
+    'qemu_args': ['-machine', 'q35,txt=on',
+                  '-cpu', 'qemu32,smx,sse', '-smp', '2',
+                  '-device', 'intel-iommu',
+                  '-device', 'iommu-testdev',
+                  '-chardev',
+                  'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                  '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                  '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+    'wrapper': [run_swtpm_test],
+  }}
+
   # Same source again, negotiating the MONITOR-based RLP wake instead
   # of GETSEC[WAKEUP] through os_sinit_data.capabilities.
   tests += {'test-smx-getsec.c': {
@@ -108,6 +155,25 @@ if 'qemu-system-i386' in emulators
     'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
                         '-fno-stack-protector', '-msse', '-DTEST_TXT_SMP=1',
                         '-DTEST_TXT_MONITOR_WAKE=1'],
+    'qemu_args': ['-machine', 'q35,txt=on',
+                  '-cpu', 'qemu32,smx,sse', '-smp', '2',
+                  '-device', 'intel-iommu',
+                  '-device', 'iommu-testdev',
+                  '-chardev',
+                  'socket,id=tpm0,path=SWTPM_SOCKET_PLACEHOLDER',
+                  '-tpmdev', 'emulator,id=tpm0,chardev=tpm0',
+                  '-device', 'tpm-tis,tpmdev=tpm0'] + qemu_def_args,
+    'wrapper': [run_swtpm_test],
+  }}
+
+  # MONITOR wake followed at once by GETSEC[WAKEUP], while the RLP's
+  # join may still be pending.
+  tests += {'test-smx-getsec.c': {
+    'exe_name': 'test-smx-getsec-wake-twice',
+    'cflags': cflags + ['-fno-pie', '-Wl,-no-pie',
+                        '-fno-stack-protector', '-msse', '-DTEST_TXT_SMP=1',
+                        '-DTEST_TXT_MONITOR_WAKE=1',
+                        '-DTEST_TXT_WAKE_TWICE=1'],
     'qemu_args': ['-machine', 'q35,txt=on',
                   '-cpu', 'qemu32,smx,sse', '-smp', '2',
                   '-device', 'intel-iommu',
@@ -162,7 +228,7 @@ if 'qemu-system-i386' in emulators
       'cc_docker_host_arch': cc_docker_host_arch,
       'folder': 'i386/system',
       'gdb_arch': 'i386',
-      'qemu': emulators['qemu-system-i386'],
+      'qemu': i386_system_qemu,
       'tests': tests,
     }
   }

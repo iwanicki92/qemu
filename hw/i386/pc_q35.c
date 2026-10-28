@@ -38,6 +38,7 @@
 #include "system/tcg.h"
 #include "system/kvm.h"
 #include "hw/i386/kvm/clock.h"
+#include "hw/pci-host/amd_nb.h"
 #include "hw/pci-host/q35.h"
 #include "hw/pci/pcie_port.h"
 #include "hw/core/qdev-properties.h"
@@ -47,6 +48,8 @@
 #include "hw/dma/i8257.h"
 #include "hw/core/sysbus.h"
 #include "hw/i386/amd_iommu.h"
+#include "monitor/qdev.h"
+#include "qom/compat-properties.h"
 #include "hw/i386/intel_iommu.h"
 #include "hw/vfio/types.h"
 #include "hw/virtio/virtio-iommu.h"
@@ -66,6 +69,7 @@
 #include "hw/mem/nvdimm.h"
 #include "hw/uefi/var-service-api.h"
 #include "hw/i386/acpi-build.h"
+#include "hw/i386/amd_drtm.h"
 #include "target/i386/cpu.h"
 
 #ifdef CONFIG_TPM
@@ -139,6 +143,44 @@ static int ehci_create_ich9_with_companions(PCIBus *bus, int slot)
     return 0;
 }
 
+/* MSR_AMD64_MMIO_CONF_BASE maps MMCONFIG the way PCIEXBAR does */
+static void pc_q35_mmio_conf_base(Notifier *n, void *data)
+{
+    Q35PCIHost *phb = container_of(n, Q35PCIHost, mmio_conf_notifier);
+    X86MmioConfBase *conf = data;
+
+    mch_mmcfg_msr_update(&phb->mch, conf->enable, conf->base, conf->size);
+}
+
+/*
+ * The devices an AMD dynamic launch needs, as amd-drtm=on creates them:
+ * the launch record, the northbridge SKL releases SL_DEV through, and an
+ * IOMMU at 00:00.2 that firmware left enabled. Each works standalone too.
+ */
+static void pc_q35_amd_drtm_init(PCMachineState *pcms)
+{
+    PCIDevice *iommu_pci;
+    DeviceState *iommu;
+
+    sysbus_create_simple(TYPE_AMD_DRTM_PLATFORM, -1, NULL);
+    pci_create_simple(pcms->pcibus, AMD_NB_DEVFN, TYPE_AMD_NB);
+
+    iommu_pci = pci_new(PCI_DEVFN(0, 2), TYPE_AMD_IOMMU_PCI);
+    qdev_set_id(DEVICE(iommu_pci), g_strdup("amd-drtm-iommu"), &error_fatal);
+    pci_realize_and_unref(iommu_pci, pcms->pcibus, &error_fatal);
+
+    iommu = qdev_new(TYPE_AMD_IOMMU_DEVICE);
+    qdev_prop_set_string(iommu, "pci-id", "amd-drtm-iommu");
+    qdev_prop_set_bit(iommu, "firmware-enabled", true);
+    /*
+     * Translate rather than pass DMA through: an OS that builds a
+     * translated domain for its disk, as Linux does, gets nothing back
+     * from it otherwise.
+     */
+    qdev_prop_set_bit(iommu, "dma-remap", true);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(iommu), &error_fatal);
+}
+
 /* PC hardware initialisation */
 static void pc_q35_init(MachineState *machine)
 {
@@ -172,6 +214,10 @@ static void pc_q35_init(MachineState *machine)
         (!pcms->txt_enabled || machine->smp.max_cpus != 1)) {
         error_report("txt-vmx-compat=on requires txt=on and exactly "
                      "one possible vCPU");
+        exit(1);
+    }
+    if (pcms->txt_firmware && !pcms->txt_enabled) {
+        error_report("txt-firmware=on requires txt=on");
         exit(1);
     }
 
@@ -215,6 +261,9 @@ static void pc_q35_init(MachineState *machine)
     }
 
     pc_machine_init_sgx_epc(pcms);
+    if (pcms->amd_drtm_enabled) {
+        object_register_sugar_prop(TYPE_X86_CPU, "skinit", "on", true);
+    }
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
 
     if (kvm_enabled()) {
@@ -227,6 +276,17 @@ static void pc_q35_init(MachineState *machine)
     pci_hole64_size = object_property_get_uint(phb,
                                                PCI_HOST_PROP_PCI_HOLE64_SIZE,
                                                &error_abort);
+
+    if (pcms->txt_firmware) {
+        Object *mch = object_resolve_path_component(phb, "mch");
+        uint64_t tseg = object_property_get_uint(mch, "extended-tseg-mbytes",
+                                                 &error_abort) * MiB;
+
+        /* Firmware picks the TSEG size, 8 MiB is the largest fixed one */
+        pcms->txt_dpr_base = intel_txt_fw_dpr_base(x86ms->below_4g_mem_size,
+                                                   MAX(tseg, 8 * MiB),
+                                                   &error_fatal);
+    }
 
     /* allocate ram and load rom/bios */
     memory_region_init(pci_memory, NULL, "pci", UINT64_MAX);
@@ -249,7 +309,17 @@ static void pc_q35_init(MachineState *machine)
                              pcms->default_bus_bypass_iommu, NULL);
     object_property_set_bool(phb, PCI_HOST_PROP_SMM_RANGES,
                              x86_machine_is_smm_enabled(x86ms), NULL);
+    if (pcms->amd_drtm_enabled) {
+        object_property_set_bool(phb, "mch-multifunction", true, &error_abort);
+        object_property_set_bool(phb, PCI_HOST_CF8_EXTENDED_CONFIG, true,
+                                 &error_abort);
+        object_property_set_bool(OBJECT(&Q35_HOST_DEVICE(phb)->mch), "smn",
+                                 true, &error_abort);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(phb), &error_fatal);
+    Q35_HOST_DEVICE(phb)->mmio_conf_notifier.notify = pc_q35_mmio_conf_base;
+    x86_cpu_mmio_conf_base_notifier_add(
+        &Q35_HOST_DEVICE(phb)->mmio_conf_notifier);
 
     /* pci */
     pcms->pcibus = PCI_BUS(qdev_get_child_bus(DEVICE(phb), "pcie.0"));
@@ -374,6 +444,8 @@ static void pc_q35_init(MachineState *machine)
             DeviceState *txt = qdev_new(TYPE_INTEL_TXT);
             CPUState *cs;
 
+            qdev_prop_set_uint64(txt, "firmware-dpr-base",
+                                 pcms->txt_dpr_base);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(txt), &error_fatal);
 
             /* The Q35 ISA DMA controller bypasses the PCI VT-d path. */
@@ -425,6 +497,10 @@ static void pc_q35_init(MachineState *machine)
                                x86_nvdimm_acpi_dsmio,
                                x86ms->fw_cfg, OBJECT(pcms));
     }
+
+    if (pcms->amd_drtm_enabled) {
+        pc_q35_amd_drtm_init(pcms);
+    }
 }
 
 static bool pc_q35_machine_get_txt(Object *o, Error **errp)
@@ -450,6 +526,17 @@ static void pc_q35_machine_set_txt_vmx_compat(Object *o, bool value,
     PC_MACHINE(o)->txt_vmx_compat = value;
 }
 
+static bool pc_q35_machine_get_txt_firmware(Object *o, Error **errp)
+{
+    return PC_MACHINE(o)->txt_firmware;
+}
+
+static void pc_q35_machine_set_txt_firmware(Object *o, bool value,
+                                             Error **errp)
+{
+    PC_MACHINE(o)->txt_firmware = value;
+}
+
 static bool pc_q35_machine_get_wdat(Object *o, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(o);
@@ -460,6 +547,18 @@ static void pc_q35_machine_set_wdat(Object *o, bool value, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(o);
     pcms->wdat_enabled = value;
+}
+
+static bool pc_q35_machine_get_amd_drtm(Object *o, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(o);
+    return pcms->amd_drtm_enabled;
+}
+
+static void pc_q35_machine_set_amd_drtm(Object *o, bool value, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(o);
+    pcms->amd_drtm_enabled = value;
 }
 
 #define DEFINE_Q35_MACHINE(major, minor) \
@@ -493,6 +592,7 @@ static void pc_q35_machine_options(MachineClass *m)
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_RAMFB_DEVICE);
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_VMBUS_BRIDGE);
     machine_class_allow_dynamic_sysbus_dev(m, TYPE_UEFI_VARS_X64);
+    machine_class_allow_dynamic_sysbus_dev(m, TYPE_AMD_DRTM_PLATFORM);
     object_class_property_add_bool(oc, "wdat",
         pc_q35_machine_get_wdat, pc_q35_machine_set_wdat);
     object_class_property_set_description(oc, "wdat",
@@ -508,6 +608,22 @@ static void pc_q35_machine_options(MachineClass *m)
     object_class_property_set_description(oc, "txt-vmx-compat",
         "Advertise VMX for single-vCPU TXT integration only; VMX "
         "instructions are not implemented by TCG. Default: off");
+    object_class_property_add_bool(oc, "txt-firmware",
+        pc_q35_machine_get_txt_firmware,
+        pc_q35_machine_set_txt_firmware);
+    object_class_property_set_description(oc, "txt-firmware",
+        "Set the platform up as TXT firmware would on every reset: lock "
+        "IA32_FEATURE_CONTROL with SENTER enabled, reserve and lock a "
+        "DPR, fill the TXT heap's BIOS data and place a SINIT ACM, which "
+        "QEMU makes and does not sign. Needs txt=on. Default: off");
+
+    object_class_property_add_bool(oc, "amd-drtm",
+        pc_q35_machine_get_amd_drtm, pc_q35_machine_set_amd_drtm);
+    object_class_property_set_description(oc, "amd-drtm",
+        "Add what an AMD dynamic launch needs: the skinit feature, the "
+        "amd-drtm-platform, amd-nb at 00:18.0, an enabled amd-iommu at "
+        "00:00.2, the AMD routes to their registers and the SMN pair "
+        "that finds an amd-psp. Default: off");
 
     compat_props_add(m->compat_props,
                      pc_q35_compat_defaults, pc_q35_compat_defaults_len);

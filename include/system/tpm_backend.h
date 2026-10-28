@@ -103,6 +103,7 @@ struct TPMBackendClass {
      * makes the whole sequence a silent no-op on at least swtpm: the
      * commands still succeed but no PCR changes, so callers must not
      * treat a zero return as proof that a measurement landed.
+     * hash_start returns -ENOTSUP when the TPM has no hash sequence.
      */
     int (*hash_start)(TPMBackend *t, uint8_t locty, Error **errp);
     int (*hash_data)(TPMBackend *t, const uint8_t *data, size_t len,
@@ -178,6 +179,20 @@ void tpm_backend_deliver_request(TPMBackend *s, TPMBackendCmd *cmd);
  * made outside the BQL can be stale by the time it is acted on.
  */
 bool tpm_backend_request_pending(TPMBackend *s);
+
+/**
+ * tpm_backend_run_sync:
+ * @s: the backend
+ * @cmd: the command to run
+ *
+ * Run a command in the caller's thread and return once its response is
+ * in @cmd->out, after any request in flight has completed. For the
+ * agents beside the processor that need the answer before they go on.
+ * Only the main loop may call this, since the wait polls its context.
+ *
+ * Returns 0, or a negative errno when the backend could not run it.
+ */
+int tpm_backend_run_sync(TPMBackend *s, TPMBackendCmd *cmd);
 
 /**
  * tpm_backend_reset:
@@ -289,6 +304,33 @@ int tpm_backend_hash_sequence(TPMBackend *s, const uint8_t *data, size_t len,
  * command interface.
  */
 bool tpm_backend_has_hash_sequence(TPMBackend *s);
+
+/**
+ * tpm_backend_hash_image:
+ * @s: the backend
+ * @data: the image to measure
+ * @len: its length in bytes
+ *
+ * Run the locality 4 hash sequence over @data: PCRs 17 to 22 reset,
+ * PCR 17 extended with the image digest in every active bank. No guest
+ * command may be in flight.
+ *
+ * Returns 0 on success, -ENOTSUP if the backend has no locality 4 path,
+ * -EBUSY with a command in flight, or another negative errno.
+ */
+int tpm_backend_hash_image(TPMBackend *s, const uint8_t *data, size_t len);
+
+/*
+ * The same sequence one signal at a time, for a frontend that receives it
+ * as register writes. hash_start returns -ENOTSUP without a locality 4
+ * path and -EBUSY with a guest command in flight. hash_data takes any
+ * length, a frontend buffers TPM_BACKEND_HASH_CHUNK bytes per call.
+ */
+#define TPM_BACKEND_HASH_CHUNK 4096
+
+int tpm_backend_hash_start(TPMBackend *s);
+int tpm_backend_hash_data(TPMBackend *s, const uint8_t *data, size_t len);
+int tpm_backend_hash_end(TPMBackend *s);
 
 TPMBackend *qemu_find_tpm_be(const char *id);
 TPMBackend *qemu_find_tpm_be_any(void);

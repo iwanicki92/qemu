@@ -175,13 +175,11 @@ FWCfgState *fw_cfg_arch_create(MachineState *ms,
     return fw_cfg;
 }
 
-void fw_cfg_build_feature_control(MachineState *ms, FWCfgState *fw_cfg)
+uint64_t fw_cfg_feature_control_bits(X86CPU *cpu)
 {
-    X86CPU *cpu = X86_CPU(ms->possible_cpus->cpus[0].cpu);
     CPUX86State *env = &cpu->env;
     uint32_t unused, ebx, ecx, edx;
     uint64_t feature_control_bits = 0;
-    uint64_t *val;
 
     cpu_x86_cpuid(env, 1, 0, &unused, &unused, &ecx, &edx);
 
@@ -210,6 +208,15 @@ void fw_cfg_build_feature_control(MachineState *ms, FWCfgState *fw_cfg)
             feature_control_bits |= FEATURE_CONTROL_SGX_LC;
         }
     }
+
+    return feature_control_bits;
+}
+
+void fw_cfg_build_feature_control(MachineState *ms, FWCfgState *fw_cfg)
+{
+    X86CPU *cpu = X86_CPU(ms->possible_cpus->cpus[0].cpu);
+    uint64_t feature_control_bits = fw_cfg_feature_control_bits(cpu);
+    uint64_t *val;
 
     if (!feature_control_bits) {
         return;

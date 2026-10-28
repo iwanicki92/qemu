@@ -49,6 +49,8 @@ typedef struct TPMTestState {
     enum TPMVersion tpm_version;
 } TPMTestState;
 
+extern uint64_t tpm_emu_caps;
+
 void tpm_emu_test_wait_cond(TPMTestState *s);
 void *tpm_emu_ctrl_thread(void *data);
 bool tpm_model_is_available(const char *args, const char *tpm_if);

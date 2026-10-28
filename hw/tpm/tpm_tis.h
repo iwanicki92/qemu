@@ -77,6 +77,37 @@ typedef struct TPMState {
 
     TPMPPI ppi;
     bool ppi_enabled;
+
+    /*
+     * The locality 4 registers, for software standing in for the
+     * processor's own hash. A sequence in flight does not migrate.
+     */
+    bool locality4;
+    /*
+     * Drop the locality 4 hash, the processor's or software's, while
+     * locality 0 is active, as a discrete TPM seen on hardware does.
+     */
+    bool locality0_drops_hash;
+    bool hash_active;
+    uint16_t hash_len;
+    uint8_t hash_buf[TPM_BACKEND_HASH_CHUNK];
+
+    /*
+     * The localities a firmware agent keeps the processor out of, one
+     * bit each. Only that agent changes it, at its own reset, so the
+     * interface's reset leaves it alone and it does not migrate.
+     */
+    uint8_t locked;
+
+    /*
+     * A FIFO that moves burst_limit bytes at most, then shows a burst
+     * count of 0 once before the next burst, as a FIFO TPM refilling does.
+     * A byte past the burst still moves, where hardware would wait. 0
+     * turns it off. burst_left does not migrate, a stale value only
+     * changes where the next burst ends.
+     */
+    uint16_t burst_limit;
+    uint16_t burst_left;
 } TPMState;
 
 extern const VMStateDescription vmstate_locty;
@@ -89,5 +120,9 @@ void tpm_tis_request_completed(TPMState *s, int ret);
 uint32_t tpm_tis_read_data(TPMState *s, hwaddr addr, unsigned size);
 void tpm_tis_write_data(TPMState *s, hwaddr addr, uint64_t val, uint32_t size);
 uint16_t tpm_tis_get_checksum(TPMState *s);
+int tpm_tis_hash_image(TPMState *s, const uint8_t *data, size_t len);
+int tpm_tis_run_command(TPMState *s, uint8_t locty, const uint8_t *in,
+                        size_t in_len, uint8_t *out, size_t out_len);
+void tpm_tis_set_locality_locks(TPMState *s, uint8_t locked);
 
 #endif /* TPM_TPM_TIS_H */

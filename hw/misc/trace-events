@@ -460,3 +460,31 @@ launch_update_write(void) ""
 vmlaunch_reset_enter(void) ""
 vm_launchupdate_finalize(void) ""
 restore_host_x86_igvm(void) ""
+
+# amd_fch_pmio.c
+amd_fch_pmio_read(uint64_t offset, unsigned size, uint64_t value) "offset 0x%" PRIx64 " size %u value 0x%" PRIx64
+amd_fch_pmio_write(uint64_t offset, unsigned size, uint64_t value) "offset 0x%" PRIx64 " size %u value 0x%" PRIx64
+
+# isa_post_code.c
+isa_post_code_write(uint64_t port, unsigned size, uint64_t value) "port 0x%" PRIx64 " size %u value 0x%" PRIx64
+
+# amd_psp.c
+amd_psp_drtm_kick(void) ""
+amd_psp_drtm_command(uint8_t cmd, uint8_t index, uint32_t arg0, uint32_t arg1, uint32_t arg2) "command 0x%x index %u args 0x%x 0x%x 0x%x"
+amd_psp_drtm_status(uint8_t cmd, uint16_t status) "command 0x%x status 0x%x"
+amd_psp_drtm_ready_held(uint32_t ms) "ready bit held for %u ms"
+amd_psp_drtm_tmr_setup(uint8_t index, uint64_t base, uint64_t len) "TMR %u base 0x%" PRIx64 " len 0x%" PRIx64
+amd_psp_drtm_tmr_release(uint8_t index, uint64_t base, uint64_t len) "TMR %u base 0x%" PRIx64 " len 0x%" PRIx64
+amd_psp_drtm_reset(void) ""
+amd_psp_drtm_launch_failed(const char *why) "%s"
+amd_psp_drtm_launch_ok(uint64_t base, uint32_t length, uint32_t sec_patch_level) "SLB 0x%" PRIx64 " measured 0x%x SecPatchLevel %u"
+amd_psp_drtm_signature(int result) "result %d"
+amd_psp_drtm_soc_flags(uint32_t cpu, uint32_t count, bool match) "cpu 0x%x in a list of %u: %d"
+amd_psp_drtm_pcr_read(unsigned pcr, const char *digest) "PCR %u = %s"
+amd_psp_drtm_pcr_extend(unsigned pcr, const char *digest) "PCR %u extended with %s"
+amd_psp_drtm_locks(uint8_t locked) "locked localities mask 0x%x"
+amd_psp_drtm_extend_ossl_digest(uint64_t base, uint64_t size, const char *digest) "base 0x%" PRIx64 " size 0x%" PRIx64 " hash %s"
+amd_psp_drtm_tpm_locality_access(void) ""
+amd_psp_drtm_log_event(unsigned pcr, uint16_t type, uint32_t len) "PCR %u type 0x%x with %u bytes of event data"
+amd_psp_drtm_get_tcg_logs(uint64_t base, uint32_t len) "log at 0x%" PRIx64 " of %u bytes"
+amd_psp_drtm_region(const char *what, uint64_t base, uint32_t len) "%s at 0x%" PRIx64 " of %u bytes"

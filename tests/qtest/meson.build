@@ -96,7 +96,11 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['tpm-tis-test'] : []) +              \
   (config_all_devices.has_key('CONFIG_Q35') and                                        \
    config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['txt-test'] : []) +               \
+  (config_all_devices.has_key('CONFIG_Q35') and                                        \
+   config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['txt-firmware-test'] : []) +      \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['tpm-tis-swtpm-test'] : []) +        \
+  (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') and                                     \
+   config_all_devices.has_key('CONFIG_AMD_DRTM') ? ['tpm-drtm-swtpm-test'] : []) +          \
   (config_all_devices.has_key('CONFIG_RTL8139_PCI') ? ['rtl8139-test'] : []) +              \
   (config_all_devices.has_key('CONFIG_E1000E_PCI_EXPRESS') ? ['fuzz-e1000e-test'] : []) +   \
   (config_all_devices.has_key('CONFIG_MEGASAS_SCSI_PCI') ? ['fuzz-megasas-test'] : []) +    \
@@ -108,6 +112,12 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_SDHCI_PCI') ? ['fuzz-sdcard-test'] : []) +            \
   (config_all_devices.has_key('CONFIG_ESP_PCI') ? ['am53c974-test'] : []) +                 \
   (config_all_devices.has_key('CONFIG_AMD_IOMMU') ? ['amd-iommu-test'] : []) +             \
+  (config_all_devices.has_key('CONFIG_AMD_DRTM') ? ['amd-drtm-test'] : []) +               \
+  (config_all_devices.has_key('CONFIG_AMD_NB') ? ['amd-nb-test'] : []) +                   \
+  (config_all_devices.has_key('CONFIG_AMD_FCH_PMIO') ? ['amd-fch-pmio-test'] : []) +     \
+  (config_all_devices.has_key('CONFIG_ISA_POST_CODE') ? ['isa-post-code-test'] : []) +   \
+  (config_all_devices.has_key('CONFIG_AMD_PSP') and                                         \
+   config_all_devices.has_key('CONFIG_AMD_DRTM') ? ['amd-psp-drtm-test'] : []) +           \
   (config_all_devices.has_key('CONFIG_VTD') ? ['intel-iommu-test'] : []) +                 \
   (config_all_devices.has_key('CONFIG_VTD') and
    config_all_devices.has_key('CONFIG_IOMMU_TESTDEV') ? ['iommu-intel-test', 'iommu-intel-inv-test', 'iommu-intel-pmr-test'] : []) + \
@@ -430,9 +440,13 @@ qtests = {
   'qos-test': [chardev, io, qos_test_ss.apply({}).sources()],
   'tpm-crb-swtpm-test': [io, tpmemu_files],
   'tpm-crb-test': [io, tpmemu_files],
+  'amd-drtm-test': [io, 'tpm-emu.c'],
+  'amd-psp-drtm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
+  'tpm-drtm-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'tpm-tis-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'tpm-tis-test': [io, tpmemu_files, 'tpm-tis-util.c'],
   'txt-test': [io, tpmemu_files],
+  'txt-firmware-test': [io, tpmemu_files],
   'tpm-tis-i2c-test': [io, tpmemu_files, 'tpm-tis-i2c-util.c', 'qtest_aspeed.c'],
   'tpm-tis-i2c-swtpm-test': [io, tpmemu_files, 'tpm-tis-i2c-util.c', 'qtest_aspeed.c'],
   'tpm-tis-device-swtpm-test': [io, tpmemu_files, 'tpm-tis-util.c'],

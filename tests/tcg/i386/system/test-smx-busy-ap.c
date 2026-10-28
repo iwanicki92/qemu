@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Reject SENTER before measuring anything when an AP is running.
- * The AP executes a real-mode SIPI trampoline that increments a byte
- * in RAM forever. A rejected SENTER must leave it running.
+ * SENTER parks an AP that is not halted as well as a halted one, and a
+ * launch that fails its checks must resume it. The AP executes a real-mode SIPI
+ * trampoline that increments a byte in RAM forever.
  */
 #include <stdint.h>
 
@@ -65,7 +65,8 @@ int main(void)
     asm volatile("mov %0, %%cr4" : : "r"(cr4));
     asm volatile(".byte 0x0f, 0x37" : : "a"(4), "b"(0), "c"(0), "d"(0)
                  : "memory");
-    if ((*sts & 1u) || *error != TXT_APS_UNSUPPORTED) {
+    /* No ACM: the launch fails its checks, not the AP rendezvous */
+    if ((*sts & 1u) || *error == 0 || *error == TXT_APS_UNSUPPORTED) {
         fail(2);
     }
     before = *counter;

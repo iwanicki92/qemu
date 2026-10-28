@@ -52,6 +52,43 @@ tests += {
   }
 }
 
+tests += {
+  # A launchable AMD machine: the skinit bit, the launch record, an AP to
+  # park
+  'skinit.c': {
+    'cflags': cflags,
+    'qemu_args': ['-machine', 'q35', '-cpu', 'max,+skinit', '-smp', '2',
+                  '-device', 'amd-drtm-platform'] + qemu_def_args,
+  },
+  # The MSR maps MMCONFIG on the q35 host only
+  'mmio-conf.c': {
+    'cflags': cflags,
+    'qemu_args': ['-machine', 'q35'] + qemu_def_args,
+  },
+  # SVM for the MSR to exist, and the value firmware that disables SVM leaves
+  'vm-cr-preset.c': {
+    'cflags': cflags,
+    'qemu_args': ['-cpu', 'max,vm-cr=0x18'] + qemu_def_args,
+  },
+  # max is an AMD CPU under TCG, and no AMD CPU has SMX
+  'cpuid-smx.c': {
+    'cflags': cflags,
+    'qemu_args': ['-cpu', 'max'] + qemu_def_args,
+  },
+}
+
+# The same source where SMX belongs: an Intel max, and +smx asked for
+tests += {'cpuid-smx.c': {
+  'exe_name': 'cpuid-smx-intel',
+  'cflags': cflags + ['-DEXPECT_SMX=1'],
+  'qemu_args': ['-cpu', 'max,vendor=GenuineIntel'] + qemu_def_args,
+}}
+tests += {'cpuid-smx.c': {
+  'exe_name': 'cpuid-smx-requested',
+  'cflags': cflags + ['-DEXPECT_SMX=1'],
+  'qemu_args': ['-cpu', 'max,+smx'] + qemu_def_args,
+}}
+
 if 'qemu-system-x86_64' in emulators
   tcg_tests += {
     'x86_64-softmmu': {

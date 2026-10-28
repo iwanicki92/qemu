@@ -12,6 +12,7 @@
 #include "hw/core/boards.h"
 #include "hw/i386/pc.h"
 #include "hw/nvram/fw_cfg.h"
+#include "target/i386/cpu-qom.h"
 
 #define FW_CFG_IO_BASE     0x510
 
@@ -25,6 +26,8 @@ FWCfgState *fw_cfg_arch_create(MachineState *ms,
                                uint16_t apic_id_limit);
 void fw_cfg_build_smbios(PCMachineState *pcms, FWCfgState *fw_cfg,
                          SmbiosEntryPointType ep_type);
+/* IA32_FEATURE_CONTROL bits the firmware sets for this CPU, unlocked */
+uint64_t fw_cfg_feature_control_bits(X86CPU *cpu);
 void fw_cfg_build_feature_control(MachineState *ms, FWCfgState *fw_cfg);
 void fw_cfg_add_acpi_dsdt(Aml *scope, FWCfgState *fw_cfg);
 void fw_cfg_add_e820(FWCfgState *fw_cfg);

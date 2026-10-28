@@ -71,6 +71,32 @@ Notes:
   TCG **does not execute VMX instructions**. The option rejects
   ``txt=off``, more than one possible vCPU, or a CPU without SMX; it
   is unsafe for general guest use. Default: off.
+- ``-machine q35,txt=on,txt-firmware=on`` leaves the platform as TXT
+  firmware would, at power-on and after every reset, so firmware with
+  no TXT support (SeaBIOS, OVMF without SMM, coreboot without its TXT
+  code) boots a TXT launch unchanged:
+
+  - ``IA32_FEATURE_CONTROL`` on every vCPU is ``0xff03``: locked,
+    VMX inside SMX, every SENTER function enabled, plus the bits QEMU
+    otherwise hands the firmware in ``etc/msr_feature_control``, which
+    it then leaves out.
+  - A 4 MiB DPR, locked, below TSEG with 32 MiB of RAM between them
+    for the firmware's own use (coreboot puts CBMEM there). The e820
+    table lists it as reserved between two RAM entries.
+  - The SINIT slot at DPR + 2 MiB (256 KiB) and the heap at
+    DPR + 3 MiB (1 MiB), in ``TXT.SINIT.BASE``/``SIZE`` and
+    ``TXT.HEAP_BASE``/``SIZE``.
+  - A version 6 ``bios_data_t`` with ``bios_sinit_size`` set and an
+    END element, so a loader uses the ACM in the slot.
+  - In the slot, a 32 KiB SINIT ACM QEMU makes: a header, a version 3
+    info table (OS-to-SINIT data version 7, both RLP wake methods,
+    TPM 2.0 event log format) and a chipset id list matching
+    ``TXT.DIDVID``. It holds no code and no signature.
+
+  Needs ``-device intel-iommu`` to lock the DPR, and at least 356 MiB
+  of RAM below 4 GiB with the default 64 MiB TSEG. OVMF built with SMM
+  takes the RAM below the DPR as all of low memory and misplaces TSEG.
+  Default: off.
 
 TXT public config register map
 ===============================
@@ -92,7 +118,8 @@ Off   Name                      Access        Semantics (QEMU)
 0x030 TXT.ERRORCODE             RO/RW         ACM error code (details below).
 0x038 TXT.CMD_RESET             WO            Write 1: perform a full platform reset
                                               (machine reset, like SINIT
-                                              ``ACMINPUT_RESET``).
+                                              ``ACMINPUT_RESET``). TXT.ERRORCODE
+                                              survives it.
 0x048 TXT.CMD_CLOSE_PRIVATE     WO            Write: close private config space (sets
                                               ``STS.private_open`` = 0).
 0x0A0 TXT.SPAD                  RO/RW         Scratchpad / ACM status (modern platforms;
@@ -171,7 +198,9 @@ TXT.ERRORCODE (ACMERROR) layout (coreboot)::
   [ 3: 0] TYPE_CODE (0 = BIOS ACM, 1 = SINIT ACM)
 
 On reset TXT.ERRORCODE reads 0 (bit 31 VALID clear = no error
-recorded; coreboot/tboot parse 0 as "no error"). DRTM PCRs 17-22
+recorded; coreboot/tboot parse 0 as "no error"), except after a
+reset requested through TXT.CMD_RESET, which keeps the code an MLE
+wrote before it. DRTM PCRs 17-22
 read all-ones before any launch; a successful SENTER resets them
 to zero and extends its measurements.
 
@@ -197,7 +226,7 @@ TYPE_CODE = 1 (SINIT ACM); the reason is the PROGRESS_CODE):
   |             |                        | header, malformed or out-of-bounds info table, or a chipset    |
   |             |                        | id list that does not cover TXT.DIDVID.                        |
   +-------------+------------------------+----------------------------------------------------------------+
-  | 0x80070001  | APS_UNSUPPORTED        | An AP was not halted or could not enter TXT sleep              |
+  | 0x80070001  | APS_UNSUPPORTED        | An AP was in SMM or already in TXT sleep                       |
   +-------------+------------------------+----------------------------------------------------------------+
   | 0x80080001  | PMR_INVALID            | VT-d PMR fields invalid, or an MLE page not protected          |
   +-------------+------------------------+----------------------------------------------------------------+
@@ -214,8 +243,10 @@ its function; the device implements:
   (some loaders poke private registers during bring-up debugging),
 - after launch, reads return all ones when private space is closed,
   including after SEXIT; public config remains accessible,
-- writes ignored except ``TXT.MLE_JOIN`` when ``STS.SENTER_DONE`` and
-  ``STS.PRIVATE_OPEN`` are both set (the MLE publishes its AP entry),
+- writes ignored except ``TXT.MLE_JOIN``, ``TXT.ERRORCODE``,
+  ``TXT.CMD_NO_SECRETS`` and ``TXT.CMD_RESET`` when ``STS.SENTER_DONE``
+  and ``STS.PRIVATE_OPEN`` are both set (the MLE publishes its AP
+  entry, and performs a TXT reset with a sticky error code),
 - ``TXT.CMD_CLOSE_PRIVATE`` closes it.
 
 DPR — DMA Protected Range
@@ -410,9 +441,10 @@ on an advertisement it does not control:
   (0xfed302a0) in ``sinit_mle_data.rlp_wakeup_addr``.  The MLE's
   ordinary 32-bit store of a nonzero value to that address traps into
   the chipset model, which validates ``TXT.MLE_JOIN`` exactly as
-  GETSEC[WAKEUP] does and joins every parked RLP.  A zero store, an
-  unlaunched environment, or a launch that did not negotiate MONITOR
-  wake leaves the RLPs parked.
+  GETSEC[WAKEUP] does and joins every parked RLP.  The store returns
+  before the RLPs have joined: the MLE waits for them itself.  A zero
+  store, an unlaunched environment, or a launch that did not negotiate
+  MONITOR wake leaves the RLPs parked.
 
   On real hardware ``rlp_wakeup_addr`` is a platform-specific
   location chosen by the ACM; pointing it at an otherwise reserved
@@ -465,9 +497,13 @@ parking strategies have very different requirements:
 The original single-vCPU path uses tboot's default VMX option, with
 ``txt-vmx-compat=on`` for its capability check only. The SMP path uses
 ``ap_wake_mwait=true`` and a CPU exposing ``monitor``; it does **not**
-advertise VMX instructions TCG cannot execute. SENTER requires every
-AP to be halted, rendezvouses with each vCPU and parks it before PCR
-measurement. Failed launches release the APs parked by that attempt.
+advertise VMX instructions TCG cannot execute. SENTER rendezvouses
+with each vCPU and parks it before PCR measurement. The SDM has software
+leave the other processors "in an idle loop, or asleep (such as after
+executing HLT)", which the hardware does not check, so a vCPU that is
+not halted is parked too (edk2 idles its APs in MWAIT). Failed launches
+release the APs parked by that attempt, and one that was not halted
+resumes.
 GETSEC[WAKEUP] transfers them to the validated join entry.
 
 Semantic measured launch (GETSEC[SENTER])
@@ -600,8 +636,8 @@ h. Set ``STS.SENTER_DONE``, ``STS.MEM_CONFIG_LOCK``.  Private space
    stays **open**: the MLE runs with it open and closes it itself
    (see below).
 i. Transfer BSP control to the MLE entry point (see below). APs were
-   halted and put into TXT sleep before measurement; a running AP
-   rejects the launch rather than executing outside the MLE.
+   put into TXT sleep before measurement, halted or not, so none
+   executes outside the MLE.
 
 SMI inhibition
 --------------
@@ -627,12 +663,12 @@ from its own teardown path via ``CMD_CLOSE_PRIVATE``
 open from reset, stays open across SENTER for the MLE's use, and is
 closed by the MLE or by a TXT reset.
 
-Current implementation: SENTER parks each halted AP on its own thread,
+Current implementation: SENTER parks each AP on its own thread,
 checks the launch inputs, measures the SINIT ACM and MLE, writes the
 SINIT-MLE heap section, sets the SENTER_DONE / MEM_CONFIG_LOCK /
 PRIVATE_OPEN status bits, and transfers BSP execution to the physical
-MLE entry with paging off. An AP that is still executing causes a
-pre-measure rejection; a failed launch rolls back the newly parked APs.
+MLE entry with paging off. An AP in SMM causes a pre-measure
+rejection; a failed launch rolls back the newly parked APs.
 The SINIT measurement uses the TIS ``_TPM_Hash_Start`` /
 ``_TPM_Hash_Data`` / ``_TPM_Hash_End`` signal sequence at locality 4.
 ``_TPM_Hash_Start`` resets the DRTM PCRs and ``_TPM_Hash_End`` extends
@@ -873,7 +909,7 @@ Deviations from real hardware
    own event types and its records match the extends exactly, but it
    covers only the events this model has inputs for; see *TPM event
    log* above for what is measured and what is deliberately absent.
-7. SMP APs must already be halted at SENTER. Both GETSEC[WAKEUP] and
+7. SMP APs must not be in SMM at SENTER. Both GETSEC[WAKEUP] and
    the MONITOR wake register join them to the MLE, but *guest*
    MONITOR/MWAIT does not track the monitored address: MWAIT
    degenerates to a spin under SMP (architecturally legal, since

@@ -172,6 +172,26 @@ typedef struct IntelTxtState IntelTxtState;
 DECLARE_INSTANCE_CHECKER(IntelTxtState, INTEL_TXT,
                          TYPE_INTEL_TXT)
 
+/*
+ * What txt-firmware=on carves out of low RAM: a locked DPR holding the
+ * SINIT slot and the TXT heap, the layout coreboot uses on real boards.
+ * It sits below TSEG and the RAM firmware keeps just under TSEG
+ * (coreboot's CBMEM), and the e820 table reserves it.
+ */
+#define INTEL_TXT_FW_DPR_SIZE      0x400000
+#define INTEL_TXT_FW_SINIT_OFFSET  0x200000
+#define INTEL_TXT_FW_SINIT_SIZE    0x40000
+#define INTEL_TXT_FW_HEAP_OFFSET   0x300000
+#define INTEL_TXT_FW_HEAP_SIZE     0x100000
+#define INTEL_TXT_FW_GAP           0x2000000
+
+/*
+ * The DPR base for @below_4g bytes of low RAM with @tseg bytes of TSEG
+ * on top, or 0 with @errp set if low RAM is too small to hold it.
+ */
+uint64_t intel_txt_fw_dpr_base(uint64_t below_4g, uint64_t tseg,
+                               Error **errp);
+
 #ifdef CONFIG_TPM
 /*
  * TPM2 hash algorithm tags for the DRTM digests (TCG TPM 2.0
@@ -247,6 +267,11 @@ bool intel_txt_wakeup(IntelTxtState *s, IntelTxtRlpEntry *rlp);
  * @rlp.  Defined by the TCG SMX helper; the BQL must be held.
  */
 void intel_txt_join_parked_rlps(IntelTxtRlpEntry *rlp);
+/*
+ * The same join queued on each parked AP, for callers in device
+ * dispatch.  The BQL must be held.
+ */
+void intel_txt_queue_rlp_joins(const IntelTxtRlpEntry *rlp);
 #endif /* CONFIG_TPM */
 
 #endif /* HW_I386_INTEL_TXT_H */

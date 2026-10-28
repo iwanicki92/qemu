@@ -1,5 +1,10 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# tpm_backend.c
+tpm_backend_hash_start(int ret) "ret %d"
+tpm_backend_hash_data(size_t len, int ret) "len %zu ret %d"
+tpm_backend_hash_end(int ret) "ret %d"
+
 # tpm_passthrough.c
 tpm_passthrough_handle_request(void *cmd) "processing command %p"
 tpm_passthrough_reset(void) "reset"
@@ -37,3 +42,4 @@ tpm_emulator_inst_init(void) ""
 tpm_emulator_hash_start(uint8_t locty) "_TPM_Hash_Start asserted at locality %d"
 tpm_emulator_hash_data(size_t len) "_TPM_Hash_Data fed %zu bytes"
 tpm_emulator_hash_end(void) "_TPM_Hash_End asserted"
+tpm_backend_run_sync(uint8_t locty, uint32_t len, bool ok) "locality %u len %u ok %d"

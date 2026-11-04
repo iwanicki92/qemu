@@ -26,6 +26,7 @@
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-ops.h"
 #include "tcg-cpu.h"
+#include "trace.h"
 
 /* Frob eflags into and out of the CPU temporary format.  */
 
@@ -141,11 +142,31 @@ static bool x86_debug_check_breakpoint(CPUState *cs)
     return !(env->eflags & RF_MASK);
 }
 
+/*
+ * INIT waits for GIF, then either resets the core or, with VM_CR.R_INIT
+ * set, arrives as #SX with error code 1 (APM 15.21.8, table 15-12, and
+ * 15.28). The wait is kept outside interrupt_request, since the loop
+ * would otherwise take the request again before running a block.
+ */
 static void x86_cpu_exec_reset(CPUState *cs)
 {
     CPUArchState *env = cpu_env(cs);
 
+    if (!(env->hflags2 & HF2_GIF_MASK)) {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_INIT);
+        env->init_pending = true;
+        trace_x86_init_held(cs->cpu_index);
+        cs->exception_index = EXCP_INTERRUPT;
+        return;
+    }
     cpu_svm_check_intercept_param(env, SVM_EXIT_INIT, 0, 0);
+    if (env->vm_cr & MSR_VM_CR_R_INIT) {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_INIT);
+        trace_x86_init_redirected(cs->cpu_index);
+        do_interrupt_all(env_archcpu(env), EXCP1E_SX, 0, 1, 0, 0);
+        cs->exception_index = EXCP_INTERRUPT;
+        return;
+    }
     do_cpu_init(env_archcpu(env));
     cs->exception_index = EXCP_HALTED;
 }

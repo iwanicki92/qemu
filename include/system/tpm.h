@@ -43,6 +43,15 @@ struct TPMIfClass {
     void (*request_completed)(TPMIf *obj, int ret);
     enum TPMVersion (*get_version)(TPMIf *obj);
     bool ppi_enabled;
+    /* optional: the locality 4 hash the processor sends at SKINIT */
+    int (*hash_image)(TPMIf *obj, const uint8_t *data, size_t len);
+    /*
+     * optional: a command run for an agent beside the processor at its
+     * own locality, and the localities such an agent keeps locked
+     */
+    int (*run_command)(TPMIf *obj, uint8_t locty, const uint8_t *in,
+                       size_t in_len, uint8_t *out, size_t out_len);
+    void (*set_locality_locks)(TPMIf *obj, uint8_t locked);
 };
 
 #define TYPE_TPM_TIS_ISA            "tpm-tis"
@@ -85,6 +94,67 @@ static inline bool tpm_ppi_enabled(TPMIf *ti)
         return false;
     }
     return TPM_IF_GET_CLASS(ti)->ppi_enabled;
+}
+
+/*
+ * Measure an image as the processor does at SKINIT: PCRs 17 to 22 reset,
+ * PCR 17 extended with its digest. Returns 0, -ENOTSUP when the frontend or
+ * its backend has no locality 4 path, or another negative errno.
+ */
+static inline int tpm_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
+{
+    TPMIfClass *tic;
+
+    if (!ti) {
+        return -ENOTSUP;
+    }
+    tic = TPM_IF_GET_CLASS(ti);
+    if (!tic->hash_image) {
+        return -ENOTSUP;
+    }
+    return tic->hash_image(ti, data, len);
+}
+
+/*
+ * Run a command for an agent beside the processor at its own locality, as
+ * the PSP does at locality 3. Any guest command in flight finishes first,
+ * the guest's active locality is seized, and the exchange runs in the
+ * caller's thread, so only the main loop may call this. Returns 0 with the
+ * response in @out, -ENOTSUP without such a path, or a negative errno.
+ */
+static inline int tpm_run_command(TPMIf *ti, uint8_t locty, const uint8_t *in,
+                                  size_t in_len, uint8_t *out, size_t out_len)
+{
+    TPMIfClass *tic;
+
+    if (!ti) {
+        return -ENOTSUP;
+    }
+    tic = TPM_IF_GET_CLASS(ti);
+    if (!tic->run_command) {
+        return -ENOTSUP;
+    }
+    return tic->run_command(ti, locty, in, in_len, out, out_len);
+}
+
+/*
+ * The localities a firmware agent keeps the processor out of, one bit per
+ * locality: reads there answer all-ones and writes are dropped. Returns
+ * false when the frontend has no such mask.
+ */
+static inline bool tpm_set_locality_locks(TPMIf *ti, uint8_t locked)
+{
+    TPMIfClass *tic;
+
+    if (!ti) {
+        return false;
+    }
+    tic = TPM_IF_GET_CLASS(ti);
+    if (!tic->set_locality_locks) {
+        return false;
+    }
+    tic->set_locality_locks(ti, locked);
+    return true;
 }
 
 #else /* CONFIG_TPM */

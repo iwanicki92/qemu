@@ -112,6 +112,8 @@ static bool query_is_ignored(const char *cmd)
         "query-sev-capabilities",
         "query-sgx",
         "query-sgx-capabilities",
+        /* Success depends on the amd-drtm-platform device */
+        "query-amd-drtm",
         /* Success depends on enabling dirty page rate limit */
         "query-vcpu-dirty-limit",
         NULL

@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "system/kvm.h"
 #include "cpu.h"
 #include "qapi/error.h"
@@ -259,6 +260,30 @@ bool cpu_has_x2apic_feature(CPUX86State *env)
 bool cpu_is_bsp(X86CPU *cpu)
 {
     return cpu_get_apic_base(cpu->apic_state) & MSR_IA32_APICBASE_BSP;
+}
+
+static NotifierList mmio_conf_base_notifiers =
+    NOTIFIER_LIST_INITIALIZER(mmio_conf_base_notifiers);
+
+void x86_cpu_mmio_conf_base_notifier_add(Notifier *n)
+{
+    notifier_list_add(&mmio_conf_base_notifiers, n);
+}
+
+/* Every core carries the MSR, and the machine follows the BSP's copy */
+void x86_cpu_mmio_conf_base_notify(X86CPU *cpu)
+{
+    uint64_t msr = cpu->env.mmio_conf_base;
+    X86MmioConfBase conf = {
+        .enable = msr & MSR_AMD64_MMIO_CONF_ENABLE,
+        .base = msr & MSR_AMD64_MMIO_CONF_BASE_ADDR,
+        .size = MiB << ((msr & MSR_AMD64_MMIO_CONF_BUS_RANGE) >> 2),
+    };
+
+    if (!cpu_is_bsp(cpu)) {
+        return;
+    }
+    notifier_list_notify(&mmio_conf_base_notifiers, &conf);
 }
 
 /* TODO: remove me, when reset over QOM tree is implemented */

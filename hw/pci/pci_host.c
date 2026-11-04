@@ -189,24 +189,63 @@ static uint64_t pci_host_config_read(void *opaque, hwaddr addr,
     return val;
 }
 
+/*
+ * AMD's extended configuration access: CONFIG_ADDRESS bits 24 to 27 carry
+ * bits 8 to 11 of the register offset, reaching the whole 4 KiB space.
+ */
+static PCIDevice *pci_host_cf8_extended(PCIHostState *s, uint32_t reg,
+                                        uint32_t *offset, uint32_t *limit)
+{
+    PCIDevice *pci_dev = pci_dev_find_by_addr(s->bus, reg);
+
+    if (pci_dev) {
+        *offset = (reg & (PCI_CONFIG_SPACE_SIZE - 1)) |
+                  extract32(reg, 24, 4) << 8;
+        *limit = pci_config_size(pci_dev);
+    }
+    return pci_dev;
+}
+
 static void pci_host_data_write(void *opaque, hwaddr addr,
                                 uint64_t val, unsigned len)
 {
     PCIHostState *s = opaque;
+    uint32_t reg = s->config_reg | (addr & 3);
+    uint32_t offset, limit;
+    PCIDevice *pci_dev;
 
-    if (s->config_reg & (1u << 31))
-        pci_data_write(s->bus, s->config_reg | (addr & 3), val, len);
+    if (!(s->config_reg & (1U << 31))) {
+        return;
+    }
+    if (!s->cf8_extended_config) {
+        pci_data_write(s->bus, reg, val, len);
+        return;
+    }
+    pci_dev = pci_host_cf8_extended(s, reg, &offset, &limit);
+    if (pci_dev) {
+        pci_host_config_write_common(pci_dev, offset, limit, val, len);
+    }
 }
 
 static uint64_t pci_host_data_read(void *opaque,
                                    hwaddr addr, unsigned len)
 {
     PCIHostState *s = opaque;
+    uint32_t reg = s->config_reg | (addr & 3);
+    uint32_t offset, limit;
+    PCIDevice *pci_dev;
 
     if (!(s->config_reg & (1U << 31))) {
         return 0xffffffff;
     }
-    return pci_data_read(s->bus, s->config_reg | (addr & 3), len);
+    if (!s->cf8_extended_config) {
+        return pci_data_read(s->bus, reg, len);
+    }
+    pci_dev = pci_host_cf8_extended(s, reg, &offset, &limit);
+    if (!pci_dev) {
+        return 0xffffffff;
+    }
+    return pci_host_config_read_common(pci_dev, offset, limit, len);
 }
 
 const MemoryRegionOps pci_host_conf_le_ops = {
@@ -248,6 +287,12 @@ static const Property pci_host_properties_common[] = {
     DEFINE_PROP_BOOL("x-config-reg-migration-enabled", PCIHostState,
                      mig_enabled, true),
     DEFINE_PROP_BOOL(PCI_HOST_BYPASS_IOMMU, PCIHostState, bypass_iommu, false),
+    /*
+     * Decodes AMD's extended register bits in port 0xcf8, which AMD
+     * firmware and software use where MMCONFIG is not yet set up.
+     */
+    DEFINE_PROP_BOOL(PCI_HOST_CF8_EXTENDED_CONFIG, PCIHostState,
+                     cf8_extended_config, false),
 };
 
 static void pci_host_class_init(ObjectClass *klass, const void *data)

@@ -83,6 +83,32 @@ static enum TPMVersion tpm_tis_sysbus_get_tpm_version(TPMIf *ti)
     return tpm_tis_get_tpm_version(s);
 }
 
+static int tpm_tis_sysbus_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
+{
+    TPMStateSysBus *sbdev = TPM_TIS_SYSBUS(ti);
+    TPMState *s = &sbdev->state;
+
+    return tpm_tis_hash_image(s, data, len);
+}
+
+static int tpm_tis_sysbus_run_command(TPMIf *ti, uint8_t locty,
+                                      const uint8_t *in, size_t in_len,
+                                      uint8_t *out, size_t out_len)
+{
+    TPMStateSysBus *sbdev = TPM_TIS_SYSBUS(ti);
+    TPMState *s = &sbdev->state;
+
+    return tpm_tis_run_command(s, locty, in, in_len, out, out_len);
+}
+
+static void tpm_tis_sysbus_set_locality_locks(TPMIf *ti, uint8_t locked)
+{
+    TPMStateSysBus *sbdev = TPM_TIS_SYSBUS(ti);
+    TPMState *s = &sbdev->state;
+
+    tpm_tis_set_locality_locks(s, locked);
+}
+
 static void tpm_tis_sysbus_reset(DeviceState *dev)
 {
     TPMStateSysBus *sbdev = TPM_TIS_SYSBUS(dev);
@@ -94,6 +120,13 @@ static void tpm_tis_sysbus_reset(DeviceState *dev)
 static const Property tpm_tis_sysbus_properties[] = {
     DEFINE_PROP_UINT32("irq", TPMStateSysBus, state.irq_num, TPM_TIS_IRQ),
     DEFINE_PROP_TPMBE("tpmdev", TPMStateSysBus, state.be_driver),
+    /* Lets software drive the locality 4 hash, which no hardware allows */
+    DEFINE_PROP_BOOL("locality4", TPMStateSysBus, state.locality4, false),
+    /* Drops the locality 4 hash while locality 0 is active */
+    DEFINE_PROP_BOOL("locality0-drops-hash", TPMStateSysBus,
+                     state.locality0_drops_hash, false),
+    /* Makes a driver wait for the FIFO between bursts, 0 for no limit */
+    DEFINE_PROP_UINT16("burst-limit", TPMStateSysBus, state.burst_limit, 0),
     DEFINE_PROP_BOOL("ppi", TPMStateSysBus, state.ppi_enabled, true),
 };
 
@@ -149,6 +182,9 @@ static void tpm_tis_sysbus_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, tpm_tis_sysbus_reset);
     tc->request_completed = tpm_tis_sysbus_request_completed;
     tc->get_version = tpm_tis_sysbus_get_tpm_version;
+    tc->hash_image = tpm_tis_sysbus_hash_image;
+    tc->run_command = tpm_tis_sysbus_run_command;
+    tc->set_locality_locks = tpm_tis_sysbus_set_locality_locks;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 

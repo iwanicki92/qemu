@@ -74,6 +74,7 @@
 
 #include "qom/qom-qobject.h"
 #include "hw/i386/amd_iommu.h"
+#include "hw/misc/amd_psp.h"
 #include "hw/i386/intel_iommu.h"
 #include "hw/virtio/virtio-iommu.h"
 
@@ -2000,6 +2001,87 @@ build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     acpi_table_end(linker, &table);
 }
 
+/*
+ * ASPT, which tells the OS where the Secure Processor's registers are
+ * (_58193, tables 3 to 8_). The offsets within the window are the ones Turin
+ * firmware reports, so a capture taken here has the same shape as one taken
+ * on hardware.
+ */
+static void
+build_amd_psp(GArray *table_data, BIOSLinker *linker, const char *oem_id,
+              const char *oem_table_id)
+{
+    AcpiTable table = { .sig = "ASPT", .rev = 2, .oem_id = oem_id,
+                        .oem_table_id = oem_table_id };
+
+    acpi_table_begin(&table, table_data);
+    /* ASP register base, 4K-aligned, and how many pages of it there are */
+    build_append_int_noprefix(table_data, AMD_PSP_ASPT_BASE, 8);
+    build_append_int_noprefix(table_data, AMD_PSP_ASPT_SIZE / 4096, 4);
+    /* Register structures: global, SEV mailbox, ACPI mailbox */
+    build_append_int_noprefix(table_data, 3, 4);
+
+    /* ASP global registers, type 0 (_58193, table 5_) */
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 20, 2);
+    build_append_int_noprefix(table_data, 0, 4); /* reserved */
+    /* Feature register, which is C2PMSG_63 within the window */
+    build_append_int_noprefix(table_data,
+                              AMD_PSP_C2PMSG_BASE - AMD_PSP_ASPT_WINDOW +
+                              4 * AMD_PSP_C2PMSG_FEATURE, 4);
+    build_append_int_noprefix(table_data, 0x510, 4); /* interrupt enable */
+    build_append_int_noprefix(table_data, 0x514, 4); /* interrupt status */
+
+    /* SEV mailbox registers, type 1 (_58193, table 7_) */
+    build_append_int_noprefix(table_data, 1, 2);
+    build_append_int_noprefix(table_data, 20, 2);
+    build_append_int_noprefix(table_data, 1, 1); /* mailbox interrupt ID */
+    build_append_int_noprefix(table_data, 0, 3); /* reserved */
+    build_append_int_noprefix(table_data, 0x980, 4); /* CmdResp */
+    build_append_int_noprefix(table_data, 0x9e0, 4); /* CmdBufAddr_Lo */
+    build_append_int_noprefix(table_data, 0x9e4, 4); /* CmdBufAddr_Hi */
+
+    /* ACPI mailbox registers, type 2 (_58193, table 8_) */
+    build_append_int_noprefix(table_data, 2, 2);
+    build_append_int_noprefix(table_data, 20, 2);
+    build_append_int_noprefix(table_data, 0, 4); /* reserved */
+    build_append_int_noprefix(table_data, 0x958, 4); /* CmdResp */
+    build_append_int_noprefix(table_data, 0, 4);
+    build_append_int_noprefix(table_data, 0, 4);
+
+    acpi_table_end(linker, &table);
+}
+
+/*
+ * The DRTM ACPI device, which Turin firmware publishes in an SSDT of its own
+ * once its "DRTM Virtual Device Support" option is enabled: \_SB.DRTM with
+ * _HID "DRTM0002" and an _STA of 0x0f. What consumes it is not known, so
+ * nothing here implements what it describes.
+ */
+static void
+build_amd_drtm(GArray *table_data, BIOSLinker *linker, const char *oem_id,
+               const char *oem_table_id)
+{
+    AcpiTable table = { .sig = "SSDT", .rev = 1, .oem_id = oem_id,
+                        .oem_table_id = oem_table_id };
+    Aml *ssdt, *scope, *dev;
+
+    acpi_table_begin(&table, table_data);
+    ssdt = init_aml_allocator();
+
+    scope = aml_scope("\\_SB");
+    dev = aml_device("DRTM");
+    aml_append(dev, aml_name_decl("_HID", aml_string("DRTM0002")));
+    aml_append(dev, aml_name_decl("_UID", aml_int(0)));
+    aml_append(dev, aml_name_decl("_STA", aml_int(0x0f)));
+    aml_append(scope, dev);
+    aml_append(ssdt, scope);
+
+    g_array_append_vals(table_data, ssdt->buf->data, ssdt->buf->len);
+    acpi_table_end(linker, &table);
+    free_aml_allocator();
+}
+
 typedef
 struct AcpiBuildState {
     /* Copy of table in RAM (for patching). */
@@ -2052,7 +2134,8 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
     uint8_t *u;
     GArray *tables_blob = tables->table_data;
     AcpiSlicOem slic_oem = { .id = NULL, .table_id = NULL };
-    Object *vmgenid_dev, *vmclock_dev;
+    Object *vmgenid_dev, *vmclock_dev, *psp;
+    unsigned ivrs_offset = 0, ivrs_len = 0;
     char *oem_id;
     char *oem_table_id;
 
@@ -2170,9 +2253,17 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
                    x86ms->oem_table_id);
     }
     if (object_dynamic_cast(OBJECT(iommu), TYPE_AMD_IOMMU_DEVICE)) {
-        acpi_add_table(table_offsets, tables_blob);
-        build_amd_iommu(tables_blob, tables->linker, x86ms->oem_id,
-                        x86ms->oem_table_id);
+        /*
+         * ivrs=off leaves the IOMMU out of ACPI, as firmware that fails to
+         * describe one does, so the guest finds it in PCI space alone.
+         */
+        if (AMD_IOMMU_DEVICE(iommu)->ivrs) {
+            ivrs_offset = tables_blob->len;
+            acpi_add_table(table_offsets, tables_blob);
+            build_amd_iommu(tables_blob, tables->linker, x86ms->oem_id,
+                            x86ms->oem_table_id);
+            ivrs_len = tables_blob->len - ivrs_offset;
+        }
     } else if (object_dynamic_cast(OBJECT(iommu), TYPE_INTEL_IOMMU_DEVICE)) {
         acpi_add_table(table_offsets, tables_blob);
         build_dmar_q35(tables_blob, tables->linker, x86ms->oem_id,
@@ -2183,6 +2274,27 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
         acpi_add_table(table_offsets, tables_blob);
         build_viot(machine, tables_blob, tables->linker, pci_get_bdf(pdev),
                    x86ms->oem_id, x86ms->oem_table_id);
+    }
+
+    psp = object_resolve_path_type("", TYPE_AMD_PSP, NULL);
+    if (psp) {
+        amd_psp_set_ivrs(AMD_PSP(psp), tables_blob->data + ivrs_offset,
+                         ivrs_len);
+    }
+    if (psp && AMD_PSP(psp)->aspt) {
+        /*
+         * aspt=off leaves the Secure Processor's registers where they are
+         * with nothing saying so, which is the platform software has to
+         * answer on without reading them.
+         */
+        acpi_add_table(table_offsets, tables_blob);
+        build_amd_psp(tables_blob, tables->linker, x86ms->oem_id,
+                      x86ms->oem_table_id);
+    }
+    if (psp && AMD_PSP(psp)->drtm_device) {
+        acpi_add_table(table_offsets, tables_blob);
+        build_amd_drtm(tables_blob, tables->linker, x86ms->oem_id,
+                       x86ms->oem_table_id);
     }
     if (machine->nvdimms_state->is_enabled) {
         nvdimm_build_acpi(table_offsets, tables_blob, tables->linker,

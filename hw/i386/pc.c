@@ -55,6 +55,7 @@
 #include "hw/cxl/cxl_host.h"
 #include "hw/usb/usb.h"
 #include "hw/i386/intel_iommu.h"
+#include "hw/i386/intel_txt.h"
 #include "hw/net/ne2000-isa.h"
 #include "hw/virtio/virtio-iommu.h"
 #include "hw/virtio/virtio-md-pci.h"
@@ -537,6 +538,17 @@ void pc_machine_done(Notifier *notifier, void *data)
         cxl_fmws_link_targets(&error_fatal);
     }
 
+    /*
+     * SENTER keeps DMA off the MLE with the VT-d PMRs. The IOMMU is a
+     * -device, so it can be checked for only now.
+     */
+    if (pcms->txt_enabled &&
+        !object_dynamic_cast(OBJECT(x86_iommu_get_default()),
+                             TYPE_INTEL_IOMMU_DEVICE)) {
+        error_report("txt=on requires -device intel-iommu");
+        exit(1);
+    }
+
     /* set the number of CPUs */
     x86_rtc_set_cpus_count(x86ms->rtc, x86ms->boot_cpus);
 
@@ -547,7 +559,10 @@ void pc_machine_done(Notifier *notifier, void *data)
     if (x86ms->fw_cfg) {
         fw_cfg_build_smbios(pcms, x86ms->fw_cfg, pcms->smbios_entry_point_type);
         fw_cfg_add_e820(x86ms->fw_cfg);
-        fw_cfg_build_feature_control(MACHINE(pcms), x86ms->fw_cfg);
+        /* txt-firmware=on locks IA32_FEATURE_CONTROL before the firmware */
+        if (!pcms->txt_firmware) {
+            fw_cfg_build_feature_control(MACHINE(pcms), x86ms->fw_cfg);
+        }
         /* update FW_CFG_NB_CPUS to account for -device added CPUs */
         fw_cfg_modify_i16(x86ms->fw_cfg, FW_CFG_NB_CPUS, x86ms->boot_cpus);
     }
@@ -801,7 +816,21 @@ void pc_memory_init(PCMachineState *pcms,
     memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g", machine->ram,
                              0, x86ms->below_4g_mem_size);
     memory_region_add_subregion(system_memory, 0, ram_below_4g);
-    e820_add_entry(0, x86ms->below_4g_mem_size, E820_RAM);
+    if (pcms->txt_dpr_base) {
+        /*
+         * Split rather than overlaid: coreboot keeps a reserved entry
+         * out of RAM only when no RAM entry covers it
+         */
+        uint64_t dpr_top = pcms->txt_dpr_base + INTEL_TXT_FW_DPR_SIZE;
+
+        e820_add_entry(0, pcms->txt_dpr_base, E820_RAM);
+        e820_add_entry(pcms->txt_dpr_base, INTEL_TXT_FW_DPR_SIZE,
+                       E820_RESERVED);
+        e820_add_entry(dpr_top, x86ms->below_4g_mem_size - dpr_top,
+                       E820_RAM);
+    } else {
+        e820_add_entry(0, x86ms->below_4g_mem_size, E820_RAM);
+    }
     if (x86ms->above_4g_mem_size > 0) {
         ram_above_4g = g_malloc(sizeof(*ram_above_4g));
         memory_region_init_alias(ram_above_4g, NULL, "ram-above-4g",

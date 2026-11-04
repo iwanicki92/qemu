@@ -32,6 +32,7 @@
 #include "qemu/log.h"
 #include "hw/i386/pc.h"
 #include "hw/pci-host/q35.h"
+#include "hw/misc/amd_psp.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -67,6 +68,7 @@ static void q35_host_realize(DeviceState *dev, Error **errp)
                                 s->mch.address_space_io,
                                 0, TYPE_PCIE_BUS);
 
+    qdev_prop_set_bit(DEVICE(&s->mch), "multifunction", s->mch_multifunction);
     qdev_realize(DEVICE(&s->mch), BUS(pci->bus), &error_fatal);
 }
 
@@ -193,6 +195,12 @@ static const Property q35_host_props[] = {
     DEFINE_PROP_BOOL(PCI_HOST_PROP_SMM_RANGES, Q35PCIHost,
                      mch.has_smm_ranges, true),
     DEFINE_PROP_BOOL("x-pci-hole64-fix", Q35PCIHost, pci_hole64_fix, true),
+    /*
+     * Lets other functions sit beside the MCH at 00:00, which AMD firmware
+     * does with the IOMMU at 00:00.2 and software written for it expects.
+     */
+    DEFINE_PROP_BOOL("mch-multifunction", Q35PCIHost, mch_multifunction,
+                     false),
 };
 
 static void q35_host_class_init(ObjectClass *klass, const void *data)
@@ -334,6 +342,26 @@ static void mch_update_pciexbar(MCHPCIState *mch)
     pcie_host_mmcfg_update(pehb, enable, addr, length);
 }
 
+static void mch_mmcfg_msr_map(MCHPCIState *mch)
+{
+    BusState *bus = qdev_get_parent_bus(DEVICE(mch));
+
+    pcie_host_mmcfg_update(PCIE_HOST_BRIDGE(bus->parent),
+                           mch->mmcfg_msr_enable, mch->mmcfg_msr_base,
+                           mch->mmcfg_msr_size);
+}
+
+/* Maps MMCONFIG over PCIEXBAR's until either is written again */
+void mch_mmcfg_msr_update(MCHPCIState *mch, bool enable, hwaddr base,
+                          uint32_t size)
+{
+    mch->mmcfg_msr = true;
+    mch->mmcfg_msr_enable = enable;
+    mch->mmcfg_msr_base = base;
+    mch->mmcfg_msr_size = size;
+    mch_mmcfg_msr_map(mch);
+}
+
 /* PAM */
 static void mch_update_pam(MCHPCIState *mch)
 {
@@ -468,12 +496,43 @@ static void mch_update_smbase_smram(MCHPCIState *mch)
     memory_region_transaction_commit();
 }
 
+/*
+ * What the SMN pair answers. Only the two registers the DRTM path reads
+ * are known: PSP_BASE_ADDR_LO holds the Secure Processor's register block
+ * in bits 31:20, taken from the amd-psp's BAR as firmware assigned it,
+ * decode enabled or not, and PSP_BASE_ADDR_HI holds zero. Everything
+ * else, and any address without an amd-psp, reads zero, which software
+ * takes as no Secure Processor.
+ */
+static uint32_t mch_smn_read(uint32_t addr)
+{
+    Object *psp;
+
+    if (addr != MCH_HOST_BRIDGE_SMN_PSP_BASE_LO) {
+        return 0;
+    }
+    psp = object_resolve_path_type("", TYPE_AMD_PSP, NULL);
+    if (!psp) {
+        return 0;
+    }
+    return pci_get_long(PCI_DEVICE(psp)->config + PCI_BASE_ADDRESS_0 +
+                        4 * AMD_PSP_BAR_INDEX) &
+           MCH_HOST_BRIDGE_SMN_PSP_BASE_MASK;
+}
+
 static void mch_write_config(PCIDevice *d,
                               uint32_t address, uint32_t val, int len)
 {
     MCHPCIState *mch = MCH_PCI_DEVICE(d);
 
     pci_default_write_config(d, address, val, len);
+
+    if (mch->smn && ranges_overlap(address, len, MCH_HOST_BRIDGE_SMN_ADDR,
+                                   4)) {
+        pci_set_long(d->config + MCH_HOST_BRIDGE_SMN_DATA,
+                     mch_smn_read(pci_get_long(d->config +
+                                               MCH_HOST_BRIDGE_SMN_ADDR)));
+    }
 
     if (ranges_overlap(address, len, MCH_HOST_BRIDGE_PAM0,
                        MCH_HOST_BRIDGE_PAM_SIZE)) {
@@ -482,6 +541,7 @@ static void mch_write_config(PCIDevice *d,
 
     if (ranges_overlap(address, len, MCH_HOST_BRIDGE_PCIEXBAR,
                        MCH_HOST_BRIDGE_PCIEXBAR_SIZE)) {
+        mch->mmcfg_msr = false;
         mch_update_pciexbar(mch);
     }
 
@@ -526,8 +586,32 @@ static int mch_post_load(void *opaque, int version_id)
 {
     MCHPCIState *mch = opaque;
     mch_update(mch);
+    if (mch->mmcfg_msr) {
+        mch_mmcfg_msr_map(mch);
+    }
     return 0;
 }
+
+static bool mch_mmcfg_msr_needed(void *opaque)
+{
+    MCHPCIState *mch = opaque;
+
+    return mch->mmcfg_msr;
+}
+
+static const VMStateDescription vmstate_mch_mmcfg_msr = {
+    .name = "mch/mmcfg_msr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = mch_mmcfg_msr_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(mmcfg_msr, MCHPCIState),
+        VMSTATE_BOOL(mmcfg_msr_enable, MCHPCIState),
+        VMSTATE_UINT64(mmcfg_msr_base, MCHPCIState),
+        VMSTATE_UINT32(mmcfg_msr_size, MCHPCIState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_mch = {
     .name = "mch",
@@ -541,6 +625,10 @@ static const VMStateDescription vmstate_mch = {
          */
         VMSTATE_UNUSED(1),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_mch_mmcfg_msr,
+        NULL
     }
 };
 
@@ -551,6 +639,7 @@ static void mch_reset(DeviceState *qdev)
 
     pci_set_quad(d->config + MCH_HOST_BRIDGE_PCIEXBAR,
                  MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT);
+    mch->mmcfg_msr = false;
 
     if (mch->has_smm_ranges) {
         d->config[MCH_HOST_BRIDGE_SMRAM] = MCH_HOST_BRIDGE_SMRAM_DEFAULT;
@@ -674,12 +763,22 @@ static void mch_realize(PCIDevice *d, Error **errp)
         object_property_add_const_link(qdev_get_machine(), "smram",
                                        OBJECT(&mch->smram));
     }
+
+    /* The SMN data register is what the last address write fetched */
+    if (mch->smn) {
+        pci_set_long(d->wmask + MCH_HOST_BRIDGE_SMN_DATA, 0);
+    }
 }
 
 static const Property mch_props[] = {
     DEFINE_PROP_UINT16("extended-tseg-mbytes", MCHPCIState, ext_tseg_mbytes,
                        64),
     DEFINE_PROP_BOOL("smbase-smram", MCHPCIState, has_smram_at_smbase, true),
+    /*
+     * The SMN access pair AMD's host bridge has at 0xb8 and 0xbc, through
+     * which the DRTM path finds the Secure Processor's registers.
+     */
+    DEFINE_PROP_BOOL("smn", MCHPCIState, smn, false),
 };
 
 static void mch_class_init(ObjectClass *klass, const void *data)

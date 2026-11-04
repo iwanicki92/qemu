@@ -956,7 +956,7 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
 #define TCG_EXT3_FEATURES (CPUID_EXT3_LAHF_LM | CPUID_EXT3_SVM | \
           CPUID_EXT3_CR8LEG | CPUID_EXT3_ABM | CPUID_EXT3_SSE4A | \
           CPUID_EXT3_3DNOWPREFETCH | CPUID_EXT3_KERNEL_FEATURES | \
-          CPUID_EXT3_CMP_LEG)
+          CPUID_EXT3_CMP_LEG | CPUID_EXT3_SKINIT)
 
 #define TCG_EXT4_FEATURES 0
 
@@ -9402,6 +9402,8 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
 
     cpu_x86_update_cr0(env, 0x60000010);
     env->a20_mask = ~0x0;
+    env->a20_gate = true;
+    env->init_pending = false;
     env->smbase = 0x30000;
     env->msr_smi_count = 0;
 
@@ -9468,6 +9470,10 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
     if (env->features[FEAT_1_ECX] & CPUID_EXT_MONITOR) {
         env->msr_ia32_misc_enable |= MSR_IA32_MISC_ENABLE_MWAIT;
     }
+
+    /* Firmware programs these, and none here does, so take them as given */
+    env->mmio_conf_base = cpu->mmio_conf_base;
+    env->vm_cr = cpu->vm_cr;
 
     memset(env->dr, 0, sizeof(env->dr));
     env->dr[6] = DR6_FIXED_1;
@@ -9731,6 +9737,12 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
                 x86_cpu_get_supported_feature_word(cpu, w) &
                 ~env->user_features[w] &
                 ~feature_word_info[w].no_autoenable_flags;
+        }
+
+        /* TCG emulates SMX, but no AMD processor has it */
+        if (IS_AMD_CPU(env) &&
+            !(env->user_features[FEAT_1_ECX] & CPUID_EXT_SMX)) {
+            env->features[FEAT_1_ECX] &= ~CPUID_EXT_SMX;
         }
 
         if ((env->features[FEAT_7_1_EDX] & CPUID_7_1_EDX_AVX10) && !env->avx10_version) {
@@ -10088,6 +10100,12 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
 
     if (cpu->apic_id == UNASSIGNED_APIC_ID) {
         error_setg(errp, "apic-id property was not initialized properly");
+        return;
+    }
+
+    if (cpu->vm_cr & ~(MSR_VM_CR_DPD | MSR_VM_CR_R_INIT | MSR_VM_CR_DIS_A20M |
+                       MSR_VM_CR_LOCK | MSR_VM_CR_SVMDIS)) {
+        error_setg(errp, "vm-cr sets a reserved bit, only bits 4:0 exist");
         return;
     }
 
@@ -10649,7 +10667,13 @@ int x86_cpu_pending_interrupt(const CPUState *cs, int interrupt_request)
 
 static bool x86_cpu_has_work(CPUState *cs)
 {
-    return x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
+    /*
+     * The CPU loop takes INIT itself, so a halted CPU has to wake for it,
+     * unless it sleeps in TXT's SENTER sleep, which INIT does not end
+     */
+    return (cpu_test_interrupt(cs, CPU_INTERRUPT_INIT) &&
+            !cpu_env(cs)->txt_ap_parked) ||
+           x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
 }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -10800,6 +10824,8 @@ static const Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("enforce", X86CPU, enforce_cpuid, false),
     DEFINE_PROP_BOOL("x-force-features", X86CPU, force_features, false),
     DEFINE_PROP_BOOL("kvm", X86CPU, expose_kvm, true),
+    DEFINE_PROP_UINT64("mmio-conf-base", X86CPU, mmio_conf_base, 0),
+    DEFINE_PROP_UINT64("vm-cr", X86CPU, vm_cr, 0),
     DEFINE_PROP_UINT32("phys-bits", X86CPU, phys_bits, 0),
     DEFINE_PROP_UINT32("guest-phys-bits", X86CPU, guest_phys_bits, -1),
     DEFINE_PROP_BOOL("host-phys-bits", X86CPU, host_phys_bits, false),

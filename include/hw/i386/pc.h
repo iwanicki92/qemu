@@ -48,6 +48,10 @@ typedef struct PCMachineState {
     bool wdat_enabled;
     bool txt_enabled;
     bool txt_vmx_compat;
+    bool txt_firmware;
+    /* Where txt-firmware=on puts the DPR, 0 without it */
+    uint64_t txt_dpr_base;
+    bool amd_drtm_enabled;
     bool smbus_enabled;
     bool sata_enabled;
     bool hpet_enabled;

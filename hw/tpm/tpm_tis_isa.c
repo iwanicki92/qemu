@@ -83,6 +83,31 @@ static enum TPMVersion tpm_tis_isa_get_tpm_version(TPMIf *ti)
     return tpm_tis_get_tpm_version(s);
 }
 
+static int tpm_tis_isa_hash_image(TPMIf *ti, const uint8_t *data, size_t len)
+{
+    TPMStateISA *isadev = TPM_TIS_ISA(ti);
+    TPMState *s = &isadev->state;
+
+    return tpm_tis_hash_image(s, data, len);
+}
+
+static int tpm_tis_isa_run_command(TPMIf *ti, uint8_t locty, const uint8_t *in,
+                          size_t in_len, uint8_t *out, size_t out_len)
+{
+    TPMStateISA *isadev = TPM_TIS_ISA(ti);
+    TPMState *s = &isadev->state;
+
+    return tpm_tis_run_command(s, locty, in, in_len, out, out_len);
+}
+
+static void tpm_tis_isa_set_locality_locks(TPMIf *ti, uint8_t locked)
+{
+    TPMStateISA *isadev = TPM_TIS_ISA(ti);
+    TPMState *s = &isadev->state;
+
+    tpm_tis_set_locality_locks(s, locked);
+}
+
 static void tpm_tis_isa_reset(DeviceState *dev)
 {
     TPMStateISA *isadev = TPM_TIS_ISA(dev);
@@ -94,6 +119,13 @@ static void tpm_tis_isa_reset(DeviceState *dev)
 static const Property tpm_tis_isa_properties[] = {
     DEFINE_PROP_UINT32("irq", TPMStateISA, state.irq_num, TPM_TIS_IRQ),
     DEFINE_PROP_TPMBE("tpmdev", TPMStateISA, state.be_driver),
+    /* Lets software drive the locality 4 hash, which no hardware allows */
+    DEFINE_PROP_BOOL("locality4", TPMStateISA, state.locality4, false),
+    /* Drops the locality 4 hash while locality 0 is active */
+    DEFINE_PROP_BOOL("locality0-drops-hash", TPMStateISA,
+                     state.locality0_drops_hash, false),
+    /* Makes a driver wait for the FIFO between bursts, 0 for no limit */
+    DEFINE_PROP_UINT16("burst-limit", TPMStateISA, state.burst_limit, 0),
 };
 
 static void tpm_tis_isa_initfn(Object *obj)
@@ -177,6 +209,9 @@ static void tpm_tis_isa_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, tpm_tis_isa_reset);
     tc->request_completed = tpm_tis_isa_request_completed;
     tc->get_version = tpm_tis_isa_get_tpm_version;
+    tc->hash_image = tpm_tis_isa_hash_image;
+    tc->run_command = tpm_tis_isa_run_command;
+    tc->set_locality_locks = tpm_tis_isa_set_locality_locks;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     adevc->build_dev_aml = build_tpm_tis_isa_aml;
 }

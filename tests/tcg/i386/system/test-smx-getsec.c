@@ -98,7 +98,9 @@
 #define TXT_PUBLIC_BASE        0xFED30000U
 #define TXT_PRIVATE_BASE       0xFED20000U
 #define TXT_OFF_STS            0x000
+#define TXT_OFF_ESTS           0x008
 #define TXT_OFF_ERRORCODE      0x030
+#define TXT_OFF_CMD_CLOSE_PRIVATE 0x048
 #define TXT_OFF_SINIT_BASE     0x270
 #define TXT_OFF_SINIT_SIZE     0x278
 #define TXT_OFF_MLE_JOIN       0x290
@@ -107,6 +109,8 @@
 #define TXT_OFF_HEAP_SIZE      0x308
 #define TXT_OFF_DPR            0x330
 
+#define TXT_OFF_CMD_OPEN_LOCALITY1 0x380
+#define TXT_OFF_CMD_SECRETS    0x8e0
 #define TXT_OFF_E2STS          0x8f0
 
 #define TXT_STS_SENTER_DONE    (1ULL << 0)
@@ -333,6 +337,12 @@ static void txt_write64(uint32_t off, uint64_t v)
     asm volatile("movq %0, %%xmm0\n\t"
                  "movq %%xmm0, %1"
                  : : "m"(v), "m"(*p) : "xmm0");
+}
+
+static void txt_private_write32(uint32_t off, uint32_t v)
+{
+    /* Volatile: private TXT space is guest MMIO, not ordinary RAM. */
+    *(volatile uint32_t *)(TXT_PRIVATE_BASE + off) = v;
 }
 
 static uint32_t tis_readl(uint32_t off)
@@ -1787,14 +1797,70 @@ static void check_tpm2_event_log(void)
 #ifdef TEST_TXT_SMP
 /* Volatile: AP writes this word concurrently with the BSP's spin wait. */
 static volatile uint32_t ap_joined;
+/* Volatile: the AP stores the EDX it joined with, read by the BSP. */
+static volatile uint32_t ap_edx;
 
-/* The AP has no stack on entry. Use no C prologue and a private stack. */
+/* Volatile: the AP stores the heap base it read, checked by the BSP. */
+static volatile uint32_t ap_heap_base;
+
+/* What the AP puts in EDX before it halts, and keeps through its sleep */
+#define AP_EDX_MARK 0xa55aa55aU
+#define LAPIC_ICR_LOW  0xfee00300U
+#define LAPIC_ICR_HIGH 0xfee00310U
+
+/*
+ * The AP has no stack on entry. Use no C prologue and a private stack.
+ * Like Linux's sl_txt_ap_entry, it reads TXT.HEAP_BASE first, while the
+ * BSP may still be inside the wake register's write.
+ */
 static void __attribute__((naked, noreturn, used)) ap_landing(void)
 {
     asm volatile("movl $0xe5f000, %%esp\n"
+                 "movl 0xfed20300, %%eax\n"
+                 "movl %%eax, ap_heap_base\n"
+                 "movl %%edx, ap_edx\n"
                  "movl $1, ap_joined\n"
                  "1: hlt\n"
                  "jmp 1b\n" : : : "memory");
+}
+
+static void lapic_ipi(uint32_t icr_low)
+{
+    unsigned i;
+
+    /* Volatile: the local APIC interrupt command is guest MMIO. */
+    *(volatile uint32_t *)LAPIC_ICR_HIGH = 1U << 24; /* APIC ID 1 */
+    *(volatile uint32_t *)LAPIC_ICR_LOW = icr_low;
+    for (i = 0; i < 100000; i++) {
+        asm volatile("pause" : : : "memory");
+    }
+}
+
+/*
+ * Start the AP in real mode at 0x8000, where it marks EDX and halts, or
+ * spins with TEST_TXT_AP_RUNNING: SENTER parks an RLP that is not halted.
+ */
+static void start_marked_ap(void)
+{
+    static const uint8_t code[] = {
+        0x66, 0xba, 0x5a, 0xa5, 0x5a, 0xa5, /* mov $AP_EDX_MARK, %edx */
+#ifdef TEST_TXT_AP_RUNNING
+        0xf3, 0x90,                         /* pause */
+        0xeb, 0xfc,                         /* jmp back to pause */
+#else
+        0xf4,                               /* hlt */
+        0xeb, 0xfd,                         /* jmp back to hlt */
+#endif
+    };
+    /* Volatile: SIPI fetches these instruction bytes from guest RAM. */
+    volatile uint8_t *dst = (volatile uint8_t *)0x8000;
+    unsigned i;
+
+    for (i = 0; i < sizeof(code); i++) {
+        dst[i] = code[i];
+    }
+    lapic_ipi(0x4500); /* INIT, level assert */
+    lapic_ipi(0x4608); /* SIPI, vector 8 -> physical 0x8000 */
 }
 #endif
 
@@ -1847,6 +1913,27 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         (TXT_STS_SENTER_DONE | TXT_STS_MEM_CONFIG_LOCK |
          TXT_STS_PRIVATE_OPEN) || txt_read64(TXT_OFF_ERRORCODE)) {
         fail_msg("MLE entry TXT status is wrong", 16384);
+    }
+    /*
+     * The MLE sets its TXT reset error code through private space.
+     * Volatile: this is a guest MMIO register, not ordinary RAM.
+     */
+    *(volatile uint32_t *)(TXT_PRIVATE_BASE + TXT_OFF_ERRORCODE) =
+        0xc000800cU;
+    if (txt_read64(TXT_OFF_ERRORCODE) != 0xc000800cU) {
+        fail_msg("private ERRORCODE write after SENTER was ignored", 16384);
+    }
+    txt_write64(TXT_OFF_ERRORCODE, 0);
+    /*
+     * Linux's MLE also clears the error status, sets the secrets flag
+     * and opens locality 1 there. SEXIT must clear the last two.
+     */
+    txt_private_write32(TXT_OFF_ESTS, 0xffffffffU);
+    txt_private_write32(TXT_OFF_CMD_SECRETS, 1);
+    txt_private_write32(TXT_OFF_CMD_OPEN_LOCALITY1, 1);
+    if (!(txt_read64(TXT_OFF_E2STS) & TXT_E2STS_SECRET_STS) ||
+        !(txt_read64(TXT_OFF_STS) & TXT_STS_LOCALITY1_OPEN)) {
+        fail_msg("private TXT commands after SENTER were ignored", 16384);
     }
 #ifdef TEST_TXT_TPM2_LOG
     check_tpm2_event_log();
@@ -1964,6 +2051,8 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             fail_msg("SEXIT abandoned a sleeping AP", 16384);
         }
         join[0] = ACM_GDT_LIMIT;
+        /* SENTER sleep ignores INIT: the AP must join with its own EDX */
+        lapic_ipi(0x4500);
 #ifdef TEST_TXT_MONITOR_WAKE
         {
             /* Volatile: a guest MMIO register, not ordinary RAM. */
@@ -1989,6 +2078,14 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
                          16384);
             }
             *wake = 1;
+#ifdef TEST_TXT_WAKE_TWICE
+            /* A WAKEUP while the RLP is still joining has nothing to do. */
+            gp_count = 0;
+            asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
+            if (gp_count != 0) {
+                fail_msg("WAKEUP after a MONITOR wake raised #GP", 16384);
+            }
+#endif
             while (!ap_joined && retries--) {
                 asm volatile("pause" : : : "memory");
             }
@@ -2013,6 +2110,20 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
             ml_printf("PASS: RLP joined MLE through TXT.MLE_JOIN\n");
         }
 #endif
+        if (ap_joined && ap_heap_base != TEST_HEAP_BASE) {
+            ml_printf("smx: AP read TXT.HEAP_BASE 0x%x\n", ap_heap_base);
+            fail_msg("the joined RLP could not read TXT private space",
+                     16384);
+        } else if (ap_joined) {
+            ml_printf("PASS: the joined RLP reads TXT private space\n");
+        }
+        if (ap_joined && ap_edx != AP_EDX_MARK) {
+            ml_printf("smx: AP joined with EDX=0x%x\n", ap_edx);
+            fail_msg("an INIT reset the RLP in SENTER sleep", 16384);
+        } else if (ap_joined) {
+            ml_printf("PASS: an INIT does not reset the RLP in SENTER "
+                      "sleep\n");
+        }
     }
 #else
     asm volatile(".byte 0x0f, 0x37" : : "a"(8) : "memory");
@@ -2033,6 +2144,11 @@ static void __attribute__((noreturn, noinline, used)) mle_landing_c(void)
         uint64_t dpr = txt_read64(TXT_OFF_DPR);
         uint64_t sts_after;
 
+        /* Linux closes private space itself before SEXIT */
+        txt_private_write32(TXT_OFF_CMD_CLOSE_PRIVATE, 1);
+        if (txt_read64(TXT_OFF_STS) & TXT_STS_PRIVATE_OPEN) {
+            fail_msg("private CMD.CLOSE-PRIVATE was ignored", 32768);
+        }
         asm volatile(".byte 0x0f, 0x37" : : "a"(5) : "memory");
 
         /* Reaching this instruction at all is half the test. */
@@ -2183,6 +2299,9 @@ int main(void)
     /* Enable SSE before any txt_read64()/txt_write64() (see above). */
     write_cr4(read_cr4() | CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK);
     ml_printf("smx: SSE enabled, cr4=0x%x\n", read_cr4());
+#ifdef TEST_TXT_SMP
+    start_marked_ap();
+#endif
 
     /* 1. With CR4.SMXE clear, GETSEC raises #UD. */
     cr4 = read_cr4();

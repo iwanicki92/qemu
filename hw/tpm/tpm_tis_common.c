@@ -262,6 +262,42 @@ void tpm_tis_request_completed(TPMState *s, int ret)
 }
 
 /*
+ * Spend a byte of the current burst. A byte past its end still moves, as
+ * a TPM inserts wait states for it on the bus (PTP, TPM_STS burstCount).
+ */
+static void tpm_tis_burst_spend(TPMState *s, uint8_t locty)
+{
+    if (!s->burst_limit) {
+        return;
+    }
+    if (!s->burst_left) {
+        trace_tpm_tis_burst_wait(locty);
+        return;
+    }
+    s->burst_left--;
+}
+
+/*
+ * The burst count a read of STS shows. With a burst limit it is what is
+ * left of the current burst, and 0 once that is spent. Only a read that
+ * covers the burst count bytes and shows the 0 starts the next burst.
+ */
+static uint32_t tpm_tis_burst_count(TPMState *s, hwaddr addr, unsigned size,
+                                    uint32_t avail)
+{
+    unsigned first = addr & 0x3;
+
+    if (!s->burst_limit || first + size <= 1 || first > 2) {
+        return avail;
+    }
+    if (!s->burst_left) {
+        s->burst_left = s->burst_limit;
+        return 0;
+    }
+    return MIN(avail, s->burst_left);
+}
+
+/*
  * Read a byte of response data
  */
 static uint32_t tpm_tis_data_read(TPMState *s, uint8_t locty)
@@ -270,6 +306,7 @@ static uint32_t tpm_tis_data_read(TPMState *s, uint8_t locty)
     uint16_t len;
 
     if ((s->loc[locty].sts & TPM_TIS_STS_DATA_AVAILABLE)) {
+        tpm_tis_burst_spend(s, locty);
         len = MIN(tpm_cmd_get_size(&s->buffer),
                   s->be_buffer_size);
 
@@ -347,6 +384,11 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
         return 0;
     }
 
+    if (s->locked & BIT(locty)) {
+        trace_tpm_tis_locked(locty, false);
+        return val;
+    }
+
     switch (offset) {
     case TPM_TIS_REG_ACCESS:
         /* never show the SEIZE flag even though we use it internally */
@@ -382,10 +424,8 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
     case TPM_TIS_REG_STS:
         if (s->active_locty == locty) {
             if ((s->loc[locty].sts & TPM_TIS_STS_DATA_AVAILABLE)) {
-                val = TPM_TIS_BURST_COUNT(
-                       MIN(tpm_cmd_get_size(&s->buffer),
-                           s->be_buffer_size)
-                       - s->rw_offset) | s->loc[locty].sts;
+                avail = MIN(tpm_cmd_get_size(&s->buffer),
+                            s->be_buffer_size) - s->rw_offset;
             } else {
                 avail = s->be_buffer_size - s->rw_offset;
                 /*
@@ -395,8 +435,9 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
                 if (size == 1 && avail > 0xff) {
                     avail = 0xff;
                 }
-                val = TPM_TIS_BURST_COUNT(avail) | s->loc[locty].sts;
             }
+            avail = tpm_tis_burst_count(s, addr, size, avail);
+            val = TPM_TIS_BURST_COUNT(avail) | s->loc[locty].sts;
         }
         break;
     case TPM_TIS_REG_DATA_FIFO:
@@ -466,6 +507,71 @@ uint16_t tpm_tis_get_checksum(TPMState *s)
     return bswap16(crc_ccitt(0, s->buffer, s->rw_offset));
 }
 
+/* With locality0-drops-hash, a hash sequence starting now is lost */
+static bool tpm_tis_hash_dropped(TPMState *s)
+{
+    if (s->locality0_drops_hash && s->active_locty == 0) {
+        trace_tpm_tis_hash_dropped(s->active_locty);
+        return true;
+    }
+    return false;
+}
+
+static void tpm_tis_hash_flush(TPMState *s)
+{
+    if (s->hash_len) {
+        tpm_backend_hash_data(s->be_driver, s->hash_buf, s->hash_len);
+        s->hash_len = 0;
+    }
+}
+
+/*
+ * The locality 4 registers (PC Client PTP, FIFO register table). The
+ * value written to HASH_START and HASH_END carries nothing, HASH_DATA
+ * takes the image a write at a time, and data outside a sequence is
+ * dropped.
+ */
+static void tpm_tis_hash_write(TPMState *s, uint16_t off, uint64_t val,
+                               unsigned size)
+{
+    int ret;
+
+    switch (off) {
+    case TPM_TIS_REG_HASH_START:
+        if (tpm_tis_hash_dropped(s)) {
+            s->hash_active = false;
+            break;
+        }
+        ret = tpm_backend_hash_start(s->be_driver);
+        trace_tpm_tis_hash_start(ret);
+        s->hash_active = ret == 0;
+        s->hash_len = 0;
+        break;
+    case TPM_TIS_REG_HASH_DATA:
+        if (!s->hash_active) {
+            break;
+        }
+        for (unsigned i = 0; i < size; i++) {
+            s->hash_buf[s->hash_len++] = val >> (8 * i);
+            if (s->hash_len == sizeof(s->hash_buf)) {
+                tpm_tis_hash_flush(s);
+            }
+        }
+        break;
+    case TPM_TIS_REG_HASH_END:
+        if (!s->hash_active) {
+            break;
+        }
+        tpm_tis_hash_flush(s);
+        ret = tpm_backend_hash_end(s->be_driver);
+        trace_tpm_tis_hash_end(ret);
+        s->hash_active = false;
+        break;
+    default:
+        trace_tpm_tis_mmio_write_locty4();
+    }
+}
+
 /*
  * Write a value to a register of the TIS interface
  * See specs pages 33-63 for description of the registers
@@ -484,12 +590,21 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
 
     trace_tpm_tis_mmio_write(size, addr, val);
 
-    if (locty == 4) {
-        trace_tpm_tis_mmio_write_locty4();
+    if (tpm_backend_had_startup_error(s->be_driver)) {
         return;
     }
 
-    if (tpm_backend_had_startup_error(s->be_driver)) {
+    if (s->locked & BIT(locty)) {
+        trace_tpm_tis_locked(locty, true);
+        return;
+    }
+
+    if (locty == 4) {
+        if (s->locality4) {
+            tpm_tis_hash_write(s, off, val, size);
+        } else {
+            trace_tpm_tis_mmio_write_locty4();
+        }
         return;
     }
 
@@ -738,6 +853,7 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
             }
 
             while ((s->loc[locty].sts & TPM_TIS_STS_EXPECT) && size > 0) {
+                tpm_tis_burst_spend(s, locty);
                 if (s->rw_offset < s->be_buffer_size) {
                     s->buffer[s->rw_offset++] =
                         (uint8_t)val;
@@ -810,6 +926,66 @@ enum TPMVersion tpm_tis_get_tpm_version(TPMState *s)
 }
 
 /*
+ * The locality 4 hash a processor sends at a dynamic launch. It reaches the
+ * backend directly: the interface registers only observe its outcome, so
+ * the active locality, the status bits and the FIFO stay as they are.
+ * Returns -EBUSY when locality0-drops-hash drops it.
+ */
+int tpm_tis_hash_image(TPMState *s, const uint8_t *data, size_t len)
+{
+    int ret;
+
+    if (tpm_tis_hash_dropped(s)) {
+        return -EBUSY;
+    }
+    ret = tpm_backend_hash_image(s->be_driver, data, len);
+
+    trace_tpm_tis_hash_image(len, ret);
+
+    return ret;
+}
+
+/*
+ * A command for an agent beside the processor, the PSP at locality 3. It
+ * takes the TPM as a seize would: the guest's active locality loses the
+ * bus and is told so through beenSeized, and gets nothing back, so it
+ * requests the locality again afterwards, as SKL learned to. The
+ * exchange runs here, in the caller's thread, and the interface state
+ * of @locty is not touched, as with the locality 4 hash.
+ */
+int tpm_tis_run_command(TPMState *s, uint8_t locty, const uint8_t *in,
+                        size_t in_len, uint8_t *out, size_t out_len)
+{
+    TPMBackendCmd cmd = {
+        .locty = locty,
+        .in = in,
+        .in_len = in_len,
+        .out = out,
+        .out_len = out_len,
+    };
+    int ret;
+
+    if (tpm_backend_had_startup_error(s->be_driver)) {
+        return -EIO;
+    }
+    if (TPM_TIS_IS_VALID_LOCTY(s->active_locty) && s->active_locty != locty) {
+        trace_tpm_tis_seized_by_agent(s->active_locty, locty);
+        s->loc[s->active_locty].access &= ~TPM_TIS_ACCESS_ACTIVE_LOCALITY;
+        s->loc[s->active_locty].access |= TPM_TIS_ACCESS_BEEN_SEIZED;
+        s->active_locty = TPM_TIS_NO_LOCALITY;
+    }
+    ret = tpm_backend_run_sync(s->be_driver, &cmd);
+    trace_tpm_tis_run_command(locty, in_len, ret);
+    return ret;
+}
+
+void tpm_tis_set_locality_locks(TPMState *s, uint8_t locked)
+{
+    trace_tpm_tis_locality_locks(locked);
+    s->locked = locked;
+}
+
+/*
  * This function is called when the machine starts, resets or due to
  * S3 resume.
  */
@@ -829,6 +1005,9 @@ void tpm_tis_reset(TPMState *s, bool ppi_enabled)
     s->active_locty = TPM_TIS_NO_LOCALITY;
     s->next_locty = TPM_TIS_NO_LOCALITY;
     s->aborting_locty = TPM_TIS_NO_LOCALITY;
+    s->hash_active = false;
+    s->hash_len = 0;
+    s->burst_left = s->burst_limit;
 
     for (c = 0; c < TPM_TIS_NUM_LOCALITIES; c++) {
         s->loc[c].access = TPM_TIS_ACCESS_TPM_REG_VALID_STS;

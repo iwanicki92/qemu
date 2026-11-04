@@ -32,6 +32,7 @@
 #include "qom/object.h"
 
 #define PCI_HOST_BYPASS_IOMMU "bypass-iommu"
+#define PCI_HOST_CF8_EXTENDED_CONFIG "cf8-extended-config"
 
 #define TYPE_PCI_HOST_BRIDGE "pci-host-bridge"
 OBJECT_DECLARE_TYPE(PCIHostState, PCIHostBridgeClass, PCI_HOST_BRIDGE)
@@ -46,6 +47,7 @@ struct PCIHostState {
     bool mig_enabled;
     PCIBus *bus;
     bool bypass_iommu;
+    bool cf8_extended_config;
 
     QLIST_ENTRY(PCIHostState) next;
 };

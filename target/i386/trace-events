@@ -24,3 +24,16 @@ getsec_senter(void) "GETSEC[SENTER]: staged measured launch"
 getsec_senter_no_chipset(void) "GETSEC[SENTER]: no TXT chipset device, #GP(0)"
 getsec_ap_parked(int cpu_index) "GETSEC[SENTER]: RLP %d asleep"
 getsec_ap_joined(int cpu_index, uint32_t entry) "GETSEC[WAKEUP]: RLP %d joined at 0x%"PRIx32
+
+# helper.c
+x86_sipi_after_launch(int cpu_index) "cpu %d starts with GIF clear and VM_CR DPD, R_INIT and DIS_A20M set"
+
+# tcg/tcg-cpu.c
+x86_init_held(int cpu_index) "cpu %d holds INIT until GIF is set"
+x86_init_redirected(int cpu_index) "cpu %d takes INIT as #SX, VM_CR.R_INIT set"
+
+# tcg/system/misc_helper.c
+x86_vm_cr_write(int cpu_index, uint64_t old, uint64_t val) "cpu %d 0x%" PRIx64 " -> 0x%" PRIx64
+
+# tcg/system/svm_helper.c
+x86_skinit(int cpu_index, uint64_t base, uint32_t entry, uint32_t length) "cpu %d slb 0x%" PRIx64 " entry 0x%x length 0x%x"

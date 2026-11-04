@@ -155,6 +155,7 @@ txt_locality_open(int locality) "TXT.CMD_OPEN_LOCALITY%d: locality opened"
 txt_locality_close(int locality) "TXT.CMD_CLOSE_LOCALITY%d: locality closed"
 txt_secrets(bool present) "TXT.CMD_SECRETS/NO_SECRETS: secrets present=%d"
 txt_dpr_locked(uint64_t dpr) "TXT.DPR locked: 0x%"PRIx64
+txt_firmware_setup(uint64_t dpr_base, uint64_t sinit, uint64_t heap) "txt-firmware: DPR at 0x%"PRIx64", SINIT at 0x%"PRIx64", heap at 0x%"PRIx64
 txt_drtm_extend_pcr(int pcr, int ndigests) "DRTM: TPM2_PCR_Extend(PCR %d) issued at locality 4 with %d digests"
 txt_drtm_tpm_error(uint32_t rc) "DRTM: TPM backend response code 0x%"PRIx32
 txt_senter(void) "GETSEC[SENTER]: staged measured launch entered"
@@ -178,3 +179,12 @@ txt_smi_held(int cpu) "TXT: SMI held on CPU %d (inhibition engaged)"
 txt_smi_released(int pending) "TXT: SMI inhibition released, %d held SMI(s) redelivered"
 txt_dmar_found(uint64_t addr, uint32_t len) "sinit_mle_data: DMAR at 0x%"PRIx64", %"PRIu32" bytes"
 txt_dmar_rejected(uint64_t addr, uint32_t len) "sinit_mle_data: DMAR at 0x%"PRIx64" rejected (bad length/checksum), %"PRIu32" bytes"
+
+# amd_drtm.c
+amd_drtm_launch(uint64_t base, uint16_t length) "SLB base 0x%" PRIx64 " length 0x%x"
+amd_drtm_hash(uint64_t base, uint16_t length, const char *result) "SLB base 0x%" PRIx64 " length 0x%x: %s"
+amd_drtm_sl_dev_release(bool launched, bool sl_dev) "launched %d sl_dev %d"
+amd_drtm_block_dma(const char *name, uint64_t base, uint64_t len, bool fetch, bool enforced) "%s base 0x%" PRIx64 " len 0x%" PRIx64 " fetch %d enforced %d"
+amd_drtm_dma_blocked(const char *name, uint64_t addr, unsigned size, bool is_write) "%s addr 0x%" PRIx64 " size %u write %d"
+amd_drtm_unblock_dma(const char *name, bool found) "%s found %d"
+amd_drtm_guest_error(const char *rule, bool strict) "%s (strict %d)"

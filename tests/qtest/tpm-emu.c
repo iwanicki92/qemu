@@ -92,6 +92,9 @@ static void *tpm_emu_tpm_thread(void *data)
     return NULL;
 }
 
+/* What CMD_GET_CAPABILITY reports, a test may drop bits before it starts */
+uint64_t tpm_emu_caps = 0x3fff;
+
 void *tpm_emu_ctrl_thread(void *data)
 {
     TPMTestState *s = data;
@@ -141,7 +144,7 @@ void *tpm_emu_ctrl_thread(void *data)
         cmd = be32_to_cpu(cmd);
         switch (cmd) {
         case CMD_GET_CAPABILITY: {
-            ptm_cap cap = cpu_to_be64(0x3fff);
+            ptm_cap cap = cpu_to_be64(tpm_emu_caps);
             qio_channel_write(ioc, (char *)&cap, sizeof(cap), &error_abort);
             break;
         }

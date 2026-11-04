@@ -86,8 +86,8 @@ static const uint8_t tcg_log_header[] = {
 /* A TCG_PCR_EVENT2 with one SHA-256 digest, before its event data */
 #define TCG_EVENT2_OVERHEAD         (12 + 2 + SHA256_LEN + 4)
 
-/* The stepping is masked when the SOC flag list is compared */
-#define CPUID_STEPPING_MASK         0xf
+/* The CPU signature without the base model and stepping */
+#define CPUID_SOC_FLAG_MASK         0x0fff0f00
 
 #define SHA256_LEN                  32
 
@@ -340,13 +340,14 @@ amd_psp_launch_failed(AmdPspState *s, const char *fmt, ...)
 }
 
 /*
- * The SL header points at a count and CPUID leaf 1 EAX values with the
- * stepping masked. A miss only traces: on hardware, adding the running
- * family to the list changed nothing.
+ * The SL header points at a count and CPU signatures. AMD's Windows driver
+ * compares each one, unmasked, with the running CPU's signature under
+ * CPUID_SOC_FLAG_MASK, so this does too. A miss only traces: on hardware,
+ * adding the running family to the list changed nothing.
  */
 static void amd_psp_check_soc_flags(AmdPspState *s, const uint8_t *slb)
 {
-    uint32_t cpu = amd_drtm_cpu_signature() & ~CPUID_STEPPING_MASK;
+    uint32_t cpu = amd_drtm_cpu_signature() & CPUID_SOC_FLAG_MASK;
     unsigned off = lduw_le_p(slb + SL_HDR_SOC_FLAG);
     uint32_t count, i;
     bool match = false;
@@ -359,7 +360,7 @@ static void amd_psp_check_soc_flags(AmdPspState *s, const uint8_t *slb)
         return;
     }
     for (i = 0; i < count; i++) {
-        if ((ldl_le_p(slb + off + 4 + 4 * i) & ~CPUID_STEPPING_MASK) == cpu) {
+        if (ldl_le_p(slb + off + 4 + 4 * i) == cpu) {
             match = true;
         }
     }

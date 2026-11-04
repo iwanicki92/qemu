@@ -342,8 +342,8 @@ amd_psp_launch_failed(AmdPspState *s, const char *fmt, ...)
 /*
  * The SL header points at a count and CPU signatures. AMD's Windows driver
  * compares each one, unmasked, with the running CPU's signature under
- * CPUID_SOC_FLAG_MASK, so this does too. A miss only traces: on hardware,
- * adding the running family to the list changed nothing.
+ * CPUID_SOC_FLAG_MASK, so this does too. A miss only traces: the PSP accepted
+ * an SL with no list, and a launch with the running CPU left out is untested.
  */
 static void amd_psp_check_soc_flags(AmdPspState *s, const uint8_t *slb)
 {

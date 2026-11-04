@@ -27,6 +27,7 @@
 #include "system/memory.h"
 #include "exec/cputlb.h"
 #include "tcg/helper-tcg.h"
+#include "hw/i386/amd_drtm.h"
 #include "hw/i386/apic.h"
 #include "trace.h"
 
@@ -452,6 +453,9 @@ void helper_rdmsr(CPUX86State *env)
         break;
     case MSR_AMD64_MMIO_CONF_BASE:
         val = env->mmio_conf_base;
+        break;
+    case MSR_AMD64_PSP_ADDR:
+        val = amd_drtm_psp_addr();
         break;
     case MSR_VM_CR:
         val = env->vm_cr;

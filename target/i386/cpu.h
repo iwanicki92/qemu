@@ -591,6 +591,8 @@ typedef enum X86Seg {
 #define MSR_VM_CR_SVMDIS                (1ULL << 4)
 #define MSR_VM_HSAVE_PA                 0xc0010117
 
+#define MSR_AMD64_PSP_ADDR              0xc00110a2
+
 #define MSR_AMD64_MMIO_CONF_BASE        0xc0010058
 #define MSR_AMD64_MMIO_CONF_ENABLE      (1ULL << 0)
 #define MSR_AMD64_MMIO_CONF_BUS_RANGE   (0xfULL << 2)

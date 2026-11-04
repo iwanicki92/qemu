@@ -307,10 +307,18 @@ AmdDrtmInfo *qmp_query_amd_drtm(Error **errp)
 }
 
 void amd_drtm_set_psp(AmdDrtmPlatform *p, AmdPspDrtmInfo *(*query)(void *),
-                      void *psp)
+                      uint64_t (*addr)(void *), void *psp)
 {
     p->psp_query = query;
+    p->psp_addr = addr;
     p->psp = psp;
+}
+
+uint64_t amd_drtm_psp_addr(void)
+{
+    AmdDrtmPlatform *p = amd_drtm_platform_find();
+
+    return p && p->psp_addr ? p->psp_addr(p->psp) : 0;
 }
 
 void qmp_x_amd_drtm_launch(uint64_t base, uint16_t length, Error **errp)

@@ -1250,6 +1250,14 @@ static void amd_psp_reset(DeviceState *dev)
     }
 }
 
+/* Where the guest mapped the registers, 0 before it does */
+static uint64_t amd_psp_addr(void *opaque)
+{
+    pcibus_t addr = pci_get_bar_addr(PCI_DEVICE(opaque), AMD_PSP_BAR_INDEX);
+
+    return addr == PCI_BAR_UNMAPPED ? 0 : addr;
+}
+
 /* The service's record on query-amd-drtm */
 static AmdPspDrtmInfo *amd_psp_drtm_info(void *opaque)
 {
@@ -1377,7 +1385,7 @@ static void amd_psp_realize(PCIDevice *pci_dev, Error **errp)
                                     &s->tmr_desc);
         memory_region_add_subregion(get_system_memory(), s->shared_base,
                                     &s->shared);
-        amd_drtm_set_psp(s->platform, amd_psp_drtm_info, s);
+        amd_drtm_set_psp(s->platform, amd_psp_drtm_info, amd_psp_addr, s);
     }
 
     memory_region_init_io(&s->mmio, OBJECT(s), &amd_psp_mmio_ops, s,
@@ -1403,7 +1411,7 @@ static void amd_psp_exit(PCIDevice *pci_dev)
 
     memory_region_del_subregion(get_system_memory(), &s->window);
     if (s->drtm_service) {
-        amd_drtm_set_psp(s->platform, NULL, NULL);
+        amd_drtm_set_psp(s->platform, NULL, NULL, NULL);
         memory_region_del_subregion(get_system_memory(), &s->tcg_log);
         memory_region_del_subregion(get_system_memory(), &s->ivrs_mr);
         memory_region_del_subregion(get_system_memory(), &s->tmr_desc);

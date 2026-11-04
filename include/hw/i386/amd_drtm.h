@@ -64,6 +64,7 @@ struct AmdDrtmPlatform {
 
     /* The PSP DRTM service's record for query-amd-drtm, when one exists */
     AmdPspDrtmInfo *(*psp_query)(void *psp);
+    uint64_t (*psp_addr)(void *psp);
     void *psp;
 };
 
@@ -72,10 +73,10 @@ AmdDrtmPlatform *amd_drtm_platform_find(void);
 
 /*
  * The amd-psp device with the DRTM service registers how to describe
- * itself here, and unregisters with a NULL @query.
+ * itself and find its registers here, and unregisters with a NULL @query.
  */
 void amd_drtm_set_psp(AmdDrtmPlatform *p, AmdPspDrtmInfo *(*query)(void *),
-                      void *psp);
+                      uint64_t (*addr)(void *), void *psp);
 
 /*
  * A rule of the launch the guest broke, one hardware would let through.
@@ -108,5 +109,8 @@ void amd_drtm_unblock_dma(AmdDrtmPlatform *p, const char *name);
 
 /* CPUID leaf 1 EAX of the first CPU, what the SL header's SOC flags name */
 uint32_t amd_drtm_cpu_signature(void);
+
+/* What MSR 0xc00110a2 reads: the PSP's registers, 0 without a DRTM service */
+uint64_t amd_drtm_psp_addr(void);
 
 #endif
